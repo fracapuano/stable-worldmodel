@@ -13,7 +13,7 @@ A 2D navigation task where a circular agent must reach a target position in anot
 
 The agent starts in one room and must navigate to the target in the opposite room. The task requires planning a path through the door openings rather than simple point-to-point navigation.
 
-**Success criteria**: The episode terminates when the agent is within 16 pixels of the target.
+**Success criteria**: The episode terminates when the agent is within 8 pixels of the target.
 
 ```python
 import stable_worldmodel as swm
