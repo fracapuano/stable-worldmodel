@@ -17,6 +17,7 @@ from stable_worldmodel import envs
 
 _LAZY_SUBMODULES = {
     'data',
+    'evaluation',
     'planning',
     'policy',
     'spaces',
@@ -28,6 +29,14 @@ _LAZY_SUBMODULES = {
 _LAZY_ATTRS = {
     'World': ('stable_worldmodel.world', 'World'),
     'PlanConfig': ('stable_worldmodel.policy', 'PlanConfig'),
+    'LearnedModelBackend': (
+        'stable_worldmodel.backends',
+        'LearnedModelBackend',
+    ),
+    'OracleModelBackend': (
+        'stable_worldmodel.backends',
+        'OracleModelBackend',
+    ),
     'pretraining': ('stable_worldmodel.utils', 'pretraining'),
 }
 
@@ -35,6 +44,7 @@ if TYPE_CHECKING:
     from stable_worldmodel import (
         buffer,
         data,
+        evaluation,
         planning,
         policy,
         spaces,
@@ -43,15 +53,22 @@ if TYPE_CHECKING:
         wrapper,
     )
     from stable_worldmodel.policy import PlanConfig
+    from stable_worldmodel.backends import (
+        LearnedModelBackend,
+        OracleModelBackend,
+    )
     from stable_worldmodel.utils import pretraining
     from stable_worldmodel.world import World
 
 __all__ = [
     'World',
     'PlanConfig',
+    'LearnedModelBackend',
+    'OracleModelBackend',
     'pretraining',
     'buffer',
     'data',
+    'evaluation',
     'envs',
     'planning',
     'policy',

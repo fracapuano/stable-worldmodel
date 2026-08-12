@@ -267,6 +267,7 @@ class TwoRoomEnv(gym.Env):
         pos_next = self.agent_position + action_t * speed
 
         pos_new = self._apply_collisions(self.agent_position, pos_next)
+        collision = not torch.allclose(pos_new, pos_next)
         self.agent_position = pos_new
 
         dist = float(torch.norm(self.agent_position - self.target_position))
@@ -276,6 +277,7 @@ class TwoRoomEnv(gym.Env):
 
         obs = self._get_obs()
         info = self._get_info()
+        info['collision'] = collision
         info['distance_to_target'] = dist
         return obs, reward, terminated, truncated, info
 
@@ -346,6 +348,8 @@ class TwoRoomEnv(gym.Env):
             'proprio': self.agent_position.detach().cpu().numpy(),
             'state': self.agent_position.detach().cpu().numpy(),
             'goal_state': self.target_position.detach().cpu().numpy(),
+            'goal': self._target_img.cpu().numpy().transpose(1, 2, 0),
+            'collision': False,
         }
 
     # ---------------- Rendering ----------------
@@ -701,6 +705,67 @@ class TwoRoomEnv(gym.Env):
 
     def _set_state(self, state):
         self.agent_position = torch.tensor(state, dtype=torch.float32)
+
+    def get_oracle_state(self):
+        """Return the privileged Markov state used by the exact backend."""
+        return self.agent_position.detach().clone()
+
+    def set_oracle_state(self, state):
+        """Restore a state previously returned by ``get_oracle_state``."""
+        self.agent_position = torch.as_tensor(
+            state, dtype=torch.float32
+        ).detach().clone()
+
+    def oracle_transition(self, state, action):
+        """Vectorized, side-effect-free equivalent of one ``step`` transition."""
+        state = torch.as_tensor(state)
+        action = torch.as_tensor(action, device=state.device, dtype=state.dtype)
+        action = action.clamp(-1.0, 1.0)
+        speed = float(self.variation_space['agent']['speed'].value.item())
+        next_state = state + action * speed
+
+        agent_r = float(self.variation_space['agent']['radius'].value.item())
+        lower = float(self.BORDER_SIZE) + agent_r
+        upper = float(self.IMG_SIZE - self.BORDER_SIZE) - agent_r
+        next_state = next_state.clamp(lower, upper)
+
+        half = self.wall_thickness // 2
+        center = float(self.WALL_CENTER)
+        door_margin = 1.75
+        coord_axis = 1 if self.wall_axis == 1 else 0
+        wall_axis = 0 if self.wall_axis == 1 else 1
+
+        door_coord = next_state[..., coord_axis]
+        in_door = torch.zeros_like(door_coord, dtype=torch.bool)
+        for i in range(self.num_doors):
+            door_center = float(self.door_positions[i])
+            door_size = float(self.door_sizes[i])
+            in_door |= (door_coord >= door_center - door_size - door_margin) & (
+                door_coord <= door_center + door_size + door_margin
+            )
+
+        started_low = state[..., wall_axis] < center
+        wall_low = center - half - agent_r
+        wall_high = center + half + agent_r
+        moving_into_from_low = started_low & (
+            next_state[..., wall_axis] > wall_low
+        )
+        moving_into_from_high = (~started_low) & (
+            next_state[..., wall_axis] < wall_high
+        )
+        blocked_low = moving_into_from_low & (~in_door)
+        blocked_high = moving_into_from_high & (~in_door)
+
+        wall_coord = next_state[..., wall_axis]
+        wall_coord = torch.where(
+            blocked_low, wall_coord.new_tensor(wall_low - 0.5), wall_coord
+        )
+        wall_coord = torch.where(
+            blocked_high, wall_coord.new_tensor(wall_high + 0.5), wall_coord
+        )
+        next_state = next_state.clone()
+        next_state[..., wall_axis] = wall_coord
+        return next_state
 
     def _set_goal_state(self, goal_state):
         self.target_position = torch.tensor(goal_state, dtype=torch.float32)

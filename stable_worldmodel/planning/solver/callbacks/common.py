@@ -76,3 +76,19 @@ class MeanCostRecorder(Callback):
     def compute(self, **state: Any) -> float | list[float]:
         costs: torch.Tensor = state['costs']
         return self._reduce(costs.mean(dim=1))
+
+
+class CandidateTraceRecorder(Callback):
+    """Record every model query (candidate sequences and returned costs).
+
+    This intentionally ignores ``reduction``: Gate-G0 diagnostics require the
+    exact candidates in their original order, not an aggregate.
+    """
+
+    name = 'model_queries'
+
+    def compute(self, **state: Any) -> dict[str, Any]:
+        return {
+            'candidates': state['candidates'].detach().cpu(),
+            'costs': state['costs'].detach().cpu(),
+        }

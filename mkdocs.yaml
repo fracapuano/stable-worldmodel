@@ -43,6 +43,7 @@ nav:
       - api/buffer.md
       - api/solver.md
       - api/planning.md
+      - api/backends.md
       - api/spaces.md
       - api/dataset.md
       - api/wrapper.md

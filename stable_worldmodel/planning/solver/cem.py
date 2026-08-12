@@ -129,6 +129,9 @@ class CEMSolver:
             'var': [],  # History of vars
         }
 
+        controller_seeds = info_dict.get('controller_seed')
+        decision_indices = info_dict.get('step_idx')
+
         # Batch size is taken from info_dict so callers can solve for a subset of envs
         total_envs = len(next(iter(info_dict.values())))
 
@@ -190,15 +193,53 @@ class CEMSolver:
 
             for step in range(self.n_steps):
                 # Sample action sequences: (Batch, Num_Samples, Horizon, Dim)
-                candidates = torch.randn(
-                    current_bs,
-                    self.num_samples,
-                    self.horizon,
-                    self.action_dim,
-                    generator=self.torch_gen,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
+                if controller_seeds is None:
+                    candidates = torch.randn(
+                        current_bs,
+                        self.num_samples,
+                        self.horizon,
+                        self.action_dim,
+                        generator=self.torch_gen,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                else:
+                    # Manifest evaluation uses one deterministic stream per
+                    # task and decision. This makes candidates independent of
+                    # batching and of other envs terminating early.
+                    sampled = []
+                    for global_idx in range(start_idx, end_idx):
+                        seed = int(
+                            torch.as_tensor(controller_seeds[global_idx])
+                            .reshape(-1)[0]
+                            .item()
+                        )
+                        decision = (
+                            0
+                            if decision_indices is None
+                            else int(
+                                torch.as_tensor(decision_indices[global_idx])
+                                .reshape(-1)[0]
+                                .item()
+                            )
+                        )
+                        stream_seed = (
+                            seed + 1_000_003 * decision + 10_007 * step
+                        ) % (2**63 - 1)
+                        generator = torch.Generator(
+                            device=self.device
+                        ).manual_seed(stream_seed)
+                        sampled.append(
+                            torch.randn(
+                                self.num_samples,
+                                self.horizon,
+                                self.action_dim,
+                                generator=generator,
+                                device=self.device,
+                                dtype=self.dtype,
+                            )
+                        )
+                    candidates = torch.stack(sampled)
 
                 # Scale and shift: (Batch, N, H, D) * (Batch, 1, H, D) + (Batch, 1, H, D)
                 candidates = candidates * batch_var.unsqueeze(
@@ -281,5 +322,6 @@ class CEMSolver:
                 cb.end_solve()
                 outputs['callbacks'][cb.output_key] = cb.history
 
-        print(f'CEM solve time: {time.time() - start_time:.4f} seconds')
+        outputs['solve_time_seconds'] = time.time() - start_time
+        print(f"CEM solve time: {outputs['solve_time_seconds']:.4f} seconds")
         return outputs
