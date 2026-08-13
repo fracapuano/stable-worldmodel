@@ -5,7 +5,11 @@ import pytest
 import torch
 
 import stable_worldmodel as swm
-from stable_worldmodel.backends import OracleModelBackend, replay_simulator
+from stable_worldmodel.backends import (
+    DecodedModelBackend,
+    OracleModelBackend,
+    replay_simulator,
+)
 from stable_worldmodel.evaluation import (
     EvaluationManifest,
     TaskKey,
@@ -17,6 +21,36 @@ from stable_worldmodel.planning import (
     ShootingCostEvaluator,
 )
 from stable_worldmodel.planning.solver.callbacks import CandidateTraceRecorder
+
+
+class ToyLatentDynamics(torch.nn.Module):
+    def encode(self, value):
+        value['emb'] = value['latent']
+        return value
+
+    def rollout(self, info, actions):
+        info['predicted_emb'] = actions[..., :2]
+        return info
+
+
+def test_decoded_backend_uses_physical_goal_and_decodes_rollout():
+    decoder = torch.nn.Linear(2, 2)
+    with torch.no_grad():
+        decoder.weight.copy_(2.0 * torch.eye(2))
+        decoder.bias.copy_(torch.tensor([1.0, -1.0]))
+    backend = DecodedModelBackend(ToyLatentDynamics(), decoder)
+
+    goal = backend.encode({'state': np.asarray([[4.0, 5.0]])})['emb']
+    result = backend.rollout(
+        {}, torch.tensor([[[[2.0, 3.0], [4.0, 5.0]]]])
+    )['predicted_emb']
+
+    assert torch.equal(goal, torch.tensor([[4.0, 5.0]]))
+    assert torch.equal(
+        result,
+        torch.tensor([[[[5.0, 5.0], [9.0, 9.0]]]]),
+    )
+    assert not any(parameter.requires_grad for parameter in decoder.parameters())
 
 
 def test_tworoom_oracle_matches_one_step_and_full_replay():

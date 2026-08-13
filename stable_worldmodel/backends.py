@@ -88,6 +88,73 @@ class LearnedModelBackend(nn.Module):
         return self.model.rollout(info_dict, action_candidates)
 
 
+class DecodedModelBackend(nn.Module):
+    """Decode a learned rollout into a privileged task-state representation.
+
+    This adapter keeps the underlying learned dynamics unchanged while making
+    its predicted states comparable to an oracle backend under one shared
+    task-space objective. The decoder is frozen by default and is applied only
+    after rollout; it is never used to correct or train the dynamics model.
+
+    Args:
+        model: Learned dynamics backend to roll out in its native latent space.
+        decoder: Module mapping the final latent dimension to task state.
+        state_key: Privileged goal-state key consumed by :meth:`encode`.
+        embedding_key: Goal key expected by planning objectives.
+        rollout_key: Learned rollout key decoded in place.
+        freeze_decoder: Put the decoder in eval mode and disable gradients.
+    """
+
+    def __init__(
+        self,
+        model: Dynamics,
+        decoder: nn.Module,
+        *,
+        state_key: str = 'state',
+        embedding_key: str = 'emb',
+        rollout_key: str = 'predicted_emb',
+        freeze_decoder: bool = True,
+    ) -> None:
+        super().__init__()
+        if not isinstance(model, Dynamics):
+            raise TypeError('model must implement the SWM Dynamics protocol')
+        self.model = model
+        self.decoder = decoder
+        self.state_key = state_key
+        self.embedding_key = embedding_key
+        self.rollout_key = rollout_key
+        if freeze_decoder:
+            self.decoder.eval()
+            self.decoder.requires_grad_(False)
+
+    def encode(self, x: dict) -> dict:
+        """Expose the privileged physical goal under the objective key."""
+        if self.state_key not in x:
+            raise KeyError(
+                f'decoded goal encoding requires {self.state_key!r}; '
+                f'available keys: {sorted(x)}'
+            )
+        state = x[self.state_key]
+        if not torch.is_tensor(state):
+            state = torch.as_tensor(state, dtype=torch.float32)
+        x[self.embedding_key] = state.to(dtype=torch.float32)
+        return x
+
+    def rollout(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> dict:
+        """Roll out learned dynamics and decode every predicted latent."""
+        info_dict = self.model.rollout(info_dict, action_candidates)
+        if self.rollout_key not in info_dict:
+            raise KeyError(
+                f'learned rollout did not populate {self.rollout_key!r}'
+            )
+        info_dict[self.rollout_key] = self.decoder(
+            info_dict[self.rollout_key]
+        )
+        return info_dict
+
+
 class OracleModelBackend(nn.Module):
     """Exact simulator adapter implementing SWM's ``Dynamics`` protocol.
 
@@ -247,6 +314,7 @@ def replay_simulator(
 
 
 __all__ = [
+    'DecodedModelBackend',
     'ExactSimulator',
     'LearnedModelBackend',
     'OracleModelBackend',
