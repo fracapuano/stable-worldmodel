@@ -44,7 +44,9 @@ def controller_hash(config: Any, *sources: Any) -> str:
         'config': _normalize(config),
         'source': source_text,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(',', ':')
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -88,7 +90,9 @@ class G0Audit:
     def write(self, path: str | Path) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + '\n')
+        path.write_text(
+            json.dumps(self.to_dict(), indent=2, sort_keys=True) + '\n'
+        )
         return path
 
 
@@ -111,6 +115,7 @@ def build_g0_audit(
     expected_episodes: int,
 ) -> G0Audit:
     """Evaluate every mandatory Experiment-0 invariant."""
+
     def initial_candidate(result):
         try:
             return result.model_queries[0]['solver_output']['callbacks'][
@@ -171,9 +176,21 @@ def build_g0_audit(
             'backend_identity',
             bool(learned.backend)
             and bool(oracle.backend)
-            and learned.backend != oracle.backend,
-            'two distinct, non-empty backend labels',
-            {'learned': learned.backend, 'oracle': oracle.backend},
+            and learned.backend != oracle.backend
+            and bool(learned.backend_type)
+            and bool(oracle.backend_type)
+            and learned.backend_type != oracle.backend_type,
+            'two distinct labels backed by two distinct runtime types',
+            {
+                'learned': {
+                    'label': learned.backend,
+                    'runtime_type': learned.backend_type,
+                },
+                'oracle': {
+                    'label': oracle.backend,
+                    'runtime_type': oracle.backend_type,
+                },
+            },
             detail='Guards against silent backend fallback.',
         ),
         Invariant(
@@ -226,11 +243,19 @@ def build_g0_audit(
     repeat_detail = []
     for first, second in deterministic_pairs:
         first_summary = [
-            (episode.task_key, episode.episode_return, [s.action for s in episode.steps])
+            (
+                episode.task_key,
+                episode.episode_return,
+                [s.action for s in episode.steps],
+            )
             for episode in first.episodes
         ]
         second_summary = [
-            (episode.task_key, episode.episode_return, [s.action for s in episode.steps])
+            (
+                episode.task_key,
+                episode.episode_return,
+                [s.action for s in episode.steps],
+            )
             for episode in second.episodes
         ]
         equal = jsonable(first_summary) == jsonable(second_summary)
@@ -252,7 +277,9 @@ def build_g0_audit(
         invariants=tuple(invariants),
         metadata={
             'learned_backend': learned.backend,
+            'learned_backend_type': learned.backend_type,
             'oracle_backend': oracle.backend,
+            'oracle_backend_type': oracle.backend_type,
             'manifest_digest': learned.manifest_digest,
         },
     )

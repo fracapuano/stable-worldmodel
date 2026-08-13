@@ -48,7 +48,9 @@ class TaskKey:
             tuple(sorted((str(k), v) for k, v in self.dynamics_parameters)),
         )
         object.__setattr__(
-            self, 'options', tuple(sorted((str(k), v) for k, v in self.options))
+            self,
+            'options',
+            tuple(sorted((str(k), v) for k, v in self.options)),
         )
 
     @property
@@ -65,15 +67,17 @@ class TaskKey:
         return value
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> 'TaskKey':
+    def from_dict(cls, value: dict[str, Any]) -> TaskKey:
         value = dict(value)
-        expected_key = value.pop('task_key', None)
+        if 'task_key' not in value:
+            raise ValueError('serialized task is missing required task_key')
+        expected_key = value.pop('task_key')
         value['dynamics_parameters'] = tuple(
             value.get('dynamics_parameters', {}).items()
         )
         value['options'] = tuple(value.get('options', {}).items())
         task = cls(**value)
-        if expected_key is not None and task.key != expected_key:
+        if task.key != expected_key:
             raise ValueError('task_key does not match the task contents')
         return task
 
@@ -92,13 +96,20 @@ class EvaluationManifest:
     metadata: tuple[tuple[str, Any], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        if self.schema_version != self.CURRENT_SCHEMA:
+            raise ValueError(
+                f'unsupported manifest schema_version {self.schema_version}; '
+                f'expected {self.CURRENT_SCHEMA}'
+            )
         if self.split not in SPLITS:
             raise ValueError(
                 f'unknown split {self.split!r}; expected one of {SPLITS}'
             )
         object.__setattr__(self, 'tasks', tuple(self.tasks))
         object.__setattr__(
-            self, 'metadata', tuple(sorted((str(k), v) for k, v in self.metadata))
+            self,
+            'metadata',
+            tuple(sorted((str(k), v) for k, v in self.metadata)),
         )
         if not self.tasks:
             raise ValueError('a manifest must contain at least one task')
@@ -149,13 +160,15 @@ class EvaluationManifest:
         return path
 
     @classmethod
-    def read(cls, path: str | Path) -> 'EvaluationManifest':
+    def read(cls, path: str | Path) -> EvaluationManifest:
         value = json.loads(Path(path).read_text())
-        expected_digest = value.pop('digest', None)
+        if 'digest' not in value:
+            raise ValueError(f'manifest is missing required digest: {path}')
+        expected_digest = value.pop('digest')
         tasks = tuple(TaskKey.from_dict(item) for item in value.pop('tasks'))
         value['metadata'] = tuple(value.get('metadata', {}).items())
         manifest = cls(tasks=tasks, **value)
-        if expected_digest is not None and manifest.digest != expected_digest:
+        if manifest.digest != expected_digest:
             raise ValueError(f'manifest digest mismatch for {path}')
         return manifest
 
@@ -180,9 +193,7 @@ def validate_manifest_suite(manifests: list[EvaluationManifest]) -> None:
             seen[key] = manifest.split
 
 
-def assert_paired(
-    left: EvaluationManifest, right: EvaluationManifest
-) -> None:
+def assert_paired(left: EvaluationManifest, right: EvaluationManifest) -> None:
     """Require exact ordered task and controller-RNG pairing."""
     if left.task_keys != right.task_keys:
         raise ValueError('paired manifests have different ordered task keys')

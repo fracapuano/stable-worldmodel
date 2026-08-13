@@ -585,7 +585,48 @@ class World:
         options = []
         for task in manifest.tasks:
             task_options = dict(task.options)
-            task_options.setdefault('state', np.asarray(task.start, dtype=np.float32))
+            if task.layout_seed != task.environment_seed:
+                raise ValueError(
+                    'this environment does not expose an independent layout '
+                    'seed; layout_seed must equal environment_seed'
+                )
+
+            dynamics = dict(task.dynamics_parameters)
+            noise_std = float(dynamics.pop('observation_noise_std', 0.0))
+            if noise_std != 0.0:
+                raise NotImplementedError(
+                    'manifest observation noise is not applied by World; '
+                    'configure a seeded observation-noise adapter before '
+                    'evaluating this task'
+                )
+
+            variation_values = task_options.get('variation_values', {})
+            missing_dynamics = sorted(set(dynamics) - set(variation_values))
+            if missing_dynamics:
+                raise ValueError(
+                    'manifest dynamics_parameters must be applied through '
+                    f'task options variation_values; missing {missing_dynamics}'
+                )
+            mismatched_dynamics = []
+            for key, expected in dynamics.items():
+                actual = variation_values[key]
+                try:
+                    matches = np.allclose(
+                        np.asarray(actual).reshape(-1),
+                        np.asarray(expected).reshape(-1),
+                    )
+                except (TypeError, ValueError):
+                    matches = actual == expected
+                if not bool(matches):
+                    mismatched_dynamics.append(key)
+            if mismatched_dynamics:
+                raise ValueError(
+                    'manifest dynamics_parameters disagree with task options '
+                    f'variation_values: {sorted(mismatched_dynamics)}'
+                )
+            task_options.setdefault(
+                'state', np.asarray(task.start, dtype=np.float32)
+            )
             task_options.setdefault(
                 'target_state', np.asarray(task.goal, dtype=np.float32)
             )
@@ -699,6 +740,7 @@ class World:
         )
         results = EvaluationResults(
             backend=backend,
+            backend_type=self._manifest_backend_type(),
             manifest_digest=manifest.digest,
             episodes=episodes,
             model_queries=tuple(model_queries),
@@ -709,6 +751,19 @@ class World:
             },
         )
         return results
+
+    def _manifest_backend_type(self) -> str:
+        """Return the runtime type of the dynamics backend used by the policy."""
+        solver = getattr(self.policy, 'solver', None)
+        cost = getattr(solver, 'cost', None)
+        backend = getattr(cost, 'model', cost)
+        if backend is None:
+            raise RuntimeError(
+                'manifest evaluation requires a policy with an inspectable '
+                'solver cost/backend'
+            )
+        backend_cls = type(backend)
+        return f'{backend_cls.__module__}.{backend_cls.__qualname__}'
 
     def _evaluate_from_dataset(
         self,

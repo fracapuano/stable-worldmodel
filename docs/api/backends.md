@@ -56,6 +56,14 @@ checks required split coverage and leakage. Manifest-driven `World.evaluate`
 returns ordered `EvaluationResults` with per-episode metrics and optional full
 transition/model-query traces.
 
+Manifest evaluation fails closed when a declared task setting is not applied.
+Environments without an independent layout-seed adapter require
+`layout_seed == environment_seed`; non-zero observation noise requires a seeded
+observation-noise adapter; and dynamics parameters must be mirrored by the
+task's environment-specific `variation_values`. Results also record the runtime
+backend type separately from the caller's display label so an audit cannot pass
+by merely relabelling the same backend.
+
 `controller_hash` hashes canonical configuration plus controller source.
 `build_g0_audit` compares paired results and emits a machine-readable report
 that fails on replay error, controller/task/RNG/budget/stopping mismatches,

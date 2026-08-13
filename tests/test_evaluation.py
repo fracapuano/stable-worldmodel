@@ -41,6 +41,36 @@ def test_manifest_round_trip_and_immutable_write(tmp_path):
         EvaluationManifest.read(path)
 
 
+def test_manifest_read_requires_integrity_fields(tmp_path):
+    manifest = make_manifest('validation')
+
+    missing_digest = manifest.to_dict()
+    missing_digest.pop('digest')
+    digest_path = tmp_path / 'missing-digest.json'
+    digest_path.write_text(json.dumps(missing_digest))
+    with pytest.raises(ValueError, match='required digest'):
+        EvaluationManifest.read(digest_path)
+
+    missing_task_key = manifest.to_dict()
+    missing_task_key['tasks'][0].pop('task_key')
+    task_path = tmp_path / 'missing-task-key.json'
+    task_path.write_text(json.dumps(missing_task_key))
+    with pytest.raises(ValueError, match='required task_key'):
+        EvaluationManifest.read(task_path)
+
+
+def test_manifest_rejects_unknown_schema_version():
+    with pytest.raises(
+        ValueError, match='unsupported manifest schema_version'
+    ):
+        EvaluationManifest(
+            split='validation',
+            environment='swm/TwoRoom-v1',
+            tasks=make_manifest('validation').tasks,
+            schema_version=EvaluationManifest.CURRENT_SCHEMA + 1,
+        )
+
+
 def test_manifest_suite_is_complete_and_disjoint():
     suite = [make_manifest(split, i) for i, split in enumerate(SPLITS)]
     validate_manifest_suite(suite)
@@ -59,7 +89,10 @@ def test_pairing_is_order_sensitive():
     first = EvaluationManifest(
         split='validation',
         environment='swm/TwoRoom-v1',
-        tasks=(make_manifest('validation', 1).tasks[0], make_manifest('validation', 2).tasks[0]),
+        tasks=(
+            make_manifest('validation', 1).tasks[0],
+            make_manifest('validation', 2).tasks[0],
+        ),
     )
     same = EvaluationManifest(
         split='validation', environment='swm/TwoRoom-v1', tasks=first.tasks

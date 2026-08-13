@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 import numpy as np
+import pytest
 import torch
 
 import stable_worldmodel as swm
@@ -10,14 +11,16 @@ from stable_worldmodel.evaluation import (
     TaskKey,
     build_g0_audit,
 )
-from stable_worldmodel.planning import CEMSolver, GoalMSE, ShootingCostEvaluator
+from stable_worldmodel.planning import (
+    CEMSolver,
+    GoalMSE,
+    ShootingCostEvaluator,
+)
 from stable_worldmodel.planning.solver.callbacks import CandidateTraceRecorder
 
 
 def test_tworoom_oracle_matches_one_step_and_full_replay():
-    world = swm.World(
-        'swm/TwoRoom-v1', num_envs=1, image_shape=(32, 32)
-    )
+    world = swm.World('swm/TwoRoom-v1', num_envs=1, image_shape=(32, 32))
     try:
         for seed in (0, 1, 2, 7, 31):
             world.reset(seed=seed, options={'variation': ['all']})
@@ -38,9 +41,7 @@ def test_tworoom_oracle_matches_one_step_and_full_replay():
 
 
 def test_oracle_rollout_honors_action_blocks_without_mutating_env():
-    world = swm.World(
-        'swm/TwoRoom-v1', num_envs=1, image_shape=(32, 32)
-    )
+    world = swm.World('swm/TwoRoom-v1', num_envs=1, image_shape=(32, 32))
     try:
         world.reset(seed=8)
         env = world.envs.envs[0].unwrapped
@@ -104,9 +105,7 @@ def test_manifest_world_evaluation_is_deterministic_and_traced():
     )
     policy = swm.policy.WorldModelPolicy(
         solver=solver,
-        config=swm.PlanConfig(
-            horizon=2, receding_horizon=1, warm_start=False
-        ),
+        config=swm.PlanConfig(horizon=2, receding_horizon=1, warm_start=False),
     )
     world.set_policy(policy)
     try:
@@ -137,11 +136,12 @@ def test_manifest_world_evaluation_is_deterministic_and_traced():
     assert first.controller_seeds == manifest.controller_seeds
     assert first_actions == second_actions
     assert len(first.model_queries) == 3
-    assert 'model_queries' in first.model_queries[0]['solver_output']['callbacks']
+    assert (
+        'model_queries' in first.model_queries[0]['solver_output']['callbacks']
+    )
+    assert first.backend_type.endswith('.OracleModelBackend')
 
-    audit = build_g0_audit(
-        replace(first, backend='pretrained'),
-        replace(second, backend='oracle'),
+    audit_kwargs = dict(
         learned_controller_hash='same',
         oracle_controller_hash='same',
         one_step_error=0.0,
@@ -156,4 +156,83 @@ def test_manifest_world_evaluation_is_deterministic_and_traced():
         spt_revision='test',
         expected_episodes=2,
     )
+
+    relabelled = build_g0_audit(
+        replace(first, backend='pretrained'),
+        replace(second, backend='oracle'),
+        **audit_kwargs,
+    )
+    assert not relabelled.passed
+    assert not next(
+        item
+        for item in relabelled.invariants
+        if item.name == 'backend_identity'
+    ).passed
+
+    audit = build_g0_audit(
+        replace(
+            first,
+            backend='pretrained',
+            backend_type='stable_worldmodel.backends.LearnedModelBackend',
+        ),
+        replace(second, backend='oracle'),
+        **audit_kwargs,
+    )
     assert audit.passed
+
+
+@pytest.mark.parametrize(
+    ('task', 'error', 'match'),
+    [
+        (
+            TaskKey(
+                environment_seed=1,
+                controller_seed=2,
+                layout_seed=99,
+                start=(50.0, 50.0),
+                goal=(175.0, 175.0),
+                observation_noise_seed=3,
+            ),
+            ValueError,
+            'layout_seed must equal environment_seed',
+        ),
+        (
+            TaskKey(
+                environment_seed=1,
+                controller_seed=2,
+                layout_seed=1,
+                start=(50.0, 50.0),
+                goal=(175.0, 175.0),
+                observation_noise_seed=3,
+                dynamics_parameters=(('observation_noise_std', 0.05),),
+            ),
+            NotImplementedError,
+            'observation noise is not applied',
+        ),
+        (
+            TaskKey(
+                environment_seed=1,
+                controller_seed=2,
+                layout_seed=1,
+                start=(50.0, 50.0),
+                goal=(175.0, 175.0),
+                observation_noise_seed=3,
+                dynamics_parameters=(('agent.speed', 7.0),),
+            ),
+            ValueError,
+            'variation_values',
+        ),
+    ],
+)
+def test_manifest_evaluation_rejects_unapplied_task_fields(task, error, match):
+    manifest = EvaluationManifest(
+        split='validation',
+        environment='swm/TwoRoom-v1',
+        tasks=(task,),
+    )
+    world = swm.World('swm/TwoRoom-v1', num_envs=1, image_shape=(32, 32))
+    try:
+        with pytest.raises(error, match=match):
+            world.evaluate(manifest=manifest, eval_budget=1)
+    finally:
+        world.close()

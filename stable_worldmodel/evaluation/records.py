@@ -83,10 +83,15 @@ class EvaluationResults:
     episodes: tuple[EpisodeResult, ...]
     model_queries: tuple[dict[str, Any], ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    backend_type: str = ''
 
     @property
     def success_rate(self) -> float:
-        return 100.0 * sum(ep.success for ep in self.episodes) / len(self.episodes)
+        return (
+            100.0
+            * sum(ep.success for ep in self.episodes)
+            / len(self.episodes)
+        )
 
     @property
     def task_keys(self) -> tuple[str, ...]:
@@ -104,7 +109,9 @@ class EvaluationResults:
     def write(self, path: str | Path) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + '\n')
+        path.write_text(
+            json.dumps(self.to_dict(), indent=2, sort_keys=True) + '\n'
+        )
         return path
 
     def write_binary(self, path: str | Path) -> Path:

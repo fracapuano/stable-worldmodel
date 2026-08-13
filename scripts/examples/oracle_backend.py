@@ -2,7 +2,11 @@
 
 import stable_worldmodel as swm
 from stable_worldmodel.evaluation import EvaluationManifest, TaskKey
-from stable_worldmodel.planning import CEMSolver, GoalMSE, ShootingCostEvaluator
+from stable_worldmodel.planning import (
+    CEMSolver,
+    GoalMSE,
+    ShootingCostEvaluator,
+)
 
 
 def main():
@@ -40,9 +44,7 @@ def main():
     )
     policy = swm.policy.WorldModelPolicy(
         solver=solver,
-        config=swm.PlanConfig(
-            horizon=3, receding_horizon=1, warm_start=False
-        ),
+        config=swm.PlanConfig(horizon=3, receding_horizon=1, warm_start=False),
     )
     world = swm.World(
         'swm/TwoRoom-v1',

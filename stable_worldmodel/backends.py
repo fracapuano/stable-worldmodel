@@ -70,7 +70,7 @@ class LearnedModelBackend(nn.Module):
         cache_dir: str | None = None,
         freeze: bool = True,
         map_location: str | torch.device | None = None,
-    ) -> 'LearnedModelBackend':
+    ) -> LearnedModelBackend:
         """Load an SWM checkpoint through the package checkpoint utility."""
         from stable_worldmodel.wm.utils import load_pretrained
 
@@ -82,7 +82,9 @@ class LearnedModelBackend(nn.Module):
     def encode(self, x: dict) -> dict:
         return self.model.encode(x)
 
-    def rollout(self, info_dict: dict, action_candidates: torch.Tensor) -> dict:
+    def rollout(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> dict:
         return self.model.rollout(info_dict, action_candidates)
 
 
@@ -199,9 +201,13 @@ class OracleModelBackend(nn.Module):
             if self.decode_action is not None:
                 actions = self.decode_action(actions)
                 if not torch.is_tensor(actions):
-                    actions = torch.as_tensor(actions, device=device, dtype=dtype)
+                    actions = torch.as_tensor(
+                        actions, device=device, dtype=dtype
+                    )
 
-            initial = simulator.get_oracle_state().to(device=device, dtype=dtype)
+            initial = simulator.get_oracle_state().to(
+                device=device, dtype=dtype
+            )
             state = initial.expand(samples, *initial.shape).clone()
             states = [state]
             for plan_step in range(horizon):

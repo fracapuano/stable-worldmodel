@@ -712,14 +712,16 @@ class TwoRoomEnv(gym.Env):
 
     def set_oracle_state(self, state):
         """Restore a state previously returned by ``get_oracle_state``."""
-        self.agent_position = torch.as_tensor(
-            state, dtype=torch.float32
-        ).detach().clone()
+        self.agent_position = (
+            torch.as_tensor(state, dtype=torch.float32).detach().clone()
+        )
 
     def oracle_transition(self, state, action):
         """Vectorized, side-effect-free equivalent of one ``step`` transition."""
         state = torch.as_tensor(state)
-        action = torch.as_tensor(action, device=state.device, dtype=state.dtype)
+        action = torch.as_tensor(
+            action, device=state.device, dtype=state.dtype
+        )
         action = action.clamp(-1.0, 1.0)
         speed = float(self.variation_space['agent']['speed'].value.item())
         next_state = state + action * speed
@@ -740,9 +742,9 @@ class TwoRoomEnv(gym.Env):
         for i in range(self.num_doors):
             door_center = float(self.door_positions[i])
             door_size = float(self.door_sizes[i])
-            in_door |= (door_coord >= door_center - door_size - door_margin) & (
-                door_coord <= door_center + door_size + door_margin
-            )
+            in_door |= (
+                door_coord >= door_center - door_size - door_margin
+            ) & (door_coord <= door_center + door_size + door_margin)
 
         started_low = state[..., wall_axis] < center
         wall_low = center - half - agent_r
