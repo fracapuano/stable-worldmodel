@@ -13,6 +13,36 @@ def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 
+def _population_affine(x, value):
+    """Broadcast one affine vector per population member over ``x``."""
+    shape = (value.size(0),) + (1,) * (x.ndim - 2) + (value.size(-1),)
+    return value.reshape(shape)
+
+
+def _population_linear(x, weight, bias=None):
+    """Linear projection with weights shaped ``(population, out, in)``."""
+    shape = x.shape
+    output = torch.bmm(
+        x.reshape(shape[0], -1, shape[-1]), weight.transpose(1, 2)
+    ).reshape(*shape[:-1], weight.size(1))
+    if bias is not None:
+        output = output + _population_affine(output, bias)
+    return output
+
+
+def _population_layer_norm(x, weight=None, bias=None, *, eps=1e-5):
+    """Layer normalization with optional candidate-specific affine terms."""
+    mean = x.mean(dim=-1, keepdim=True)
+    normalized = (x - mean) * torch.rsqrt(
+        (x - mean).square().mean(dim=-1, keepdim=True) + eps
+    )
+    if weight is not None:
+        normalized = normalized * _population_affine(normalized, weight)
+    if bias is not None:
+        normalized = normalized + _population_affine(normalized, bias)
+    return normalized
+
+
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""
 
@@ -292,3 +322,167 @@ class Predictor(nn.Module):
         x = self.dropout(x)
         x = self.transformer(x, c)
         return x
+
+    @property
+    def population_parameter_names(self):
+        """Stable parameter order consumed by :meth:`forward_population`."""
+        return tuple(name for name, _ in self.named_parameters())
+
+    @staticmethod
+    def _project_population(x, module, state, prefix):
+        if isinstance(module, nn.Identity):
+            return x
+        if not isinstance(module, nn.Linear):
+            raise TypeError(
+                'population predictor projections must be Linear or Identity, '
+                f'got {type(module).__name__}'
+            )
+        bias = state.get(f'{prefix}.bias')
+        return _population_linear(x, state[f'{prefix}.weight'], bias)
+
+    def _attention_population(self, x, attention, state, prefix):
+        norm_prefix = f'{prefix}.norm'
+        x = _population_layer_norm(
+            x,
+            state[f'{norm_prefix}.weight'],
+            state[f'{norm_prefix}.bias'],
+            eps=attention.norm.eps,
+        )
+        qkv = _population_linear(x, state[f'{prefix}.to_qkv.weight'])
+        q, k, v = qkv.chunk(3, dim=-1)
+        q, k, v = (
+            rearrange(t, 'p b t (h d) -> p b h t d', h=attention.heads)
+            for t in (q, k, v)
+        )
+        output = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, is_causal=True
+        )
+        output = rearrange(output, 'p b h t d -> p b t (h d)')
+        return self._project_population(
+            output,
+            attention.to_out[0]
+            if isinstance(attention.to_out, nn.Sequential)
+            else attention.to_out,
+            state,
+            f'{prefix}.to_out.0'
+            if isinstance(attention.to_out, nn.Sequential)
+            else f'{prefix}.to_out',
+        )
+
+    def _feedforward_population(self, x, feedforward, state, prefix):
+        norm = feedforward.net[0]
+        x = _population_layer_norm(
+            x,
+            state[f'{prefix}.net.0.weight'],
+            state[f'{prefix}.net.0.bias'],
+            eps=norm.eps,
+        )
+        x = _population_linear(
+            x,
+            state[f'{prefix}.net.1.weight'],
+            state[f'{prefix}.net.1.bias'],
+        )
+        activation = feedforward.net[2]
+        if not isinstance(activation, nn.GELU):
+            raise TypeError(
+                'population predictor feed-forward activation must be GELU, '
+                f'got {type(activation).__name__}'
+            )
+        x = F.gelu(x, approximate=activation.approximate)
+        return _population_linear(
+            x,
+            state[f'{prefix}.net.4.weight'],
+            state[f'{prefix}.net.4.bias'],
+        )
+
+    def forward_population(self, x, c, parameters):
+        """Evaluate independently parameterized predictors in one tensor graph.
+
+        Args:
+            x: Embeddings shaped ``(population, batch, time, dim)``.
+            c: Conditioning embeddings with the same leading dimensions.
+            parameters: Tuple of tensors ordered like
+                :attr:`population_parameter_names`; every tensor has a leading
+                population dimension followed by the corresponding parameter
+                shape.
+
+        This inference-only path applies candidate-specific linear and
+        normalization weights explicitly.  Attention sees the population as
+        an ordinary batch dimension, avoiding ``vmap`` fallbacks around scaled
+        dot-product attention while retaining fused CUDA attention kernels.
+        """
+        if self.training:
+            raise RuntimeError(
+                'forward_population is inference-only; call eval()'
+            )
+        names = self.population_parameter_names
+        if len(parameters) != len(names):
+            raise ValueError(
+                f'expected {len(names)} predictor parameter tensors, '
+                f'got {len(parameters)}'
+            )
+        state = dict(zip(names, parameters, strict=True))
+        population = x.size(0)
+        if c.size(0) != population or any(
+            value.size(0) != population for value in parameters
+        ):
+            raise ValueError(
+                'all population inputs must share their leading size'
+            )
+
+        time = x.size(2)
+        x = x + state['pos_embedding'][:, :, :time]
+        transformer = self.transformer
+        x = self._project_population(
+            x, transformer.input_proj, state, 'transformer.input_proj'
+        )
+        c = self._project_population(
+            c, transformer.cond_proj, state, 'transformer.cond_proj'
+        )
+
+        for index, block in enumerate(transformer.layers):
+            if not isinstance(block, ConditionalBlock):
+                raise TypeError(
+                    'population predictor requires ConditionalBlock layers, '
+                    f'got {type(block).__name__}'
+                )
+            prefix = f'transformer.layers.{index}'
+            modulation = _population_linear(
+                F.silu(c),
+                state[f'{prefix}.adaLN_modulation.1.weight'],
+                state[f'{prefix}.adaLN_modulation.1.bias'],
+            )
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = modulation.chunk(6, dim=-1)
+            attn_input = modulate(
+                _population_layer_norm(x, eps=block.norm1.eps),
+                shift_msa,
+                scale_msa,
+            )
+            x = x + gate_msa * self._attention_population(
+                attn_input, block.attn, state, f'{prefix}.attn'
+            )
+            mlp_input = modulate(
+                _population_layer_norm(x, eps=block.norm2.eps),
+                shift_mlp,
+                scale_mlp,
+            )
+            x = x + gate_mlp * self._feedforward_population(
+                mlp_input, block.mlp, state, f'{prefix}.mlp'
+            )
+
+        x = _population_layer_norm(
+            x,
+            state['transformer.norm.weight'],
+            state['transformer.norm.bias'],
+            eps=transformer.norm.eps,
+        )
+        return self._project_population(
+            x, transformer.output_proj, state, 'transformer.output_proj'
+        )

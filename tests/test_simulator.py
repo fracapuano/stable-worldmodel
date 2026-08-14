@@ -114,6 +114,25 @@ def test_tworoom_transition_supports_planner_batches(two_room_world):
     assert torch.equal(simulator.agent_position, initial)
 
 
+def test_tworoom_transition_is_fullgraph_compilable(two_room_world):
+    two_room_world.reset(seed=4)
+    simulator = two_room_world.envs.envs[0].unwrapped
+
+    def rollout(state, actions):
+        for step in range(actions.size(1)):
+            state = simulator.get_next_state(state, actions[:, step])
+        return state
+
+    state = simulator.agent_position.expand(3, -1).clone()
+    actions = torch.randn(3, 4, 2)
+    expected = rollout(state, actions)
+    compiled = torch.compile(
+        rollout, backend='aot_eager', fullgraph=True, dynamic=False
+    )
+
+    torch.testing.assert_close(compiled(state, actions), expected)
+
+
 def test_rollout_decodes_actions_and_batches_simulator_calls():
     class BatchSimulator:
         class ActionSpace:

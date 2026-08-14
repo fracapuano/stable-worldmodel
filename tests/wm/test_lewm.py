@@ -11,10 +11,12 @@ parity of ``GoalMSE`` with the old ``criterion`` lives in
 import pytest
 import torch
 from torch import nn
+from torch.func import functional_call
 
 from stable_worldmodel.planning import ShootingCostEvaluator, GoalMSE
 from stable_worldmodel.protocols import Dynamics
 from stable_worldmodel.wm.lewm.lewm import LeWM
+from stable_worldmodel.wm.lewm.module import Predictor
 
 # CEM-like dimensions
 B, S, T, D, H, A = 2, 3, 2, 5, 4, 2
@@ -273,3 +275,96 @@ def test_rollout_rejects_multiframe_pixels_without_action_history():
     info = _rollout_info(hist_len=3)
     with pytest.raises(AssertionError, match='action_history'):
         model.rollout(info, torch.randn(RB, RS, 4, RD))
+
+
+def _population_predictor():
+    return Predictor(
+        num_frames=3,
+        depth=2,
+        heads=2,
+        mlp_dim=8,
+        input_dim=4,
+        hidden_dim=4,
+        output_dim=4,
+        dim_head=2,
+        dropout=0.0,
+        emb_dropout=0.0,
+    ).eval()
+
+
+def _stacked_predictor_parameters(predictor, population=2):
+    generator = torch.Generator().manual_seed(123)
+    values = []
+    for _, parameter in predictor.named_parameters():
+        perturbation = torch.randn(
+            parameter.shape, generator=generator, dtype=parameter.dtype
+        )
+        candidates = [parameter]
+        candidates.extend(
+            parameter + (index + 1) * 1e-3 * perturbation
+            for index in range(population - 1)
+        )
+        values.append(torch.stack(candidates))
+    return tuple(values)
+
+
+def test_predictor_population_forward_matches_serial_functional_calls():
+    torch.manual_seed(0)
+    predictor = _population_predictor()
+    parameters = _stacked_predictor_parameters(predictor, population=3)
+    x = torch.randn(3, 5, 3, 4)
+    conditioning = torch.randn_like(x)
+
+    actual = predictor.forward_population(x, conditioning, parameters)
+    expected = torch.stack(
+        [
+            functional_call(
+                predictor,
+                {
+                    name: parameters[index][candidate]
+                    for index, name in enumerate(
+                        predictor.population_parameter_names
+                    )
+                },
+                (x[candidate], conditioning[candidate]),
+            )
+            for candidate in range(3)
+        ]
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+def test_population_latent_rollout_matches_serial_predictor_models():
+    torch.manual_seed(0)
+    predictor = _population_predictor()
+    model = LeWM(
+        encoder=nn.Identity(),
+        predictor=predictor,
+        action_encoder=nn.Identity(),
+    ).eval()
+    parameters = _stacked_predictor_parameters(predictor, population=2)
+    emb = torch.randn(2, 1, 4)
+    actions = torch.randn(2, 2, 3, 4, 4)
+
+    actual = model.rollout_population_from_embeddings(emb, actions, parameters)
+    expected = []
+    original = {
+        name: value.detach().clone()
+        for name, value in predictor.named_parameters()
+    }
+    with torch.no_grad():
+        for candidate in range(2):
+            for index, name in enumerate(predictor.population_parameter_names):
+                dict(predictor.named_parameters())[name].copy_(
+                    parameters[index][candidate]
+                )
+            expected.append(
+                model.rollout_from_embeddings(emb, actions[candidate])
+            )
+        for name, value in predictor.named_parameters():
+            value.copy_(original[name])
+
+    torch.testing.assert_close(
+        actual, torch.stack(expected), rtol=3e-5, atol=3e-6
+    )
