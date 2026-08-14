@@ -31,6 +31,43 @@ summary: Model-based planning solvers for action optimization
 
 ::: stable_worldmodel.planning.solver.CEMSolver.solve
 
+### Accelerated LeWM CEM
+
+`AcceleratedCEMSolver` is an opt-in, PyTorch-only execution path for tensor
+costs such as `LatentGoalCost`. It encodes observations once, keeps CEM state
+and all random candidates on the planning device, and copies only the final
+plan back to the host. CUDA uses `torch.compile` by default; MPS and CPU use
+the same tensor kernel eagerly unless `compile_kernel=True` is requested.
+
+```python
+from stable_worldmodel.planning import (
+    AcceleratedCEMSolver,
+    LatentGoalCost,
+)
+
+cost = LatentGoalCost(learned_model_backend)
+solver = AcceleratedCEMSolver(
+    cost=cost,
+    num_samples=100,
+    n_steps=15,
+    topk=10,
+    device='cuda',
+)
+```
+
+The first CUDA solve includes graph compilation; reuse the solver to amortize
+it. Per-iteration callbacks are unavailable on this path because exposing loop
+intermediates would break the compiled execution contract. The regular
+`CEMSolver` remains the reference implementation and supports callbacks.
+
+::: stable_worldmodel.planning.solver.AcceleratedCEMSolver
+    options:
+        heading_level: 3
+        members: false
+        show_source: false
+
+::: stable_worldmodel.planning.solver.AcceleratedCEMSolver.solve
+
 ::: stable_worldmodel.planning.solver.ICEMSolver
     options:
         heading_level: 3

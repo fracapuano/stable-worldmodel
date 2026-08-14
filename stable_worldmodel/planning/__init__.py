@@ -19,6 +19,7 @@ from stable_worldmodel.planning.objective import (
 # so ``from stable_worldmodel.planning import CEMSolver`` works alongside
 # ``from stable_worldmodel.planning.solver import CEMSolver``.
 from stable_worldmodel.planning.solver import (
+    AcceleratedCEMSolver,
     CategoricalCEMSolver,
     CEMSolver,
     GradientSolver,
@@ -29,6 +30,7 @@ from stable_worldmodel.planning.solver import (
     PredictiveSamplingSolver,
     Solver,
 )
+from stable_worldmodel.planning.tensor_cost import LatentGoalCost
 
 # Re-exported from stable_worldmodel.protocols (their canonical home) so that
 # ``from stable_worldmodel.planning import Objective, Dynamics`` keeps working.
@@ -40,6 +42,7 @@ from stable_worldmodel.protocols import (
 )
 
 __all__ = [
+    'AcceleratedCEMSolver',
     'CEMSolver',
     'CategoricalCEMSolver',
     'Constrainable',
@@ -50,6 +53,7 @@ __all__ = [
     'GradientSolver',
     'ICEMSolver',
     'LagrangianSolver',
+    'LatentGoalCost',
     'MPPISolver',
     'Objective',
     'PGDSolver',

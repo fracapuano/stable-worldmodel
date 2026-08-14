@@ -12,7 +12,7 @@ import pytest
 import torch
 from torch import nn
 
-from stable_worldmodel.planning import ShootingCostEvaluator, GoalMSE
+from stable_worldmodel.planning import GoalMSE, ShootingCostEvaluator
 from stable_worldmodel.protocols import Dynamics
 from stable_worldmodel.wm.lewm.lewm import LeWM
 
@@ -192,6 +192,27 @@ def test_rollout_h1_matches_legacy_semantics():
     )
     assert 'action_history' not in out
     torch.testing.assert_close(out['action'], candidates[:, :, :1])
+
+
+def test_pure_tensor_rollout_matches_dictionary_rollout():
+    """The accelerated tensor seam must preserve the reference rollout."""
+    torch.manual_seed(0)
+    model = _toy_model()
+    emb = torch.randn(RB, 3, RD)
+    past = torch.randn(RB, 2, RD)
+    candidates = torch.randn(RB, RS, 4, RD)
+    info = _rollout_info(
+        hist_len=3,
+        emb=emb.unsqueeze(1).expand(RB, RS, -1, -1),
+    )
+    info['action_history'] = past.unsqueeze(1).expand(RB, RS, -1, -1)
+
+    reference = model.rollout(dict(info), candidates)['predicted_emb']
+    accelerated = model.rollout_from_embeddings(
+        emb, candidates, action_history=past
+    )
+
+    torch.testing.assert_close(accelerated, reference)
 
 
 def test_rollout_consumes_past_actions_in_order():
