@@ -82,6 +82,10 @@ class TwoRoomEnv(gym.Env):
         self.num_doors = 1
         self.door_positions = torch.zeros(self.MAX_DOOR, dtype=torch.float32)
         self.door_sizes = torch.zeros(self.MAX_DOOR, dtype=torch.float32)
+        self.door_position_values = (0.0,) * self.MAX_DOOR
+        self.door_size_values = (0.0,) * self.MAX_DOOR
+        self.agent_speed = 5.0
+        self.agent_radius = 7.0
         self.wall_pos = float(self.WALL_CENTER)
 
     # ---------------- Variation Space ----------------
@@ -286,11 +290,12 @@ class TwoRoomEnv(gym.Env):
 
     def get_next_state(self, state, action):
         """Return the exact next state without mutating the environment."""
-        state = torch.as_tensor(state, dtype=torch.float32)
-        action = torch.as_tensor(action, dtype=torch.float32)
-        action = torch.clamp(action, -1.0, 1.0)
-        speed = float(self.variation_space['agent']['speed'].value.item())
-        return self._apply_collisions(state, state + action * speed)
+        state = torch.as_tensor(state)
+        action = torch.as_tensor(
+            action, device=state.device, dtype=state.dtype
+        )
+        action = action.clamp(-1.0, 1.0)
+        return self._apply_collisions(state, state + action * self.agent_speed)
 
     def render(self):
         # returns HWC uint8 numpy for compatibility with PIL/wrappers
@@ -321,6 +326,21 @@ class TwoRoomEnv(gym.Env):
         self.door_sizes = torch.as_tensor(
             door_size, dtype=torch.float32
         )  # half-extent
+        # Keep immutable Python scalars alongside the tensors. The exact
+        # transition uses these constants so a batched rollout can be captured
+        # by torch.compile without data-dependent Tensor.item() guards.
+        self.door_position_values = tuple(
+            float(value) for value in self.door_positions
+        )
+        self.door_size_values = tuple(
+            float(value) for value in self.door_sizes
+        )
+        self.agent_speed = float(
+            self.variation_space['agent']['speed'].value.item()
+        )
+        self.agent_radius = float(
+            self.variation_space['agent']['radius'].value.item()
+        )
 
         # For policy / observation: wall position on relevant axis
         self.wall_pos = float(self.WALL_CENTER)
@@ -497,7 +517,7 @@ class TwoRoomEnv(gym.Env):
         """
         bs = float(self.BORDER_SIZE)
         door_margin = 1.75  # was 0.5 * 3.5 scale
-        agent_r = float(self.variation_space['agent']['radius'].value.item())
+        agent_r = self.agent_radius
 
         # border clamp first - account for agent radius
         lower = bs + agent_r
@@ -512,8 +532,8 @@ class TwoRoomEnv(gym.Env):
         door_coord = pos2c[..., door_axis]
         in_door = torch.zeros_like(door_coord, dtype=torch.bool)
         for i in range(self.num_doors):
-            c = float(self.door_positions[i])
-            s = float(self.door_sizes[i])
+            c = self.door_position_values[i]
+            s = self.door_size_values[i]
             in_door |= (door_coord >= c - s - door_margin) & (
                 door_coord <= c + s + door_margin
             )

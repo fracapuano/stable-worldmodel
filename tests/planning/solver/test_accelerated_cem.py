@@ -9,8 +9,12 @@ from torch import nn
 from stable_worldmodel.planning.solver import (
     AcceleratedCEMSolver,
     CEMSolver,
+    PopulationAcceleratedCEMSolver,
 )
+from stable_worldmodel.planning.tensor_cost import PopulationLatentGoalCost
 from stable_worldmodel.policy import PlanConfig
+from stable_worldmodel.wm.lewm.lewm import LeWM
+from stable_worldmodel.wm.lewm.module import Predictor
 
 
 class DictionaryQuadraticCost(nn.Module):
@@ -61,6 +65,36 @@ class ParameterizedTensorCost(TensorQuadraticCost):
     ) -> torch.Tensor:
         return (
             (candidates - target[:, None] * self.target_scale)
+            .square()
+            .sum(dim=(-1, -2))
+        )
+
+
+class PopulationTargetCost(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+
+    def prepare(
+        self,
+        info_dict: dict,
+        *,
+        device: str | torch.device,
+        dtype: torch.dtype,
+        action_dim: int,
+    ) -> tuple[torch.Tensor]:
+        del action_dim
+        return (info_dict['target'].to(device=device, dtype=dtype),)
+
+    def forward(
+        self,
+        candidates: torch.Tensor,
+        parameters: tuple[torch.Tensor, ...],
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        scale = parameters[0].reshape(-1, 1, 1, 1, 1)
+        return (
+            (candidates - target[None, :, None] * scale)
             .square()
             .sum(dim=(-1, -2))
         )
@@ -179,3 +213,139 @@ def test_compiled_kernel_reads_updated_model_parameters():
     second = solver.solve(info)['actions']
 
     assert not torch.equal(first, second)
+
+
+def _reference_population_cem(noise, target, scales, *, topk, var_scale):
+    population = scales.numel()
+    mean = torch.zeros(
+        population, target.size(0), target.size(1), target.size(2)
+    )
+    var = torch.full_like(mean, var_scale)
+    costs = mean.new_zeros(mean.shape[:2])
+    for step_noise in noise:
+        sampled = step_noise.unsqueeze(0) * var.unsqueeze(2) + mean.unsqueeze(
+            2
+        )
+        candidates = torch.cat([mean.unsqueeze(2), sampled[:, :, 1:]], dim=2)
+        candidate_costs = (
+            (
+                candidates
+                - target[None, :, None] * scales.reshape(-1, 1, 1, 1, 1)
+            )
+            .square()
+            .sum(dim=(-1, -2))
+        )
+        values, indices = torch.topk(
+            candidate_costs, k=topk, dim=2, largest=False
+        )
+        gather = indices[:, :, :, None, None].expand(
+            -1, -1, -1, candidates.size(3), candidates.size(4)
+        )
+        elites = torch.gather(candidates, 2, gather)
+        mean = elites.mean(dim=2)
+        var = elites.std(dim=2)
+        costs = values.mean(dim=2)
+    return mean, var, costs
+
+
+def test_population_cem_matches_independent_reference_with_common_noise():
+    cost = PopulationTargetCost()
+    solver = PopulationAcceleratedCEMSolver(
+        cost,
+        num_samples=16,
+        n_steps=3,
+        topk=4,
+        var_scale=0.7,
+        seed=9,
+        compile_kernel=False,
+    )
+    _configure(solver, n_envs=2)
+    target = torch.randn(2, 4, 2)
+    scales = torch.tensor([0.5, 1.0, 1.5])
+    noise = solver.sample_noise(task_batch_size=2)
+
+    actual = solver.solve_population(
+        {'target': target}, (scales,), noise=noise
+    )
+    expected = _reference_population_cem(
+        noise, target, scales, topk=4, var_scale=0.7
+    )
+
+    torch.testing.assert_close(actual['actions'], expected[0])
+    torch.testing.assert_close(actual['var'], expected[1])
+    torch.testing.assert_close(actual['costs'], expected[2])
+
+
+def test_population_cem_tensor_loop_is_fully_capturable():
+    solver = PopulationAcceleratedCEMSolver(
+        PopulationTargetCost(),
+        num_samples=8,
+        n_steps=2,
+        topk=2,
+        compile_kernel=True,
+        compile_backend='aot_eager',
+        compile_fallback=False,
+    )
+    _configure(solver, n_envs=1)
+    noise = solver.sample_noise(task_batch_size=1)
+
+    output = solver.solve_population(
+        {'target': torch.ones(1, 4, 2)},
+        (torch.tensor([1.0, 2.0]),),
+        noise=noise,
+    )
+
+    assert output['actions'].shape == (2, 1, 4, 2)
+    assert output['compiled'] is True
+    assert output['compile_error'] is None
+
+
+def test_population_lewm_cem_graph_is_fully_capturable():
+    predictor = Predictor(
+        num_frames=2,
+        depth=1,
+        heads=2,
+        mlp_dim=8,
+        input_dim=4,
+        hidden_dim=4,
+        output_dim=4,
+        dim_head=2,
+    ).eval()
+    model = LeWM(
+        encoder=nn.Identity(),
+        predictor=predictor,
+        action_encoder=nn.Identity(),
+    ).eval()
+    solver = PopulationAcceleratedCEMSolver(
+        PopulationLatentGoalCost(model),
+        num_samples=4,
+        n_steps=1,
+        topk=2,
+        compile_kernel=True,
+        compile_backend='aot_eager',
+        compile_fallback=False,
+    )
+    action_space = gym_spaces.Box(
+        low=-1.0, high=1.0, shape=(1, 4), dtype=np.float32
+    )
+    solver.configure(
+        action_space=action_space,
+        n_envs=1,
+        config=PlanConfig(horizon=2, receding_horizon=1),
+    )
+    parameters = tuple(
+        value.detach().unsqueeze(0).expand(2, *value.shape)
+        for value in predictor.parameters()
+    )
+
+    output = solver.solve_population(
+        {
+            'emb': torch.randn(1, 1, 4),
+            'goal_emb': torch.randn(1, 1, 4),
+        },
+        parameters,
+    )
+
+    assert output['actions'].shape == (2, 1, 2, 4)
+    assert output['compiled'] is True
+    assert output['compile_error'] is None

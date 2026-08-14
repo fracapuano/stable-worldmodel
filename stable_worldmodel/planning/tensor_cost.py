@@ -126,4 +126,51 @@ class LatentGoalCost(nn.Module):
         return (terminal - goal).square().sum(dim=-1)
 
 
-__all__ = ['LatentGoalCost']
+class PopulationLatentGoalCost(LatentGoalCost):
+    """Terminal latent error for independently parameterized LeWM predictors.
+
+    Observation and goal embeddings are prepared once and shared across the
+    model population.  The population dimension lives on the candidate action
+    tensor and on every predictor parameter tensor; no resident module weights
+    are mutated between candidates.
+    """
+
+    def __init__(
+        self, model: nn.Module, *, history_size: int | None = None
+    ) -> None:
+        super().__init__(model, history_size=history_size)
+        if not hasattr(model, 'rollout_population_from_embeddings'):
+            raise TypeError(
+                'model must expose rollout_population_from_embeddings'
+            )
+        if not hasattr(model, 'population_predictor_parameter_names'):
+            raise TypeError(
+                'model must expose population_predictor_parameter_names'
+            )
+
+    @property
+    def predictor_parameter_names(self) -> tuple[str, ...]:
+        return tuple(self.model.population_predictor_parameter_names)
+
+    def forward(
+        self,
+        action_candidates: torch.Tensor,
+        predictor_parameters: tuple[torch.Tensor, ...],
+        current_emb: torch.Tensor,
+        goal_emb: torch.Tensor,
+        action_history: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score plans shaped ``(population, batch, samples, horizon, A)``."""
+        predicted = self.model.rollout_population_from_embeddings(
+            current_emb,
+            action_candidates,
+            predictor_parameters,
+            action_history=action_history,
+            history_size=self.history_size,
+        )
+        terminal = predicted[:, :, :, -1, :]
+        goal = goal_emb[None, :, None, -1, :]
+        return (terminal - goal).square().sum(dim=-1)
+
+
+__all__ = ['LatentGoalCost', 'PopulationLatentGoalCost']

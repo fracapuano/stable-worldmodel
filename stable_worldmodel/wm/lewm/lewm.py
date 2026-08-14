@@ -124,6 +124,110 @@ class LeWM(nn.Module):
         predicted = torch.stack(emb_list, dim=1)
         return rearrange(predicted, '(b s) ... -> b s ...', b=B, s=S)
 
+    @property
+    def population_predictor_parameter_names(self) -> tuple[str, ...]:
+        """Full state-dict keys expected by population latent rollouts."""
+        names = getattr(self.predictor, 'population_parameter_names', None)
+        if names is None:
+            raise TypeError(
+                f'{type(self.predictor).__name__} does not expose a '
+                'population predictor path'
+            )
+        return tuple(f'predictor.{name}' for name in names)
+
+    def rollout_population_from_embeddings(
+        self,
+        emb: torch.Tensor,
+        action_sequence: torch.Tensor,
+        predictor_parameters: tuple[torch.Tensor, ...],
+        action_history: torch.Tensor | None = None,
+        history_size: int | None = None,
+    ) -> torch.Tensor:
+        """Roll out a population of predictors without mutating the model.
+
+        ``emb`` and ``action_history`` are shared across the population because
+        LeWM post-training evolves the predictor while keeping the observation
+        and action encoders fixed.  Candidate actions have shape
+        ``(population, batch, samples, horizon, action_dim)``.  Predictor
+        parameter tensors follow :attr:`population_predictor_parameter_names`
+        and carry the population as their leading dimension.
+        """
+        forward_population = getattr(
+            self.predictor, 'forward_population', None
+        )
+        if forward_population is None:
+            raise TypeError(
+                f'{type(self.predictor).__name__} does not expose '
+                'forward_population'
+            )
+        if history_size is None:
+            history_size = getattr(self.predictor, 'num_frames', 3)
+
+        population, batch, samples, horizon = action_sequence.shape[:4]
+        if emb.ndim != 3 or emb.size(0) != batch:
+            raise ValueError('emb must have shape (batch, history, dim)')
+        history = emb.size(1)
+        if action_history is None:
+            action_history = action_sequence.new_zeros(
+                batch, 0, action_sequence.size(-1)
+            )
+        if action_history.ndim != 3:
+            raise ValueError(
+                'action_history must have shape (batch, history - 1, action_dim)'
+            )
+        expected = (batch, history - 1, action_sequence.size(-1))
+        if tuple(action_history.shape) != expected:
+            raise ValueError(
+                f'action_history must have shape {expected}, got '
+                f'{tuple(action_history.shape)}'
+            )
+
+        emb_init = emb[None, :, None].expand(
+            population, batch, samples, history, emb.size(-1)
+        )
+        past = action_history[None, :, None].expand(
+            population,
+            batch,
+            samples,
+            history - 1,
+            action_sequence.size(-1),
+        )
+        all_actions = torch.cat([past, action_sequence], dim=3)
+        all_action_emb = self.action_encoder(
+            rearrange(all_actions, 'p b s t a -> (p b s) t a')
+        )
+        all_action_emb = rearrange(
+            all_action_emb,
+            '(p b s) t d -> p (b s) t d',
+            p=population,
+            b=batch,
+            s=samples,
+        )
+
+        emb_list = list(emb_init.unbind(dim=3))
+        for step in range(horizon):
+            lo = max(0, history + step - history_size)
+            emb_trunc = torch.stack(emb_list[lo:], dim=3)
+            emb_trunc = rearrange(emb_trunc, 'p b s t d -> p (b s) t d')
+            act_trunc = all_action_emb[:, :, lo : history + step]
+            prediction = forward_population(
+                emb_trunc, act_trunc, predictor_parameters
+            )
+            prediction = self.pred_proj(
+                rearrange(prediction, 'p n t d -> (p n t) d')
+            )
+            prediction = rearrange(
+                prediction,
+                '(p b s t) d -> p b s t d',
+                p=population,
+                b=batch,
+                s=samples,
+                t=prediction.size(0) // (population * batch * samples),
+            )
+            emb_list.append(prediction[:, :, :, -1])
+
+        return torch.stack(emb_list, dim=3)
+
     def rollout(self, info, action_sequence, history_size: int | None = None):
         """Rollout the model given an initial info dict and action sequence.
         pixels: (B, S, H, C, h, w) — H context frames (block timesteps)
