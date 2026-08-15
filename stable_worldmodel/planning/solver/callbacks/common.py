@@ -4,7 +4,6 @@ from typing import Any, Literal
 
 import torch
 
-
 Reduction = Literal['mean', 'sum', 'none']
 
 
@@ -79,16 +78,15 @@ class MeanCostRecorder(Callback):
 
 
 class CandidateTraceRecorder(Callback):
-    """Record every model query (candidate sequences and returned costs).
+    """Record the initial candidate population of each solver batch.
 
-    This intentionally ignores ``reduction``: Gate-G0 diagnostics require the
-    exact candidates in their original order, not an aggregate.
+    This is enough to prove RNG pairing and replay a model query without
+    retaining every candidate and cost tensor from every CEM iteration.
     """
 
     name = 'model_queries'
 
-    def compute(self, **state: Any) -> dict[str, Any]:
-        return {
-            'candidates': state['candidates'].detach().cpu(),
-            'costs': state['costs'].detach().cpu(),
-        }
+    def compute(self, **state: Any) -> dict[str, Any] | None:
+        if state.get('step') != 0:
+            return None
+        return {'candidates': state['candidates'].detach().cpu()}

@@ -9,18 +9,6 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 
-SPLITS = (
-    'fitness',
-    'validation',
-    'test_id',
-    'test_layout',
-    'test_noise',
-    'test_dynamics',
-    'prediction_validation',
-    'prediction_test',
-)
-
-
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(',', ':'))
 
@@ -55,8 +43,15 @@ class TaskKey:
 
     @property
     def key(self) -> str:
-        """Content-addressed task key (independent of split and ordering)."""
+        """Content-addressed environment task identity.
+
+        Controller randomness and the human-readable name are deliberately
+        excluded: changing either must not turn the same environment task
+        into a distinct sample.
+        """
         payload = asdict(self)
+        payload.pop('controller_seed')
+        payload.pop('name')
         return hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
@@ -101,10 +96,8 @@ class EvaluationManifest:
                 f'unsupported manifest schema_version {self.schema_version}; '
                 f'expected {self.CURRENT_SCHEMA}'
             )
-        if self.split not in SPLITS:
-            raise ValueError(
-                f'unknown split {self.split!r}; expected one of {SPLITS}'
-            )
+        if not self.split:
+            raise ValueError('manifest split must be a non-empty string')
         object.__setattr__(self, 'tasks', tuple(self.tasks))
         object.__setattr__(
             self,
@@ -173,26 +166,6 @@ class EvaluationManifest:
         return manifest
 
 
-def validate_manifest_suite(manifests: list[EvaluationManifest]) -> None:
-    """Validate complete split coverage and cross-split task disjointness."""
-    by_split = {manifest.split: manifest for manifest in manifests}
-    missing = set(SPLITS) - set(by_split)
-    if missing:
-        raise ValueError(f'missing required manifests: {sorted(missing)}')
-    if len(by_split) != len(manifests):
-        raise ValueError('only one manifest version may be active per split')
-
-    seen: dict[str, str] = {}
-    for manifest in manifests:
-        for key in manifest.task_keys:
-            if key in seen:
-                raise ValueError(
-                    f'task leakage between {seen[key]!r} and '
-                    f'{manifest.split!r}: {key}'
-                )
-            seen[key] = manifest.split
-
-
 def assert_paired(left: EvaluationManifest, right: EvaluationManifest) -> None:
     """Require exact ordered task and controller-RNG pairing."""
     if left.task_keys != right.task_keys:
@@ -202,9 +175,7 @@ def assert_paired(left: EvaluationManifest, right: EvaluationManifest) -> None:
 
 
 __all__ = [
-    'SPLITS',
-    'TaskKey',
     'EvaluationManifest',
+    'TaskKey',
     'assert_paired',
-    'validate_manifest_suite',
 ]

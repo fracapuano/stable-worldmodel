@@ -15,7 +15,7 @@ def main():
             name=f'oracle-smoke-{index}',
             environment_seed=10 + index,
             controller_seed=20 + index,
-            layout_seed=30 + index,
+            layout_seed=10 + index,
             start=start,
             goal=goal,
             observation_noise_seed=40 + index,

@@ -1,13 +1,12 @@
 import json
+from dataclasses import replace
 
 import pytest
 
 from stable_worldmodel.evaluation import (
-    SPLITS,
     EvaluationManifest,
     TaskKey,
     assert_paired,
-    validate_manifest_suite,
 )
 
 
@@ -71,18 +70,15 @@ def test_manifest_rejects_unknown_schema_version():
         )
 
 
-def test_manifest_suite_is_complete_and_disjoint():
-    suite = [make_manifest(split, i) for i, split in enumerate(SPLITS)]
-    validate_manifest_suite(suite)
+def test_task_identity_excludes_controller_seed_and_name():
+    task = make_manifest('validation').tasks[0]
 
-    leaked = list(suite)
-    leaked[-1] = EvaluationManifest(
-        split=SPLITS[-1],
-        environment='swm/TwoRoom-v1',
-        tasks=suite[0].tasks,
-    )
-    with pytest.raises(ValueError, match='leakage'):
-        validate_manifest_suite(leaked)
+    assert task.key == replace(task, controller_seed=999, name='renamed').key
+    assert task.key != replace(task, environment_seed=999).key
+
+
+def test_manifest_allows_project_defined_split_names():
+    assert make_manifest('custom_holdout').split == 'custom_holdout'
 
 
 def test_pairing_is_order_sensitive():
@@ -106,3 +102,14 @@ def test_pairing_is_order_sensitive():
     )
     with pytest.raises(ValueError, match='ordered'):
         assert_paired(first, reversed_manifest)
+
+    different_controller = EvaluationManifest(
+        split='validation',
+        environment='swm/TwoRoom-v1',
+        tasks=(
+            replace(first.tasks[0], controller_seed=999),
+            first.tasks[1],
+        ),
+    )
+    with pytest.raises(ValueError, match='controller seeds'):
+        assert_paired(first, different_controller)

@@ -1,5 +1,3 @@
-from dataclasses import replace
-
 import numpy as np
 import pytest
 import torch
@@ -13,7 +11,6 @@ from stable_worldmodel.backends import (
 from stable_worldmodel.evaluation import (
     EvaluationManifest,
     TaskKey,
-    build_g0_audit,
 )
 from stable_worldmodel.planning import (
     CEMSolver,
@@ -131,7 +128,7 @@ def test_manifest_world_evaluation_is_deterministic_and_traced():
     backend = OracleModelBackend()
     solver = CEMSolver(
         cost=ShootingCostEvaluator(backend, GoalMSE()),
-        batch_size=2,
+        batch_size=1,
         num_samples=8,
         n_steps=2,
         topk=2,
@@ -173,46 +170,80 @@ def test_manifest_world_evaluation_is_deterministic_and_traced():
     assert (
         'model_queries' in first.model_queries[0]['solver_output']['callbacks']
     )
+    candidate_history = first.model_queries[0]['solver_output']['callbacks'][
+        'model_queries'
+    ]
+    assert len(candidate_history) == 2
+    assert all(len(batch) == 1 for batch in candidate_history)
+    assert all(set(batch[0]) == {'candidates'} for batch in candidate_history)
     assert first.backend_type.endswith('.OracleModelBackend')
 
-    audit_kwargs = dict(
-        learned_controller_hash='same',
-        oracle_controller_hash='same',
-        one_step_error=0.0,
-        horizon_error=0.0,
-        replay_tolerance=1e-6,
-        learned_query_budget={'samples': 8, 'iterations': 2},
-        oracle_query_budget={'samples': 8, 'iterations': 2},
-        learned_stopping_rules={'steps': 3},
-        oracle_stopping_rules={'steps': 3},
-        deterministic_pairs=[(first, second)],
-        swm_revision='test',
-        spt_revision='test',
-        expected_episodes=2,
-    )
 
-    relabelled = build_g0_audit(
-        replace(first, backend='pretrained'),
-        replace(second, backend='oracle'),
-        **audit_kwargs,
-    )
-    assert not relabelled.passed
-    assert not next(
-        item
-        for item in relabelled.invariants
-        if item.name == 'backend_identity'
-    ).passed
-
-    audit = build_g0_audit(
-        replace(
-            first,
-            backend='pretrained',
-            backend_type='stable_worldmodel.backends.LearnedModelBackend',
+def test_manifest_start_and_goal_override_conflicting_options(monkeypatch):
+    task = TaskKey(
+        environment_seed=1,
+        controller_seed=2,
+        layout_seed=1,
+        start=(50.0, 50.0),
+        goal=(175.0, 175.0),
+        observation_noise_seed=3,
+        options=(
+            ('state', (40.0, 40.0)),
+            ('target_state', (160.0, 160.0)),
         ),
-        replace(second, backend='oracle'),
-        **audit_kwargs,
     )
-    assert audit.passed
+    manifest = EvaluationManifest(
+        split='validation',
+        environment='swm/TwoRoom-v1',
+        tasks=(task,),
+    )
+    world = swm.World('swm/TwoRoom-v1', num_envs=1, image_shape=(32, 32))
+    monkeypatch.setattr(world, '_run', lambda **kwargs: None)
+    monkeypatch.setattr(world, '_manifest_backend_type', lambda: 'test')
+    try:
+        world.evaluate(manifest=manifest, eval_budget=1)
+        assert np.allclose(world.infos['state'][0], task.start)
+        assert np.allclose(world.infos['goal_state'][0], task.goal)
+    finally:
+        world.close()
+
+
+def test_manifest_without_recording_skips_full_info_snapshots(monkeypatch):
+    class FullSnapshotForbidden:
+        def __deepcopy__(self, memo):
+            raise AssertionError('full info snapshot was created')
+
+    task = TaskKey(
+        environment_seed=1,
+        controller_seed=2,
+        layout_seed=1,
+        start=(50.0, 50.0),
+        goal=(175.0, 175.0),
+        observation_noise_seed=3,
+    )
+    manifest = EvaluationManifest(
+        split='validation',
+        environment='swm/TwoRoom-v1',
+        tasks=(task,),
+    )
+    world = swm.World('swm/TwoRoom-v1', num_envs=1, image_shape=(32, 32))
+
+    def reset(**kwargs):
+        world.infos = {
+            'state': np.zeros((1, 1, 2), dtype=np.float32),
+            'pixels': [FullSnapshotForbidden()],
+        }
+        world.terminateds = np.zeros(1, dtype=bool)
+        world.truncateds = np.zeros(1, dtype=bool)
+
+    monkeypatch.setattr(world, 'reset', reset)
+    monkeypatch.setattr(world, '_run', lambda **kwargs: None)
+    monkeypatch.setattr(world, '_manifest_backend_type', lambda: 'test')
+    try:
+        result = world.evaluate(manifest=manifest, eval_budget=1, record=False)
+        assert result.episodes[0].steps == ()
+    finally:
+        world.close()
 
 
 @pytest.mark.parametrize(

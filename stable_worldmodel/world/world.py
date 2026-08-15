@@ -48,10 +48,9 @@ import torch
 
 from stable_worldmodel.policy import Policy
 
-from .env_pool import EnvPool
 from ..plot import save_panel_videos, save_video
 from ..wrapper import MegaWrapper
-
+from .env_pool import EnvPool
 
 RESET_MODES = ('auto', 'wait')
 
@@ -624,11 +623,9 @@ class World:
                     'manifest dynamics_parameters disagree with task options '
                     f'variation_values: {sorted(mismatched_dynamics)}'
                 )
-            task_options.setdefault(
-                'state', np.asarray(task.start, dtype=np.float32)
-            )
-            task_options.setdefault(
-                'target_state', np.asarray(task.goal, dtype=np.float32)
+            task_options['state'] = np.asarray(task.start, dtype=np.float32)
+            task_options['target_state'] = np.asarray(
+                task.goal, dtype=np.float32
             )
             options.append(task_options)
         self.reset(seed=seeds, options=options)
@@ -652,7 +649,28 @@ class World:
                     result[key] = deepcopy(value)
             return result
 
-        previous = [snapshot(i) for i in range(self.num_envs)]
+        def info_at(key: str, index: int, default: Any = None) -> Any:
+            value = self.infos.get(key)
+            if value is None:
+                return default
+            if torch.is_tensor(value) or isinstance(value, np.ndarray):
+                return value[index]
+            if isinstance(value, (list, tuple)):
+                return value[index]
+            return value
+
+        def state_at(index: int) -> Any:
+            value = info_at('state', index)
+            if torch.is_tensor(value):
+                return value.detach().cpu().clone()
+            if isinstance(value, np.ndarray):
+                return value.copy()
+            return deepcopy(value)
+
+        previous_states = [state_at(i) for i in range(self.num_envs)]
+        previous_records = (
+            [snapshot(i) for i in range(self.num_envs)] if record else None
+        )
         step_records: list[list[StepRecord]] = [
             [] for _ in range(self.num_envs)
         ]
@@ -678,7 +696,7 @@ class World:
         def on_step(world, mask):
             active = np.asarray(mask, dtype=bool)
             for i in np.where(active)[0]:
-                current = snapshot(i)
+                current_state = state_at(i)
                 action = np.asarray(world.actions[i]).copy()
                 reward = float(world.rewards[i])
                 returns[i] += reward
@@ -686,31 +704,33 @@ class World:
                 successes[i] |= bool(world.terminateds[i])
                 control_costs[i] += float(np.square(action).sum())
 
-                before_state = previous[i].get('state')
-                after_state = current.get('state')
+                before_state = previous_states[i]
+                after_state = current_state
                 if before_state is not None and after_state is not None:
                     delta = np.asarray(after_state) - np.asarray(before_state)
                     distance = float(np.linalg.norm(delta))
                     path_costs[i] += distance
-                    if bool(np.asarray(current.get('collision', False)).any()):
+                    if bool(np.asarray(info_at('collision', i, False)).any()):
                         collisions[i] += 1
-                violation = current.get('constraint_violation', False)
+                violation = info_at('constraint_violation', i, False)
                 violations[i] += int(np.asarray(violation).any())
 
                 if record:
+                    current_record = snapshot(i)
                     step_records[i].append(
                         StepRecord(
                             decision=int(lengths[i] - 1),
-                            observation=previous[i],
+                            observation=previous_records[i],
                             action=action,
-                            next_observation=current,
+                            next_observation=current_record,
                             reward=reward,
                             cost=-reward,
                             terminated=bool(world.terminateds[i]),
                             truncated=bool(world.truncateds[i]),
                         )
                     )
-                previous[i] = current
+                    previous_records[i] = current_record
+                previous_states[i] = current_state
 
         try:
             self._run(
