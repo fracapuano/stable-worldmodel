@@ -271,7 +271,7 @@ class TwoRoomEnv(gym.Env):
         self.agent_position = pos_new
 
         dist = float(torch.norm(self.agent_position - self.target_position))
-        terminated = dist < 8.0
+        terminated = dist < 16.0  # ~4.5 * 3.5 scale
         truncated = False
         reward = 0.0
 
