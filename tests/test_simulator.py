@@ -40,6 +40,15 @@ def test_tworoom_transition_matches_step_and_has_no_side_effects(
             predicted_state = predicted_next
 
 
+def test_tworoom_exposes_rendered_goal_for_learned_planning(two_room_world):
+    two_room_world.reset(
+        seed=3,
+        options={'target_state': np.asarray([175.0, 175.0], dtype=np.float32)},
+    )
+
+    assert two_room_world.infos['goal'].shape == (1, 1, 32, 32, 3)
+
+
 def test_simulator_rollout_honors_action_blocks_without_mutating_env(
     two_room_world,
 ):
