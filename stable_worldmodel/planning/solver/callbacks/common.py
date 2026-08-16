@@ -4,7 +4,6 @@ from typing import Any, Literal
 
 import torch
 
-
 Reduction = Literal['mean', 'sum', 'none']
 
 
@@ -76,3 +75,14 @@ class MeanCostRecorder(Callback):
     def compute(self, **state: Any) -> float | list[float]:
         costs: torch.Tensor = state['costs']
         return self._reduce(costs.mean(dim=1))
+
+
+class CandidateTraceRecorder(Callback):
+    """Record each batch's initial CEM population for reproducibility."""
+
+    name = 'model_queries'
+
+    def compute(self, **state: Any) -> dict[str, Any] | None:
+        if state.get('step') != 0:
+            return None
+        return {'candidates': state['candidates'].detach().cpu()}

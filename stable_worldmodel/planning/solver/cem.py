@@ -9,9 +9,9 @@ import torch
 from gymnasium.spaces import Box
 from loguru import logger as logging
 
-from .utils import prepare_init_action
 from .callbacks import Callback
 from .solver import Costable
+from .utils import prepare_init_action
 
 
 class CEMSolver:
@@ -129,6 +129,9 @@ class CEMSolver:
             'var': [],  # History of vars
         }
 
+        controller_seeds = info_dict.get('controller_seed')
+        decision_indices = info_dict.get('step_idx')
+
         # Batch size is taken from info_dict so callers can solve for a subset of envs
         total_envs = len(next(iter(info_dict.values())))
 
@@ -190,15 +193,28 @@ class CEMSolver:
 
             for step in range(self.n_steps):
                 # Sample action sequences: (Batch, Num_Samples, Horizon, Dim)
-                candidates = torch.randn(
-                    current_bs,
-                    self.num_samples,
-                    self.horizon,
-                    self.action_dim,
-                    generator=self.torch_gen,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
+                if controller_seeds is None:
+                    candidates = torch.randn(
+                        current_bs,
+                        self.num_samples,
+                        self.horizon,
+                        self.action_dim,
+                        generator=self.torch_gen,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                else:
+                    candidates = torch.stack(
+                        [
+                            self._sample_task_candidates(
+                                controller_seeds,
+                                decision_indices,
+                                task_index,
+                                step,
+                            )
+                            for task_index in range(start_idx, end_idx)
+                        ]
+                    )
 
                 # Scale and shift: (Batch, N, H, D) * (Batch, 1, H, D) + (Batch, 1, H, D)
                 candidates = candidates * batch_var.unsqueeze(
@@ -281,5 +297,41 @@ class CEMSolver:
                 cb.end_solve()
                 outputs['callbacks'][cb.output_key] = cb.history
 
-        print(f'CEM solve time: {time.time() - start_time:.4f} seconds')
+        outputs['solve_time_seconds'] = time.time() - start_time
         return outputs
+
+    def _sample_task_candidates(
+        self,
+        controller_seeds,
+        decision_indices,
+        task_index: int,
+        cem_step: int,
+    ) -> torch.Tensor:
+        """Sample one task's batching-independent controller RNG stream."""
+        seed = int(
+            torch.as_tensor(controller_seeds[task_index]).reshape(-1)[0]
+        )
+        decision = (
+            0
+            if decision_indices is None
+            else int(
+                torch.as_tensor(decision_indices[task_index]).reshape(-1)[0]
+            )
+        )
+        # Preserve the frozen evaluation stream while making it independent
+        # of batch size and of other environments terminating early.
+        # TODO(): fix this obscure seeding and repeat experiments.
+        stream_seed = (seed + 1_000_003 * decision + 10_007 * cem_step) % (
+            2**63 - 1
+        )
+        generator = torch.Generator(device=self.device).manual_seed(
+            stream_seed
+        )
+        return torch.randn(
+            self.num_samples,
+            self.horizon,
+            self.action_dim,
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )

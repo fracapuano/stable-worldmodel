@@ -1,7 +1,7 @@
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -342,6 +342,7 @@ class WorldModelPolicy(BasePolicy):
         transform: dict[str, Callable[[torch.Tensor], torch.Tensor]]
         | None = None,
         history_keys: tuple[str, ...] = ('pixels',),
+        on_plan: Callable[[dict[str, Any]], None] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the world model policy.
@@ -356,6 +357,7 @@ class WorldModelPolicy(BasePolicy):
                 (only used when ``history_len > 1``). The executed action
                 blocks between those frames are supplied alongside under
                 ``'action_history'``.
+            on_plan: Optional observer called after each solver query.
             **kwargs: Additional configuration parameters.
         """
         super().__init__(**kwargs)
@@ -366,6 +368,7 @@ class WorldModelPolicy(BasePolicy):
         self.process = process or {}
         self.transform = transform or {}
         self.history_keys = tuple(history_keys)
+        self.on_plan = on_plan
         self._action_buffer: list[deque[torch.Tensor]] | None = None
         self._next_init: torch.Tensor | None = None
         self._history_buffer: HistoryBuffer | None = None
@@ -374,6 +377,19 @@ class WorldModelPolicy(BasePolicy):
     def flatten_receding_horizon(self) -> int:
         """Receding horizon in environment steps (with frameskip)."""
         return self.cfg.receding_horizon * self.cfg.action_block
+
+    def reset_state(self, env_ids: list[int] | None = None) -> None:
+        """Clear action buffers and warm starts for fresh episodes."""
+        if self._action_buffer is None:
+            return
+        if env_ids is None:
+            env_ids = list(range(len(self._action_buffer)))
+        for env_id in env_ids:
+            self._action_buffer[env_id].clear()
+            if self._next_init is not None:
+                self._next_init[env_id] = 0
+        if self._history_buffer is not None:
+            self._history_buffer.reset(env_ids)
 
     def set_env(self, env: Any) -> None:
         """Configure the policy and solver for the given environment.
@@ -500,6 +516,16 @@ class WorldModelPolicy(BasePolicy):
             keep_horizon = self.cfg.receding_horizon
             plan = actions[:, :keep_horizon]
             rest = actions[:, keep_horizon:]
+
+            if self.on_plan is not None:
+                self.on_plan(
+                    {
+                        'env_indices': tuple(replan_idx),
+                        'controller_input': sliced,
+                        'solver_output': outputs,
+                        'selected_plan': plan,
+                    }
+                )
 
             if self.cfg.warm_start and rest.shape[1] > 0:
                 if self._next_init is None:

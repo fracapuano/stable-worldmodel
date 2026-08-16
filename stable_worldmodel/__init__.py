@@ -14,9 +14,9 @@ from typing import TYPE_CHECKING
 
 from stable_worldmodel import envs
 
-
 _LAZY_SUBMODULES = {
     'data',
+    'evaluation',
     'planning',
     'policy',
     'spaces',
@@ -26,8 +26,16 @@ _LAZY_SUBMODULES = {
 }
 
 _LAZY_ATTRS = {
+    'DecodedDynamics': (
+        'stable_worldmodel.dynamics',
+        'DecodedDynamics',
+    ),
     'World': ('stable_worldmodel.world', 'World'),
     'PlanConfig': ('stable_worldmodel.policy', 'PlanConfig'),
+    'SimulatorDynamics': (
+        'stable_worldmodel.simulator',
+        'SimulatorDynamics',
+    ),
     'pretraining': ('stable_worldmodel.utils', 'pretraining'),
 }
 
@@ -35,6 +43,7 @@ if TYPE_CHECKING:
     from stable_worldmodel import (
         buffer,
         data,
+        evaluation,
         planning,
         policy,
         spaces,
@@ -42,19 +51,24 @@ if TYPE_CHECKING:
         wm,
         wrapper,
     )
+    from stable_worldmodel.dynamics import DecodedDynamics
     from stable_worldmodel.policy import PlanConfig
+    from stable_worldmodel.simulator import SimulatorDynamics
     from stable_worldmodel.utils import pretraining
     from stable_worldmodel.world import World
 
 __all__ = [
-    'World',
+    'DecodedDynamics',
     'PlanConfig',
-    'pretraining',
+    'SimulatorDynamics',
+    'World',
     'buffer',
     'data',
     'envs',
+    'evaluation',
     'planning',
     'policy',
+    'pretraining',
     'spaces',
     'utils',
     'wm',

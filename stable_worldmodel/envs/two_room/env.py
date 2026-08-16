@@ -12,6 +12,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium import spaces
+
 from stable_worldmodel import spaces as swm_spaces
 
 DEFAULT_VARIATIONS = ('agent.position', 'target.position')
@@ -34,11 +35,15 @@ class TwoRoomEnv(gym.Env):
         self,
         render_mode: str = 'rgb_array',
         render_target: bool = False,
+        success_radius: float = 16.0,
         init_value: dict | None = None,
     ):
         assert render_mode in self.metadata['render_modes']
+        if success_radius <= 0:
+            raise ValueError('success_radius must be positive')
         self.render_mode = render_mode
         self.render_target_flag = bool(render_target)
+        self.success_radius = float(success_radius)
 
         # Precompute coordinate grids once (H,W)
         y = torch.arange(self.IMG_SIZE, dtype=torch.float32)
@@ -270,7 +275,7 @@ class TwoRoomEnv(gym.Env):
         self.agent_position = pos_new
 
         dist = float(torch.norm(self.agent_position - self.target_position))
-        terminated = dist < 16.0  # ~4.5 * 3.5 scale
+        terminated = dist < self.success_radius
         truncated = False
         reward = 0.0
 
@@ -278,6 +283,14 @@ class TwoRoomEnv(gym.Env):
         info = self._get_info()
         info['distance_to_target'] = dist
         return obs, reward, terminated, truncated, info
+
+    def get_next_state(self, state, action):
+        """Return the exact next state without mutating the environment."""
+        state = torch.as_tensor(state, dtype=torch.float32)
+        action = torch.as_tensor(action, dtype=torch.float32)
+        action = torch.clamp(action, -1.0, 1.0)
+        speed = float(self.variation_space['agent']['speed'].value.item())
+        return self._apply_collisions(state, state + action * speed)
 
     def render(self):
         # returns HWC uint8 numpy for compatibility with PIL/wrappers
@@ -346,6 +359,7 @@ class TwoRoomEnv(gym.Env):
             'proprio': self.agent_position.detach().cpu().numpy(),
             'state': self.agent_position.detach().cpu().numpy(),
             'goal_state': self.target_position.detach().cpu().numpy(),
+            'goal': self._target_img.cpu().numpy().transpose(1, 2, 0),
         }
 
     # ---------------- Rendering ----------------
@@ -478,93 +492,53 @@ class TwoRoomEnv(gym.Env):
         """
         If attempting to cross central wall outside doors => clamp at wall edge with small pushback.
         Collision is triggered when agent radius touches the wall, not just the center.
-        Also handles border clamping.
+        Also handles border clamping. Leading dimensions are treated as batch
+        dimensions.
         """
         bs = float(self.BORDER_SIZE)
         door_margin = 1.75  # was 0.5 * 3.5 scale
         agent_r = float(self.variation_space['agent']['radius'].value.item())
 
         # border clamp first - account for agent radius
-        x2, y2 = float(pos2[0]), float(pos2[1])
-        x2 = min(max(x2, bs + agent_r), self.IMG_SIZE - bs - agent_r)
-        y2 = min(max(y2, bs + agent_r), self.IMG_SIZE - bs - agent_r)
-        pos2c = torch.tensor([x2, y2], dtype=torch.float32)
+        lower = bs + agent_r
+        upper = self.IMG_SIZE - bs - agent_r
+        pos2c = pos2.clamp(lower, upper)
 
         # central wall collision - account for agent radius
         half = self.wall_thickness // 2
-        c = float(self.WALL_CENTER)
 
-        if self.wall_axis == 1:
-            # For vertical wall
-            # Wall spans from (c - half) to (c + half)
-            wall_left = c - half
-            wall_right = c + half
-
-            # Effective wall boundaries considering agent radius
-            effective_left = wall_left - agent_r
-            effective_right = wall_right + agent_r
-
-            x1, x2_val = float(pos1[0]), float(pos2c[0])
-            y2_val = float(pos2c[1])
-
-            # Determine which side the agent started on
-            started_left = x1 < c
-
-            # Check if agent is trying to enter the wall zone
-            if started_left:
-                # Agent is on left side, check if moving into wall
-                if x2_val > effective_left:
-                    # Check if in a door
-                    if not self._in_any_door_1d(y2_val, door_margin):
-                        # Clamp to effective wall boundary
-                        pos2c[0] = effective_left - 0.5
-            else:
-                # Agent is on right side, check if moving into wall
-                if x2_val < effective_right:
-                    # Check if in a door
-                    if not self._in_any_door_1d(y2_val, door_margin):
-                        # Clamp to effective wall boundary
-                        pos2c[0] = effective_right + 0.5
-        else:
-            # For horizontal wall
-            wall_top = c - half
-            wall_bottom = c + half
-
-            # Effective wall boundaries considering agent radius
-            effective_top = wall_top - agent_r
-            effective_bottom = wall_bottom + agent_r
-
-            y1, y2_val = float(pos1[1]), float(pos2c[1])
-            x2_val = float(pos2c[0])
-
-            # Determine which side the agent started on
-            started_top = y1 < c
-
-            # Check if agent is trying to enter the wall zone
-            if started_top:
-                # Agent is on top side, check if moving into wall
-                if y2_val > effective_top:
-                    # Check if in a door
-                    if not self._in_any_door_1d(x2_val, door_margin):
-                        # Clamp to effective wall boundary
-                        pos2c[1] = effective_top - 0.5
-            else:
-                # Agent is on bottom side, check if moving into wall
-                if y2_val < effective_bottom:
-                    # Check if in a door
-                    if not self._in_any_door_1d(x2_val, door_margin):
-                        # Clamp to effective wall boundary
-                        pos2c[1] = effective_bottom + 0.5
-
-        return pos2c
-
-    def _in_any_door_1d(self, coord_1d: float, margin: float):
+        wall_axis = 0 if self.wall_axis == 1 else 1
+        door_axis = 1 - wall_axis
+        door_coord = pos2c[..., door_axis]
+        in_door = torch.zeros_like(door_coord, dtype=torch.bool)
         for i in range(self.num_doors):
             c = float(self.door_positions[i])
             s = float(self.door_sizes[i])
-            if (c - s - margin) <= coord_1d <= (c + s + margin):
-                return True
-        return False
+            in_door |= (door_coord >= c - s - door_margin) & (
+                door_coord <= c + s + door_margin
+            )
+
+        effective_low = self.WALL_CENTER - half - agent_r
+        effective_high = self.WALL_CENTER + half + agent_r
+        started_low = pos1[..., wall_axis] < self.WALL_CENTER
+        enters_wall = torch.where(
+            started_low,
+            pos2c[..., wall_axis] > effective_low,
+            pos2c[..., wall_axis] < effective_high,
+        )
+        clamped = torch.where(
+            started_low,
+            effective_low - 0.5,
+            effective_high + 0.5,
+        )
+
+        result = pos2c.clone()
+        result[..., wall_axis] = torch.where(
+            enters_wall & ~in_door,
+            clamped,
+            pos2c[..., wall_axis],
+        )
+        return result
 
     # ---------------- Constraint ----------------
 

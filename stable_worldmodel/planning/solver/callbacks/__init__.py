@@ -9,6 +9,7 @@ from .cem import (
 from .common import (
     BestCostRecorder,
     Callback,
+    CandidateTraceRecorder,
     MeanCostRecorder,
 )
 from .gd import (
@@ -16,15 +17,15 @@ from .gd import (
     GradNormRecorder,
 )
 
-
 __all__ = [
-    'Callback',
-    'BestCostRecorder',
-    'MeanCostRecorder',
-    'GradNormRecorder',
     'ActionNormRecorder',
+    'BestCostRecorder',
+    'Callback',
+    'CandidateTraceRecorder',
     'EliteCostRecorder',
-    'VarNormRecorder',
-    'MeanShiftRecorder',
     'EliteSpreadRecorder',
+    'GradNormRecorder',
+    'MeanCostRecorder',
+    'MeanShiftRecorder',
+    'VarNormRecorder',
 ]
