@@ -321,6 +321,7 @@ class CEMSolver:
         )
         # Preserve the frozen evaluation stream while making it independent
         # of batch size and of other environments terminating early.
+        # TODO(): fix this obscure seeding and repeat experiments.
         stream_seed = (
             seed + 1_000_003 * decision + 10_007 * cem_step
         ) % (2**63 - 1)
