@@ -35,11 +35,15 @@ class TwoRoomEnv(gym.Env):
         self,
         render_mode: str = 'rgb_array',
         render_target: bool = False,
+        success_radius: float = 16.0,
         init_value: dict | None = None,
     ):
         assert render_mode in self.metadata['render_modes']
+        if success_radius <= 0:
+            raise ValueError('success_radius must be positive')
         self.render_mode = render_mode
         self.render_target_flag = bool(render_target)
+        self.success_radius = float(success_radius)
 
         # Precompute coordinate grids once (H,W)
         y = torch.arange(self.IMG_SIZE, dtype=torch.float32)
@@ -271,7 +275,7 @@ class TwoRoomEnv(gym.Env):
         self.agent_position = pos_new
 
         dist = float(torch.norm(self.agent_position - self.target_position))
-        terminated = dist < 16.0  # ~4.5 * 3.5 scale
+        terminated = dist < self.success_radius
         truncated = False
         reward = 0.0
 

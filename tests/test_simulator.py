@@ -49,6 +49,25 @@ def test_tworoom_exposes_rendered_goal_for_learned_planning(two_room_world):
     assert two_room_world.infos['goal'].shape == (1, 1, 32, 32, 3)
 
 
+def test_tworoom_success_radius_defaults_to_sixteen_and_is_configurable():
+    default_world = swm.World(
+        'swm/TwoRoom-v1', num_envs=1, image_shape=None, add_pixels=False
+    )
+    legacy_world = swm.World(
+        'swm/TwoRoom-v1',
+        num_envs=1,
+        image_shape=None,
+        add_pixels=False,
+        success_radius=8.0,
+    )
+    try:
+        assert default_world.envs.envs[0].unwrapped.success_radius == 16.0
+        assert legacy_world.envs.envs[0].unwrapped.success_radius == 8.0
+    finally:
+        default_world.close()
+        legacy_world.close()
+
+
 def test_simulator_rollout_honors_action_blocks_without_mutating_env(
     two_room_world,
 ):
