@@ -574,10 +574,6 @@ class World:
             )
         if eval_budget is None or eval_budget < 1:
             raise ValueError('protocol evaluation requires eval_budget >= 1')
-        if video:
-            raise NotImplementedError(
-                'protocol evaluation video output is not yet supported'
-            )
 
         seeds = [task.environment_seed for task in protocol.tasks]
         options = [self._task_reset_options(task) for task in protocol.tasks]
@@ -596,6 +592,15 @@ class World:
             if isinstance(value, (list, tuple)):
                 return value[index]
             return value
+
+        def pixels_frame(index: int) -> np.ndarray:
+            value = info_at('pixels', index)
+            if torch.is_tensor(value):
+                value = value.detach().cpu().numpy()
+            frame = np.asarray(value)
+            if frame.ndim > 3:
+                frame = frame[-1]
+            return np.asarray(frame).copy()
 
         def snapshot(index: int) -> dict[str, Any]:
             result = {}
@@ -646,6 +651,28 @@ class World:
         if record and hasattr(self.policy, 'on_plan'):
             self.policy.on_plan = on_plan
 
+        frames: dict[int, list] | None = None
+        goal_frames: list[np.ndarray] | None = None
+        if video:
+            if 'pixels' not in self.infos:
+                raise ValueError(
+                    'protocol video requires pixels in World infos; '
+                    'construct World with image_shape set'
+                )
+            frames = defaultdict(list)
+            for i in range(self.num_envs):
+                frames[i].append(pixels_frame(i))
+            if 'goal' in self.infos:
+                goal_frames = []
+                for i in range(self.num_envs):
+                    value = info_at('goal', i)
+                    if torch.is_tensor(value):
+                        value = value.detach().cpu().numpy()
+                    frame = np.asarray(value)
+                    if frame.ndim > 3:
+                        frame = frame[-1]
+                    goal_frames.append(np.asarray(frame).copy())
+
         def on_step(world, mask):
             active = np.asarray(mask, dtype=bool)
             for i in np.where(active)[0]:
@@ -686,6 +713,8 @@ class World:
                     )
                     previous_records[i] = current_record
                 previous_states[i] = current_state
+                if frames is not None:
+                    frames[i].append(pixels_frame(i))
 
         try:
             self._run(max_steps=eval_budget, mode='wait', on_step=on_step)
@@ -709,6 +738,19 @@ class World:
             )
             for i, task in enumerate(protocol.tasks)
         )
+        if frames is not None:
+            out_dir = Path(video)
+            if backend:
+                out_dir = out_dir / backend
+            for i, task in enumerate(protocol.tasks):
+                label = task.name or f'task-{i}'
+                clip = frames[i]
+                if goal_frames is not None:
+                    goal = goal_frames[i]
+                    clip = [
+                        np.concatenate([frame, goal], axis=1) for frame in clip
+                    ]
+                save_video(out_dir / f'{label}.mp4', clip)
         return EvaluationResults(
             backend=backend,
             backend_type=self._protocol_backend_type(),

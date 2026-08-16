@@ -102,6 +102,30 @@ def test_world_evaluates_an_ordered_protocol():
     assert len(results.episodes[0].steps) == 3
 
 
+def test_world_protocol_writes_task_videos(tmp_path):
+    protocol = make_protocol()
+    world = swm.World(
+        protocol.environment,
+        num_envs=1,
+        image_shape=(32, 32),
+        max_episode_steps=10,
+    )
+    world.set_policy(ZeroPolicy())
+    try:
+        world.evaluate(
+            protocol=protocol,
+            eval_budget=2,
+            backend='zero',
+            video=tmp_path,
+        )
+    finally:
+        world.close()
+
+    video_path = tmp_path / 'zero' / 'paired-task.mp4'
+    assert video_path.exists()
+    assert video_path.stat().st_size > 0
+
+
 class QuadraticCost:
     def get_cost(self, info_dict, action_candidates):
         return action_candidates.square().sum(dim=(-1, -2))

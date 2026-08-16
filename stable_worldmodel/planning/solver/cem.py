@@ -298,7 +298,6 @@ class CEMSolver:
                 outputs['callbacks'][cb.output_key] = cb.history
 
         outputs['solve_time_seconds'] = time.time() - start_time
-        print(f'CEM solve time: {outputs["solve_time_seconds"]:.4f} seconds')
         return outputs
 
     def _sample_task_candidates(
