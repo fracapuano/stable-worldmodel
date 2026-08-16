@@ -12,6 +12,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium import spaces
+
 from stable_worldmodel import spaces as swm_spaces
 
 DEFAULT_VARIATIONS = ('agent.position', 'target.position')
@@ -354,6 +355,7 @@ class TwoRoomEnv(gym.Env):
             'proprio': self.agent_position.detach().cpu().numpy(),
             'state': self.agent_position.detach().cpu().numpy(),
             'goal_state': self.target_position.detach().cpu().numpy(),
+            'goal': self._target_img.cpu().numpy().transpose(1, 2, 0),
         }
 
     # ---------------- Rendering ----------------
