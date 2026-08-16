@@ -319,13 +319,11 @@ class CEMSolver:
                 torch.as_tensor(decision_indices[task_index]).reshape(-1)[0]
             )
         )
-        # SeedSequence mixes (task, decision, CEM iteration) into one seed so
-        # this stream does not depend on batch size or env order.
-        stream_seed = int(
-            np.random.SeedSequence((seed, decision, cem_step)).generate_state(
-                1
-            )[0]
-        )
+        # Preserve the frozen evaluation stream while making it independent
+        # of batch size and of other environments terminating early.
+        stream_seed = (
+            seed + 1_000_003 * decision + 10_007 * cem_step
+        ) % (2**63 - 1)
         generator = torch.Generator(device=self.device).manual_seed(stream_seed)
         return torch.randn(
             self.num_samples,
