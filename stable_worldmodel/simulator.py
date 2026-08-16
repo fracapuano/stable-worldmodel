@@ -39,8 +39,8 @@ class SimulatorDynamics(nn.Module):
     and batch dimensions all share that simulator's layout and dynamics.
 
     Args:
-        simulator: Gymnasium environment implementing ``get_next_state``.
-            Wrapped environments are automatically unwrapped.
+        simulator: Object implementing ``Simulatable`` (``get_next_state``).
+            Wrapped Gymnasium environments are automatically unwrapped.
         state_key: Privileged current-state key in the planning info dict.
         goal_state_key: Privileged goal-state key used by ``encode_goal``.
         embedding_key: Key populated by ``encode``.
