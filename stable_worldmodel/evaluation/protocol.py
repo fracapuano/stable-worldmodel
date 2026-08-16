@@ -201,9 +201,7 @@ class EvaluationProtocol:
         return protocol
 
 
-def assert_paired(
-    left: EvaluationProtocol, right: EvaluationProtocol
-) -> None:
+def assert_paired(left: EvaluationProtocol, right: EvaluationProtocol) -> None:
     """Require two conditions to use the same ordered tasks and RNG ledger."""
     if left.task_keys != right.task_keys:
         raise ValueError('paired protocols have different ordered task keys')

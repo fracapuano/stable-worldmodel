@@ -26,7 +26,9 @@ def test_decoded_dynamics_exposes_state_goal_and_decodes_rollout():
     assert torch.equal(info['emb'], torch.tensor([[3, 4]]))
     assert torch.equal(result['predicted_emb'], torch.full((1, 2, 3, 1), 4.0))
     assert not decoder.training
-    assert not any(parameter.requires_grad for parameter in decoder.parameters())
+    assert not any(
+        parameter.requires_grad for parameter in decoder.parameters()
+    )
 
 
 def test_decoded_dynamics_requires_state_and_rollout_output():

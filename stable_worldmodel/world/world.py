@@ -659,15 +659,15 @@ class World:
 
                 before_state = previous_states[i]
                 if before_state is not None and current_state is not None:
-                    delta = np.asarray(current_state) - np.asarray(before_state)
+                    delta = np.asarray(current_state) - np.asarray(
+                        before_state
+                    )
                     path_costs[i] += float(np.linalg.norm(delta))
                 collisions[i] += int(
                     np.asarray(info_at('collision', i, False)).any()
                 )
                 violations[i] += int(
-                    np.asarray(
-                        info_at('constraint_violation', i, False)
-                    ).any()
+                    np.asarray(info_at('constraint_violation', i, False)).any()
                 )
 
                 if record:

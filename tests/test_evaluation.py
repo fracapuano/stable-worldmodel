@@ -122,9 +122,7 @@ def run_seeded_cem(batch_size: int):
             low=-1, high=1, shape=(3, 1), dtype=np.float32
         ),
         n_envs=3,
-        config=swm.PlanConfig(
-            horizon=2, receding_horizon=1, warm_start=False
-        ),
+        config=swm.PlanConfig(horizon=2, receding_horizon=1, warm_start=False),
     )
     output = solver.solve(
         {
@@ -159,17 +157,13 @@ def test_controller_rng_preserves_frozen_evaluation_stream():
             low=-1, high=1, shape=(1, 1), dtype=np.float32
         ),
         n_envs=1,
-        config=swm.PlanConfig(
-            horizon=2, receding_horizon=1, warm_start=False
-        ),
+        config=swm.PlanConfig(horizon=2, receding_horizon=1, warm_start=False),
     )
     actual = solver._sample_task_candidates(
         torch.tensor([[11]]), torch.tensor([[2]]), 0, 3
     )
     stream_seed = 11 + 1_000_003 * 2 + 10_007 * 3
     generator = torch.Generator().manual_seed(stream_seed)
-    expected = torch.randn(
-        8, 2, 1, generator=generator, dtype=solver.dtype
-    )
+    expected = torch.randn(8, 2, 1, generator=generator, dtype=solver.dtype)
 
     assert torch.equal(actual, expected)

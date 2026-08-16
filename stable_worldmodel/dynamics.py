@@ -68,9 +68,7 @@ class DecodedDynamics(nn.Module):
             raise KeyError(
                 f'learned rollout did not populate {self.rollout_key!r}'
             )
-        info_dict[self.rollout_key] = self.decoder(
-            info_dict[self.rollout_key]
-        )
+        info_dict[self.rollout_key] = self.decoder(info_dict[self.rollout_key])
         return info_dict
 
 

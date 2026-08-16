@@ -36,7 +36,7 @@ swm = "stable_worldmodel.cli:app"
 
 [project.optional-dependencies]
 train = [
-    "transformers>=4.50.0",
+    "transformers>=4.50.0,<5",
     "stable-pretraining>=0.1.8",
     "datasets>=2.20.0",
     "hydra-submitit-launcher",
@@ -65,7 +65,7 @@ format = [
 ]
 
 lerobot = [
-    "lerobot>=0.5.0; python_version >= '3.12'",
+    "lerobot>=0.4.4,<0.5; python_version >= '3.12'",
 ]
 
 all = [
