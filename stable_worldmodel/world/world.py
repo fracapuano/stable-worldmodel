@@ -46,12 +46,10 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from stable_worldmodel.plot import save_panel_videos, save_video
 from stable_worldmodel.policy import Policy
-
-from .env_pool import EnvPool
-from ..plot import save_panel_videos, save_video
-from ..wrapper import MegaWrapper
-
+from stable_worldmodel.world.env_pool import EnvPool
+from stable_worldmodel.wrapper import MegaWrapper
 
 RESET_MODES = ('auto', 'wait')
 
@@ -155,6 +153,7 @@ class World:
         self.rewards: np.ndarray | None = None
         self.terminateds: np.ndarray | None = None
         self.truncateds: np.ndarray | None = None
+        self.actions: np.ndarray | None = None
 
     @property
     def num_envs(self) -> int:
@@ -182,6 +181,8 @@ class World:
         Clears ``terminateds``/``truncateds`` back to all-False.
         """
         _, self.infos = self.envs.reset(seed=seed, options=options)
+        if self.policy is not None and hasattr(self.policy, 'reset_state'):
+            self.policy.reset_state()
         self.terminateds = np.zeros(self.num_envs, dtype=bool)
         self.truncateds = np.zeros(self.num_envs, dtype=bool)
 
@@ -198,6 +199,9 @@ class World:
         goal_offset: int | None = None,
         eval_budget: int | None = None,
         callables: list[dict] | None = None,
+        protocol: Any = None,
+        record: bool = False,
+        backend: str = '',
     ) -> dict:
         """Run the attached policy and return aggregated metrics.
 
@@ -234,11 +238,25 @@ class World:
                 'in_dataset': bool}}}``; if ``in_dataset`` is True, the
                 ``value`` names a key in the sliced dataset state and the
                 per-env value is deep-copied in.
+            protocol: Immutable ``EvaluationProtocol`` whose ordered tasks
+                define resets and controller RNG streams.
+            record: Include full transitions and planning queries in
+                protocol-driven results.
+            backend: Condition label stored in protocol-driven results.
 
         Returns:
             A dict with ``'success_rate'`` (percent), ``'episode_successes'``
             (per-episode bool/uint array), and ``'seeds'`` used for reset.
         """
+        if protocol is not None:
+            if dataset is not None or episodes is not None:
+                raise ValueError(
+                    'protocol evaluation is mutually exclusive with dataset '
+                    'and episodic evaluation arguments'
+                )
+            return self._evaluate_protocol(
+                protocol, eval_budget, video, record, backend
+            )
         if dataset is not None:
             mode = reset_mode or 'wait'
             return self._evaluate_from_dataset(
@@ -433,6 +451,7 @@ class World:
 
         for t in range(max_steps if max_steps is not None else 2**63):
             actions = self._get_actions()
+            self.actions = np.asarray(actions).copy()
 
             mask = alive if not alive.all() else None
             _, self.rewards, self.terminateds, self.truncateds, self.infos = (
@@ -521,6 +540,237 @@ class World:
             for env_idx, f in frames.items():
                 save_video(Path(video) / f'episode_remaining_{env_idx}.mp4', f)
         return results
+
+    def _evaluate_protocol(
+        self, protocol, eval_budget, video, record, backend
+    ):
+        """Run every task in an ``EvaluationProtocol`` exactly once."""
+        from stable_worldmodel.evaluation import (
+            EpisodeResult,
+            EvaluationProtocol,
+            EvaluationResults,
+            StepRecord,
+        )
+        from stable_worldmodel.evaluation.records import recordable
+
+        if not isinstance(protocol, EvaluationProtocol):
+            raise TypeError('protocol must be an EvaluationProtocol')
+        first_env = self.envs.envs[0]
+        spec = getattr(first_env, 'spec', None)
+        env_id = getattr(spec, 'id', None)
+        accepted_names = {
+            env_id,
+            getattr(first_env.unwrapped, 'env_name', None),
+        }
+        if protocol.environment not in accepted_names:
+            raise ValueError(
+                f'protocol environment {protocol.environment!r} does not '
+                f'match World environment {env_id!r}'
+            )
+        if len(protocol.tasks) != self.num_envs:
+            raise ValueError(
+                'protocol evaluation requires one World env per task: '
+                f'{len(protocol.tasks)} tasks != {self.num_envs} envs'
+            )
+        if eval_budget is None or eval_budget < 1:
+            raise ValueError('protocol evaluation requires eval_budget >= 1')
+        if video:
+            raise NotImplementedError(
+                'protocol evaluation video output is not yet supported'
+            )
+
+        seeds = [task.environment_seed for task in protocol.tasks]
+        options = [self._task_reset_options(task) for task in protocol.tasks]
+        self.reset(seed=seeds, options=options)
+        self.infos['controller_seed'] = np.asarray(
+            protocol.controller_seeds, dtype=np.int64
+        )[:, None]
+        self.infos['task_key'] = [[key] for key in protocol.task_keys]
+
+        def info_at(key: str, index: int, default: Any = None) -> Any:
+            value = self.infos.get(key)
+            if value is None:
+                return default
+            if torch.is_tensor(value) or isinstance(value, np.ndarray):
+                return value[index]
+            if isinstance(value, (list, tuple)):
+                return value[index]
+            return value
+
+        def snapshot(index: int) -> dict[str, Any]:
+            result = {}
+            for key, value in self.infos.items():
+                if key.startswith('_'):
+                    continue
+                if torch.is_tensor(value):
+                    result[key] = value[index].detach().cpu().clone()
+                elif isinstance(value, np.ndarray):
+                    result[key] = value[index].copy()
+                elif isinstance(value, list):
+                    result[key] = deepcopy(value[index])
+                else:
+                    result[key] = deepcopy(value)
+            return result
+
+        def state_at(index: int) -> Any:
+            value = info_at('state', index)
+            if torch.is_tensor(value):
+                return value.detach().cpu().clone()
+            if isinstance(value, np.ndarray):
+                return value.copy()
+            return deepcopy(value)
+
+        previous_states = [state_at(i) for i in range(self.num_envs)]
+        previous_records = (
+            [snapshot(i) for i in range(self.num_envs)] if record else None
+        )
+        step_records: list[list[StepRecord]] = [
+            [] for _ in range(self.num_envs)
+        ]
+        returns = np.zeros(self.num_envs, dtype=np.float64)
+        lengths = np.zeros(self.num_envs, dtype=np.int64)
+        path_costs = np.zeros(self.num_envs, dtype=np.float64)
+        control_costs = np.zeros(self.num_envs, dtype=np.float64)
+        collisions = np.zeros(self.num_envs, dtype=np.int64)
+        violations = np.zeros(self.num_envs, dtype=np.int64)
+        successes = np.zeros(self.num_envs, dtype=bool)
+
+        model_queries: list[dict[str, Any]] = []
+        original_on_plan = getattr(self.policy, 'on_plan', None)
+
+        def on_plan(event):
+            model_queries.append(recordable(event))
+            if original_on_plan is not None:
+                original_on_plan(event)
+
+        if record and hasattr(self.policy, 'on_plan'):
+            self.policy.on_plan = on_plan
+
+        def on_step(world, mask):
+            active = np.asarray(mask, dtype=bool)
+            for i in np.where(active)[0]:
+                current_state = state_at(i)
+                action = np.asarray(world.actions[i]).copy()
+                reward = float(world.rewards[i])
+                returns[i] += reward
+                lengths[i] += 1
+                successes[i] |= bool(world.terminateds[i])
+                control_costs[i] += float(np.square(action).sum())
+
+                before_state = previous_states[i]
+                if before_state is not None and current_state is not None:
+                    delta = np.asarray(current_state) - np.asarray(before_state)
+                    path_costs[i] += float(np.linalg.norm(delta))
+                collisions[i] += int(
+                    np.asarray(info_at('collision', i, False)).any()
+                )
+                violations[i] += int(
+                    np.asarray(
+                        info_at('constraint_violation', i, False)
+                    ).any()
+                )
+
+                if record:
+                    current_record = snapshot(i)
+                    step_records[i].append(
+                        StepRecord(
+                            decision=int(lengths[i] - 1),
+                            observation=previous_records[i],
+                            action=action,
+                            next_observation=current_record,
+                            reward=reward,
+                            cost=-reward,
+                            terminated=bool(world.terminateds[i]),
+                            truncated=bool(world.truncateds[i]),
+                        )
+                    )
+                    previous_records[i] = current_record
+                previous_states[i] = current_state
+
+        try:
+            self._run(max_steps=eval_budget, mode='wait', on_step=on_step)
+        finally:
+            if record and hasattr(self.policy, 'on_plan'):
+                self.policy.on_plan = original_on_plan
+
+        episodes = tuple(
+            EpisodeResult(
+                task_key=task.key,
+                environment_seed=task.environment_seed,
+                controller_seed=task.controller_seed,
+                success=bool(successes[i]),
+                episode_return=float(returns[i]),
+                length=int(lengths[i]),
+                path_cost=float(path_costs[i]),
+                control_cost=float(control_costs[i]),
+                collisions=int(collisions[i]),
+                constraint_violations=int(violations[i]),
+                steps=tuple(step_records[i]),
+            )
+            for i, task in enumerate(protocol.tasks)
+        )
+        return EvaluationResults(
+            backend=backend,
+            backend_type=self._protocol_backend_type(),
+            protocol_digest=protocol.digest,
+            episodes=episodes,
+            model_queries=tuple(model_queries),
+            metadata={
+                'split': protocol.split,
+                'environment': protocol.environment,
+                'eval_budget': eval_budget,
+            },
+        )
+
+    @staticmethod
+    def _task_reset_options(task) -> dict[str, Any]:
+        options = dict(task.options)
+        if task.layout_seed != task.environment_seed:
+            raise ValueError(
+                'this environment does not expose an independent layout '
+                'seed; layout_seed must equal environment_seed'
+            )
+
+        dynamics = dict(task.dynamics_parameters)
+        noise_std = float(dynamics.pop('observation_noise_std', 0.0))
+        if noise_std != 0.0:
+            raise NotImplementedError(
+                'protocol observation noise requires a seeded observation '
+                'adapter on the World'
+            )
+        variation_values = options.get('variation_values', {})
+        missing = sorted(set(dynamics) - set(variation_values))
+        if missing:
+            raise ValueError(
+                'protocol dynamics_parameters must be present in reset '
+                f'option variation_values; missing {missing}'
+            )
+        for key, expected in dynamics.items():
+            actual = variation_values[key]
+            try:
+                matches = np.allclose(
+                    np.asarray(actual).reshape(-1),
+                    np.asarray(expected).reshape(-1),
+                )
+            except (TypeError, ValueError):
+                matches = actual == expected
+            if not bool(matches):
+                raise ValueError(
+                    'protocol dynamics_parameters disagree with reset '
+                    f'option variation_values for {key!r}'
+                )
+        options['state'] = np.asarray(task.start, dtype=np.float32)
+        options['target_state'] = np.asarray(task.goal, dtype=np.float32)
+        return options
+
+    def _protocol_backend_type(self) -> str:
+        solver = getattr(self.policy, 'solver', None)
+        cost = getattr(solver, 'cost', None)
+        backend = getattr(cost, 'model', cost)
+        if backend is None:
+            return f'{type(self.policy).__module__}.{type(self.policy).__qualname__}'
+        backend_cls = type(backend)
+        return f'{backend_cls.__module__}.{backend_cls.__qualname__}'
 
     def _evaluate_from_dataset(
         self,
