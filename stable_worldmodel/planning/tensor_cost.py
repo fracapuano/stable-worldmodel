@@ -123,13 +123,13 @@ class _LeWMTerminalCost(nn.Module):
         return (terminal - goal[:, None]).square().sum(-1)
 
 
-class PopulationLatentGoalCost(_LeWMTerminalCost):
-    """Terminal latent error for independently parameterized LeWM predictors.
+class _PopulationLeWMTerminalCost(_LeWMTerminalCost):
+    """FastCEM terminal cost with an explicit model-population dimension.
 
-    Observation and goal embeddings are prepared once and shared across the
-    model population.  The population dimension lives on the candidate action
-    tensor and on every predictor parameter tensor; no resident module weights
-    are mutated between candidates.
+    The observation and goal encoders are shared by the supported LeWM
+    population. They receive all ``population * tasks`` inputs in one forward
+    call. Predictor parameters carry a leading population dimension and are
+    consumed without mutating the reference model.
     """
 
     def __init__(
@@ -149,25 +149,79 @@ class PopulationLatentGoalCost(_LeWMTerminalCost):
     def predictor_parameter_names(self) -> tuple[str, ...]:
         return tuple(self.model.population_predictor_parameter_names)
 
+    def prepare_population(
+        self,
+        info: dict[str, Any],
+        *,
+        device: str | torch.device,
+        dtype: torch.dtype,
+        action_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode inputs shaped ``(population, tasks, time, ...)`` once."""
+
+        def tensor(key: str) -> torch.Tensor:
+            return torch.as_tensor(info[key], device=device, dtype=dtype)
+
+        if 'emb' in info:
+            current = tensor('emb')
+        else:
+            pixels = tensor('pixels')
+            if pixels.ndim < 4:
+                raise ValueError(
+                    'population pixels must have shape (population, tasks, time, ...)'
+                )
+            population, tasks = pixels.shape[:2]
+            current = self.model.encode({'pixels': pixels.flatten(0, 1)})[
+                'emb'
+            ].unflatten(0, (population, tasks))
+
+        if current.ndim != 4:
+            raise ValueError(
+                'population embeddings must have shape '
+                '(population, tasks, time, dim)'
+            )
+        population, tasks, context = current.shape[:3]
+
+        if 'goal_emb' in info:
+            goal = tensor('goal_emb')[:, :, -1]
+        else:
+            goal_pixels = tensor('goal')
+            if goal_pixels.shape[:2] != (population, tasks):
+                raise ValueError('population goal batch does not match pixels')
+            goal = self.model.encode(
+                {'pixels': goal_pixels[:, :, -1:].flatten(0, 1)}
+            )['emb'][:, 0].unflatten(0, (population, tasks))
+
+        history = (
+            tensor('action_history')
+            if 'action_history' in info
+            else current.new_zeros(population, tasks, context - 1, action_dim)
+        )
+        expected = (population, tasks, context - 1, action_dim)
+        if tuple(history.shape) != expected:
+            raise ValueError(
+                f'expected population action_history shape {expected}'
+            )
+        return current.detach(), goal.detach(), history.detach()
+
     def forward(
         self,
         action_candidates: torch.Tensor,
         predictor_parameters: tuple[torch.Tensor, ...],
-        current_emb: torch.Tensor,
-        goal_emb: torch.Tensor,
-        action_history: torch.Tensor,
+        current: torch.Tensor,
+        goal: torch.Tensor,
+        history: torch.Tensor,
     ) -> torch.Tensor:
         """Score plans shaped ``(population, batch, samples, horizon, A)``."""
         terminal = self.model.rollout_population_from_embeddings(
-            current_emb,
+            current,
             action_candidates,
             predictor_parameters,
-            action_history=action_history,
+            action_history=history,
             history_size=self.history_size,
             terminal_only=True,
         )
-        goal = goal_emb[None, :, None, :]
-        return (terminal - goal).square().sum(dim=-1)
+        return (terminal - goal[:, :, None]).square().sum(dim=-1)
 
 
-__all__ = ['PopulationLatentGoalCost']
+__all__: list[str] = []

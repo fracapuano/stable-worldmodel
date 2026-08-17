@@ -150,9 +150,9 @@ class LeWM(nn.Module):
     ) -> torch.Tensor:
         """Roll out a population of predictors without mutating the model.
 
-        ``emb`` and ``action_history`` are shared across the population because
-        LeWM post-training evolves the predictor while keeping the observation
-        and action encoders fixed.  Candidate actions have shape
+        The observation/action encoders are shared across the population, but
+        every model may receive a different realized observation history.
+        Candidate actions have shape
         ``(population, batch, samples, horizon, action_dim)``.  Predictor
         parameter tensors follow :attr:`population_predictor_parameter_names`
         and carry the population as their leading dimension.
@@ -169,32 +169,48 @@ class LeWM(nn.Module):
             history_size = getattr(self.predictor, 'num_frames', 3)
 
         population, batch, samples, horizon = action_sequence.shape[:4]
-        if emb.ndim != 3 or emb.size(0) != batch:
-            raise ValueError('emb must have shape (batch, history, dim)')
-        history = emb.size(1)
+        if emb.ndim == 3:
+            emb = emb[None].expand(population, -1, -1, -1)
+        if emb.ndim != 4 or emb.shape[:2] != (population, batch):
+            raise ValueError(
+                'emb must have shape (batch, history, dim) or '
+                '(population, batch, history, dim)'
+            )
+        context = emb.size(2)
         if action_history is None:
             action_history = action_sequence.new_zeros(
-                batch, 0, action_sequence.size(-1)
+                population, batch, context - 1, action_sequence.size(-1)
             )
-        if action_history.ndim != 3:
+        elif action_history.ndim == 3:
+            action_history = action_history[None].expand(
+                population, -1, -1, -1
+            )
+        if action_history.ndim != 4:
             raise ValueError(
-                'action_history must have shape (batch, history - 1, action_dim)'
+                'action_history must have shape '
+                '(batch, history - 1, action_dim) or '
+                '(population, batch, history - 1, action_dim)'
             )
-        expected = (batch, history - 1, action_sequence.size(-1))
+        expected = (
+            population,
+            batch,
+            context - 1,
+            action_sequence.size(-1),
+        )
         if tuple(action_history.shape) != expected:
             raise ValueError(
                 f'action_history must have shape {expected}, got '
                 f'{tuple(action_history.shape)}'
             )
 
-        emb_init = emb[None, :, None].expand(
-            population, batch, samples, history, emb.size(-1)
+        emb_init = emb[:, :, None].expand(
+            population, batch, samples, context, emb.size(-1)
         )
-        past = action_history[None, :, None].expand(
+        past = action_history[:, :, None].expand(
             population,
             batch,
             samples,
-            history - 1,
+            context - 1,
             action_sequence.size(-1),
         )
         all_actions = torch.cat([past, action_sequence], dim=3)
@@ -211,10 +227,10 @@ class LeWM(nn.Module):
 
         emb_list = list(emb_init.unbind(dim=3))
         for step in range(horizon):
-            lo = max(0, history + step - history_size)
+            lo = max(0, context + step - history_size)
             emb_trunc = torch.stack(emb_list[lo:], dim=3)
             emb_trunc = rearrange(emb_trunc, 'p b s t d -> p (b s) t d')
-            act_trunc = all_action_emb[:, :, lo : history + step]
+            act_trunc = all_action_emb[:, :, lo : context + step]
             prediction = forward_population(
                 emb_trunc, act_trunc, predictor_parameters
             )

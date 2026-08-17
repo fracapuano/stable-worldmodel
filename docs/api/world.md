@@ -162,63 +162,76 @@ Non-array values (strings, nested objects) stay as a Python list of length `num_
 
 ## ManyWorlds
 
-`ManyWorlds` evaluates a compatible population of LeWM-style models with one
-population-batched CEM solve. Every model uses the same task observations,
-planner configuration, and CEM random numbers while retaining its own CEM
-mean, variance, elite set, and selected plan. The selected plans are copied to
-the host once and realized through the ordinary `World` Gymnasium loop one
-model at a time.
+`ManyWorlds` composes existing, weight-bound `World` instances and replaces
+their separate FastCEM calls with one population FastCEM graph. Every model
+retains its own CEM mean, variance, elite set, selected plan, realized
+environment state, and MPC warm start. Task-specific CEM random numbers are
+shared across the population for paired comparisons.
 
 ```python
 import stable_worldmodel as swm
-
-many = swm.ManyWorlds(
-    models,  # same architecture and shared encoder; predictors may differ
-    "swm/TwoRoom-v1",
-    config=swm.PlanConfig(
-        horizon=5,
-        receding_horizon=5,
-        action_block=5,
-    ),
-    cem_kwargs={
-        "device": "cuda",
-        "num_samples": 100,
-        "n_steps": 15,
-        "topk": 10,
-    },
-    population_batch_size=16,  # fixed-size GPU chunks; tune to available VRAM
-    num_envs=len(protocol.tasks),
-    image_shape=(224, 224),
-    transform={"pixels": image_transform, "goal": image_transform},
-    process={"action": action_scaler},
+from stable_worldmodel.planning import (
+    FastCEMSolver,
+    GoalMSE,
+    PopulationFastCEMSolver,
+    ShootingCostEvaluator,
 )
 
-results = many.evaluate(protocol=protocol, eval_budget=25)
+def make_world(model):
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(model, GoalMSE()),
+        device="cuda",
+        num_samples=100,
+        n_steps=15,
+        topk=10,
+    )
+    policy = swm.policy.WorldModelPolicy(
+        solver=solver,
+        config=plan_config,
+        transform={"pixels": image_transform, "goal": image_transform},
+        process={"action": action_scaler},
+    )
+    world = swm.World(
+        "swm/TwoRoom-v1",
+        num_envs=len(protocol.tasks),
+        image_shape=(224, 224),
+        max_episode_steps=50,
+    )
+    world.set_policy(policy)
+    return world
+
+worlds = [make_world(model) for model in models]
+many = swm.ManyWorlds.init(worlds=worlds)
+population_solver = PopulationFastCEMSolver.from_fast_cem(
+    worlds[0].policy.solver
+)
+
+results = many.evaluate(protocol, solver=population_solver)
 
 # Device-resident planner outputs:
-results.planned_actions.shape  # (models, tasks, horizon, blocked_action_dim)
-results.planner_costs.shape    # (models, tasks)
+results.planned_actions.shape  # (planning_calls, models, tasks, horizon, blocked_action_dim)
+results.planner_costs.shape    # (planning_calls, models, tasks)
 
 # Standard realized World results, one entry per model:
 results.evaluations[0].episodes
 ```
 
-The initial implementation is intentionally limited to predictor-only model
-variation and an evaluation budget that fits inside one receding-horizon plan.
-All models must already reside on the solver device. Population chunks reuse
-the same prepared task observations and CEM noise, including a padded final
-chunk so compiled CUDA graphs retain one fixed shape. Use
-`ManyWorlds.plan(...)` when only the device-resident batched planning result is
-needed.
+Closed-loop replanning, history, action blocks, warm starts, and early
+termination are supported. The current population kernel intentionally limits
+variation to LeWM predictor parameters; encoders, projections, buffers,
+preprocessing, action spaces, and `PlanConfig` must match. All models must
+already reside on the solver device. Gymnasium environment stepping remains a
+host operation, while every world-model and CEM refinement forward is batched
+over the complete model population.
 
 ::: stable_worldmodel.world.ManyWorlds
     options:
         heading_level: 3
         members:
+          - init
           - population_size
-          - actions_per_plan
-          - plan
           - evaluate
+          - close
         show_source: false
 
 ## EnvPool

@@ -1,4 +1,4 @@
-"""End-to-end tests for population planning with serial Gym realization."""
+"""End-to-end tests for population-parallel closed-loop evaluation."""
 
 from __future__ import annotations
 
@@ -8,8 +8,14 @@ import pytest
 import torch
 from torch import nn
 
-from stable_worldmodel import ManyWorlds, PlanConfig
+import stable_worldmodel as swm
 from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationTask
+from stable_worldmodel.planning import (
+    FastCEMSolver,
+    GoalMSE,
+    PopulationFastCEMSolver,
+    ShootingCostEvaluator,
+)
 from stable_worldmodel.world.many_worlds import _same_device
 
 ENV_ID = 'ManyWorldsTest-v0'
@@ -30,7 +36,6 @@ class PopulationPlanEnv(gym.Env):
         super().__init__()
         self.state = 0.0
         self.goal = 0.0
-        self.reset_count = 0
 
     def _observation(self) -> dict[str, np.ndarray]:
         return {
@@ -51,12 +56,11 @@ class PopulationPlanEnv(gym.Env):
         self.goal = float(
             np.asarray(options.get('target_state', [1.0])).item()
         )
-        self.reset_count += 1
         return self._observation(), self._info()
 
     def step(self, action):
         self.state += float(np.asarray(action).item())
-        return self._observation(), 0.0, False, False, self._info()
+        return self._observation(), 0.0, self.state > 0.0, False, self._info()
 
 
 if ENV_ID not in gym.registry:
@@ -64,7 +68,7 @@ if ENV_ID not in gym.registry:
 
 
 class DirectionalWorldModel(nn.Module):
-    """A predictor sign determines which physical direction looks positive."""
+    """The predictor sign changes which real action appears goal-directed."""
 
     def __init__(self, direction: float, *, shared: float = 0.0) -> None:
         super().__init__()
@@ -73,6 +77,8 @@ class DirectionalWorldModel(nn.Module):
         self.shared = nn.Parameter(
             torch.tensor(shared, dtype=torch.float32), requires_grad=False
         )
+        self.serial_calls = 0
+        self.population_calls = 0
 
     @property
     def population_predictor_parameter_names(self) -> tuple[str, ...]:
@@ -87,10 +93,18 @@ class DirectionalWorldModel(nn.Module):
         action_sequence,
         action_history=None,
         history_size=None,
+        *,
+        terminal_only=False,
     ):
         del action_history, history_size
+        self.serial_calls += 1
         direction = self.predictor.weight.reshape(1, 1, 1, 1)
-        return emb[:, None, -1:, :] + direction * action_sequence.cumsum(dim=2)
+        delta = action_sequence.sum(dim=-1, keepdim=True)
+        future = emb[:, None, -1:, :] + direction * delta.cumsum(dim=2)
+        if terminal_only:
+            return future[:, :, -1]
+        context = emb[:, None].expand(-1, action_sequence.size(1), -1, -1)
+        return torch.cat([context, future], dim=2)
 
     def rollout_population_from_embeddings(
         self,
@@ -99,11 +113,22 @@ class DirectionalWorldModel(nn.Module):
         predictor_parameters,
         action_history=None,
         history_size=None,
+        *,
+        terminal_only=False,
     ):
         del action_history, history_size
+        self.population_calls += 1
         direction = predictor_parameters[0][:, 0, 0].reshape(-1, 1, 1, 1, 1)
-        initial = emb[None, :, None, -1:, :]
-        return initial + direction * action_sequence.cumsum(dim=3)
+        if emb.ndim == 3:
+            emb = emb[None].expand(action_sequence.size(0), -1, -1, -1)
+        delta = action_sequence.sum(dim=-1, keepdim=True)
+        future = emb[:, :, None, -1:, :] + direction * delta.cumsum(dim=3)
+        if terminal_only:
+            return future[:, :, :, -1]
+        context = emb[:, :, None].expand(
+            -1, -1, action_sequence.size(2), -1, -1
+        )
+        return torch.cat([context, future], dim=3)
 
 
 def _protocol() -> EvaluationProtocol:
@@ -118,156 +143,219 @@ def _protocol() -> EvaluationProtocol:
                 start=(0.0,),
                 goal=(1.0,),
                 observation_noise_seed=0,
+                name='right',
+            ),
+            EvaluationTask(
+                environment_seed=5,
+                controller_seed=23,
+                layout_seed=5,
+                start=(0.5,),
+                goal=(-1.0,),
+                observation_noise_seed=0,
+                name='left',
             ),
         ),
     )
 
 
-def _many_worlds(models) -> ManyWorlds:
-    return ManyWorlds(
-        models,
+def _world(
+    direction: float,
+    *,
+    shared: float = 0.0,
+    config: swm.PlanConfig | None = None,
+) -> tuple[swm.World, DirectionalWorldModel]:
+    config = config or swm.PlanConfig(
+        horizon=2,
+        receding_horizon=1,
+        warm_start=True,
+    )
+    model = DirectionalWorldModel(direction, shared=shared).eval()
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(model, GoalMSE()),
+        batch_size=2,
+        num_samples=64,
+        n_steps=3,
+        topk=8,
+        compile_kernel=False,
+    )
+    policy = swm.policy.WorldModelPolicy(
+        solver=solver, config=config, history_keys=('emb',)
+    )
+    world = swm.World(
         ENV_ID,
-        config=PlanConfig(horizon=2, receding_horizon=2),
-        cem_kwargs={
-            'num_samples': 64,
-            'n_steps': 3,
-            'topk': 8,
-            'seed': 17,
-            'compile_kernel': False,
-        },
-        model_names=('positive', 'negative'),
-        num_envs=1,
-        max_episode_steps=2,
+        num_envs=2,
+        max_episode_steps=4,
         add_pixels=False,
     )
+    world.set_policy(policy)
+    return world, model
 
 
-def test_many_worlds_batches_planning_then_realizes_each_plan() -> None:
-    world = _many_worlds(
-        [DirectionalWorldModel(1.0), DirectionalWorldModel(-1.0)]
+def _many_worlds(**kwargs):
+    first, first_model = _world(1.0, **kwargs)
+    second, second_model = _world(-1.0, **kwargs)
+    first_model.train()
+    second_model.train()
+    many = swm.ManyWorlds.init(
+        worlds=[first, second], model_names=['positive', 'negative']
     )
+    assert not any(model.training for model in many.models)
+    solver = PopulationFastCEMSolver.from_fast_cem(first.policy.solver)
+    return many, solver, (first_model, second_model)
+
+
+def test_many_worlds_matches_individual_closed_loop_evaluations() -> None:
+    many, solver, _ = _many_worlds()
+    protocol = _protocol()
     try:
-        result = world.evaluate(
-            protocol=_protocol(), eval_budget=2, record=True
+        batched = many.evaluate(
+            protocol, solver=solver, eval_budget=4, record=True
+        )
+        serial = tuple(
+            world.evaluate(
+                protocol=protocol,
+                eval_budget=4,
+                backend=name,
+                record=True,
+            )
+            for world, name in zip(many.worlds, many.model_names, strict=True)
         )
 
-        assert result.planned_actions.shape == (2, 1, 2, 1)
-        assert result.planner_costs.shape == (2, 1)
-        assert result.environment_actions.shape == (2, 1, 2, 1)
-        assert result.population_size == 2
+        assert batched.planned_actions.shape == (4, 2, 2, 2, 1)
+        assert batched.planner_costs.shape == (4, 2, 2)
+        assert batched.planner_variances.shape == (4, 2, 2, 2, 1)
+        assert batched.environment_actions.shape == (2, 2, 4, 1)
+        assert batched.population_size == 2
+        assert batched.planning_calls == 4
+
+        for population_result, serial_result in zip(
+            batched.evaluations, serial, strict=True
+        ):
+            assert population_result.backend == serial_result.backend
+            assert (
+                population_result.protocol_digest
+                == serial_result.protocol_digest
+            )
+            for actual_episode, expected_episode in zip(
+                population_result.episodes,
+                serial_result.episodes,
+                strict=True,
+            ):
+                assert actual_episode.length == expected_episode.length
+                assert actual_episode.success == expected_episode.success
+                np.testing.assert_allclose(
+                    [step.action for step in actual_episode.steps],
+                    [step.action for step in expected_episode.steps],
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+                np.testing.assert_allclose(
+                    actual_episode.steps[-1].next_observation['state'],
+                    expected_episode.steps[-1].next_observation['state'],
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+    finally:
+        many.close()
+
+
+def test_many_worlds_uses_population_rollout_not_model_loop() -> None:
+    many, solver, models = _many_worlds()
+    before = tuple(
+        {
+            name: value.detach().clone()
+            for name, value in model.state_dict().items()
+        }
+        for model in models
+    )
+    try:
+        result = many.evaluate(_protocol(), solver=solver, eval_budget=3)
+
+        assert result.planning_calls == 3
+        assert models[0].population_calls == 3 * solver.n_steps
+        assert models[1].population_calls == 0
+        assert [model.serial_calls for model in models] == [0, 0]
+        for model, expected in zip(models, before, strict=True):
+            for name, value in model.state_dict().items():
+                assert torch.equal(value, expected[name])
+    finally:
+        many.close()
+
+
+def test_many_worlds_supports_history_action_blocks_and_replanning() -> None:
+    config = swm.PlanConfig(
+        horizon=2,
+        receding_horizon=1,
+        history_len=3,
+        action_block=2,
+        warm_start=True,
+    )
+    many, solver, _ = _many_worlds(config=config)
+    protocol = _protocol()
+    try:
+        batched = many.evaluate(
+            protocol, solver=solver, eval_budget=4, record=True
+        )
+        serial = tuple(
+            world.evaluate(protocol=protocol, eval_budget=4, record=True)
+            for world in many.worlds
+        )
+
+        assert batched.planning_calls == 2
+        assert batched.planned_actions.shape == (2, 2, 2, 2, 2)
+        for actual, expected in zip(batched.evaluations, serial, strict=True):
+            for actual_episode, expected_episode in zip(
+                actual.episodes, expected.episodes, strict=True
+            ):
+                np.testing.assert_allclose(
+                    [step.action for step in actual_episode.steps],
+                    [step.action for step in expected_episode.steps],
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+    finally:
+        many.close()
+
+
+def test_many_worlds_infers_budget_and_accepts_named_constructor() -> None:
+    many, solver, _ = _many_worlds()
+    try:
+        result = many.evaluate(_protocol(), solver=solver)
+        assert result.environment_actions.shape[2] == 4
         assert [item.backend for item in result.evaluations] == [
             'positive',
             'negative',
         ]
-
-        positive_final = result.evaluations[0].episodes[0].steps[-1]
-        negative_final = result.evaluations[1].episodes[0].steps[-1]
-        assert float(positive_final.next_observation['state'].item()) > 0.0
-        assert float(negative_final.next_observation['state'].item()) < 0.0
-
-        # One reset produces the shared planning observation, then the same
-        # task is reset once before each model's Gym rollout.
-        assert world.envs.envs[0].unwrapped.reset_count == 3
-        assert world.policy is world._planner_policy
     finally:
-        world.close()
+        many.close()
 
 
 def test_many_worlds_rejects_changes_outside_population_parameters() -> None:
-    with pytest.raises(ValueError, match='predictor-only variation'):
-        _many_worlds(
-            [
-                DirectionalWorldModel(1.0, shared=0.0),
-                DirectionalWorldModel(-1.0, shared=1.0),
-            ]
-        )
+    first, _ = _world(1.0, shared=0.0)
+    second, _ = _world(-1.0, shared=1.0)
+    many = swm.ManyWorlds(worlds=[first, second])
+    solver = PopulationFastCEMSolver.from_fast_cem(first.policy.solver)
+    try:
+        with pytest.raises(ValueError, match='predictor-only variation'):
+            many.evaluate(_protocol(), solver=solver, eval_budget=1)
+    finally:
+        many.close()
 
 
-def test_many_worlds_requires_budget_to_fit_one_plan() -> None:
-    world = _many_worlds(
-        [DirectionalWorldModel(1.0), DirectionalWorldModel(-1.0)]
+def test_many_worlds_rejects_mismatched_world_configuration() -> None:
+    first, _ = _world(1.0)
+    second, _ = _world(
+        -1.0,
+        config=swm.PlanConfig(horizon=3, receding_horizon=1),
     )
     try:
-        with pytest.raises(ValueError, match='fit in one plan'):
-            world.evaluate(protocol=_protocol(), eval_budget=3)
+        with pytest.raises(ValueError, match='same PlanConfig'):
+            swm.ManyWorlds(worlds=[first, second])
     finally:
-        world.close()
+        first.close()
+        second.close()
 
 
 def test_many_worlds_accepts_implicit_cuda_device_index() -> None:
     assert _same_device(torch.device('cuda:0'), torch.device('cuda'))
     assert not _same_device(torch.device('cuda:1'), torch.device('cuda:0'))
-
-
-def test_many_worlds_chunks_population_with_one_preparation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    models = [
-        DirectionalWorldModel(1.0),
-        DirectionalWorldModel(-1.0),
-        DirectionalWorldModel(0.5),
-    ]
-    world = ManyWorlds(
-        models,
-        ENV_ID,
-        config=PlanConfig(horizon=2, receding_horizon=2),
-        cem_kwargs={
-            'num_samples': 16,
-            'n_steps': 2,
-            'topk': 4,
-            'compile_kernel': False,
-        },
-        population_batch_size=2,
-        num_envs=1,
-        max_episode_steps=2,
-        add_pixels=False,
-    )
-    solve_sizes = []
-    prepare_calls = 0
-    original_solve = world.solver.solve_population_tensors
-    original_prepare = world.solver.cost.prepare
-
-    def solve(parameters, prepared, **kwargs):
-        solve_sizes.append(parameters[0].size(0))
-        return original_solve(parameters, prepared, **kwargs)
-
-    def prepare(*args, **kwargs):
-        nonlocal prepare_calls
-        prepare_calls += 1
-        return original_prepare(*args, **kwargs)
-
-    monkeypatch.setattr(world.solver, 'solve_population_tensors', solve)
-    monkeypatch.setattr(world.solver.cost, 'prepare', prepare)
-    try:
-        result = world.plan(protocol=_protocol(), eval_budget=2)
-        assert result['actions'].shape == (3, 1, 2, 1)
-        assert solve_sizes == [2, 2]
-        assert prepare_calls == 1
-    finally:
-        world.close()
-
-
-def test_many_worlds_realizes_bfloat16_plans() -> None:
-    world = _many_worlds(
-        [
-            DirectionalWorldModel(1.0).to(torch.bfloat16),
-            DirectionalWorldModel(-1.0).to(torch.bfloat16),
-        ]
-    )
-    try:
-        result = world.evaluate(protocol=_protocol(), eval_budget=2)
-        assert result.environment_actions.dtype == np.float32
-        assert len(result.evaluations) == 2
-    finally:
-        world.close()
-
-
-def test_many_worlds_rejects_receding_horizon_beyond_plan() -> None:
-    with pytest.raises(ValueError, match='cannot exceed'):
-        ManyWorlds(
-            [DirectionalWorldModel(1.0), DirectionalWorldModel(-1.0)],
-            ENV_ID,
-            config=PlanConfig(horizon=1, receding_horizon=2),
-            cem_kwargs={'compile_kernel': False},
-            add_pixels=False,
-        )

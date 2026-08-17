@@ -13,7 +13,7 @@ import torch
 from torch import nn
 from torch.func import functional_call
 
-from stable_worldmodel.planning import ShootingCostEvaluator, GoalMSE
+from stable_worldmodel.planning import GoalMSE, ShootingCostEvaluator
 from stable_worldmodel.protocols import Dynamics
 from stable_worldmodel.wm.lewm.lewm import LeWM
 from stable_worldmodel.wm.lewm.module import Predictor

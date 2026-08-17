@@ -6,20 +6,20 @@ from .icem import ICEMSolver
 from .lagrangian import LagrangianSolver
 from .mppi import MPPISolver
 from .pgd import PGDSolver
-from .population_cem import PopulationAcceleratedCEMSolver
+from .population_cem import PopulationFastCEMSolver
 from .predictive_sampling import PredictiveSamplingSolver
 from .solver import Solver
 
 __all__ = [
-    'Solver',
-    'GradientSolver',
     'CEMSolver',
-    'FastCEMSolver',
     'CategoricalCEMSolver',
+    'FastCEMSolver',
+    'GradientSolver',
     'ICEMSolver',
-    'PGDSolver',
-    'MPPISolver',
     'LagrangianSolver',
-    'PopulationAcceleratedCEMSolver',
+    'MPPISolver',
+    'PGDSolver',
+    'PopulationFastCEMSolver',
     'PredictiveSamplingSolver',
+    'Solver',
 ]
