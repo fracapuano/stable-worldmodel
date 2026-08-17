@@ -19,7 +19,8 @@ quick smoke run, for example::
 
 Setup and evaluation time are reported separately. Checkpoint download and one
 untimed CPU load are excluded, while every timed condition still instantiates
-its own model copies.
+its own model copies. The ordered per-World success-rate vectors are reported
+and checked for exact parity between the two conditions.
 """
 
 from __future__ import annotations
@@ -310,6 +311,33 @@ def print_report(
     print()
     print(f'evaluation speedup: {evaluation_speedup:.2f}x')
     print(f'end-to-end speedup: {total_speedup:.2f}x')
+    print(
+        'sequential success rates: '
+        f'{[round(value, 1) for value in sequential.success_rates]}'
+    )
+    print(
+        'many-worlds success rates: '
+        f'{[round(value, 1) for value in batched.success_rates]}'
+    )
+
+    mismatches = [
+        index
+        for index, (expected, actual) in enumerate(
+            zip(
+                sequential.success_rates,
+                batched.success_rates,
+                strict=True,
+            )
+        )
+        if expected != actual
+    ]
+    if mismatches:
+        raise RuntimeError(
+            'success-rate parity failed for world indices '
+            f'{mismatches}: sequential={sequential.success_rates}, '
+            f'many-worlds={batched.success_rates}'
+        )
+    print('success-rate vectors match: yes')
     print(
         'mean success rate: '
         f'{sum(sequential.success_rates) / args.worlds:.1f}% sequential, '
