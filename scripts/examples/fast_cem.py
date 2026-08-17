@@ -25,7 +25,7 @@ import torch
 
 import stable_worldmodel as swm
 from stable_worldmodel.planning import (
-    AcceleratedCEMSolver,
+    FastCEMSolver,
     GoalMSE,
     ShootingCostEvaluator,
 )
@@ -100,7 +100,7 @@ class PlannerMetrics:
             'task_plans': self.task_plans,
             'candidate_rollouts': rollouts,
             'latent_predictions': rollouts * config.mpc.horizon,
-            # LatentGoalCost encodes current/goal once per solver batch.
+            # FastCEM encodes current/goal once per solver batch.
             'encoder_forwards': 2 * self.solver_batches,
             'predictor_forwards': (
                 self.solver_batches * config.n_steps * config.mpc.horizon
@@ -117,7 +117,7 @@ class PlannerMetrics:
 def evaluate(world, model, protocol, config, *, device, video):
     """Compose the public model, planner, policy, and evaluation APIs."""
     metrics = PlannerMetrics(config)
-    solver = AcceleratedCEMSolver(
+    solver = FastCEMSolver(
         cost=ShootingCostEvaluator(model, GoalMSE()),
         batch_size=config.batch_size,
         num_samples=config.num_samples,

@@ -1,6 +1,6 @@
-from .accelerated_cem import AcceleratedCEMSolver
 from .categorical_cem import CategoricalCEMSolver
 from .cem import CEMSolver
+from .fast_cem import FastCEMSolver
 from .gd import GradientSolver
 from .icem import ICEMSolver
 from .lagrangian import LagrangianSolver
@@ -13,7 +13,7 @@ __all__ = [
     'Solver',
     'GradientSolver',
     'CEMSolver',
-    'AcceleratedCEMSolver',
+    'FastCEMSolver',
     'CategoricalCEMSolver',
     'ICEMSolver',
     'PGDSolver',

@@ -10,7 +10,7 @@ from stable_worldmodel.planning import (
     GoalMSE,
     ShootingCostEvaluator,
 )
-from stable_worldmodel.planning.solver import AcceleratedCEMSolver, CEMSolver
+from stable_worldmodel.planning.solver import CEMSolver, FastCEMSolver
 from stable_worldmodel.planning.solver.callbacks import BestCostRecorder
 from stable_worldmodel.policy import PlanConfig, WorldModelPolicy
 from stable_worldmodel.wm.lewm.lewm import LeWM
@@ -99,11 +99,9 @@ def test_eager_path_matches_reference_cem(manifest_streams):
         seed=17,
     )
     reference = CEMSolver(TargetCost(), **kwargs)
-    accelerated = AcceleratedCEMSolver(
-        TargetCost(), compile_kernel=False, **kwargs
-    )
+    fast = FastCEMSolver(TargetCost(), compile_kernel=False, **kwargs)
     _configure(reference)
-    _configure(accelerated)
+    _configure(fast)
     info = {'target': torch.randn(3, 4, 2)}
     if manifest_streams:
         info.update(
@@ -111,14 +109,14 @@ def test_eager_path_matches_reference_cem(manifest_streams):
             step_idx=torch.tensor([0, 5, 9]),
         )
 
-    expected, actual = reference.solve(info), accelerated.solve(info)
+    expected, actual = reference.solve(info), fast.solve(info)
 
     torch.testing.assert_close(actual['actions'], expected['actions'])
     torch.testing.assert_close(actual['var'][0], expected['var'][0])
     assert actual['costs'] == pytest.approx(expected['costs'])
 
 
-def test_standard_shooting_cost_is_automatically_accelerated():
+def test_standard_shooting_cost_automatically_uses_fast_path():
     torch.manual_seed(0)
     model = TinyDynamics()
     kwargs = dict(
@@ -131,9 +129,9 @@ def test_standard_shooting_cost_is_automatically_accelerated():
     )
     reference = CEMSolver(ShootingCostEvaluator(model, GoalMSE()), **kwargs)
     cost = ShootingCostEvaluator(model, GoalMSE())
-    accelerated = AcceleratedCEMSolver(cost, compile_kernel=False, **kwargs)
+    fast = FastCEMSolver(cost, compile_kernel=False, **kwargs)
     _configure(reference)
-    _configure(accelerated)
+    _configure(fast)
     info = {
         'pixels': torch.randn(3, 2, 3, 2, 2),
         'goal': torch.randn(3, 2, 3, 2, 2),
@@ -143,11 +141,11 @@ def test_standard_shooting_cost_is_automatically_accelerated():
     }
 
     expected = reference.solve(dict(info))
-    actual = accelerated.solve(dict(info))
+    actual = fast.solve(dict(info))
 
-    assert accelerated.cost is cost
-    assert accelerated.fast_path_enabled is True
-    assert actual['accelerated'] is True
+    assert fast.cost is cost
+    assert fast.fast_path_enabled is True
+    assert actual['fast_path'] is True
     torch.testing.assert_close(actual['actions'], expected['actions'])
     torch.testing.assert_close(actual['var'][0], expected['var'][0])
     torch.testing.assert_close(
@@ -160,7 +158,7 @@ def test_standard_shooting_cost_is_automatically_accelerated():
 
 def test_unsupported_cost_and_callbacks_preserve_reference_cem():
     callback = BestCostRecorder()
-    solver = AcceleratedCEMSolver(
+    solver = FastCEMSolver(
         TargetCost(),
         num_samples=12,
         n_steps=3,
@@ -174,21 +172,21 @@ def test_unsupported_cost_and_callbacks_preserve_reference_cem():
 
     assert solver.fast_path_enabled is False
     assert 'callbacks' in output
-    assert output['accelerated'] is False
+    assert output['fast_path'] is False
 
-    fallback = AcceleratedCEMSolver(
+    fallback = FastCEMSolver(
         ReferenceOnlyCost(), num_samples=8, n_steps=2, topk=2
     )
     _configure(fallback, 1)
     output = fallback.solve({'target': torch.randn(1, 4, 2)})
     assert fallback.fast_path_enabled is False
-    assert output['accelerated'] is False
+    assert output['fast_path'] is False
     with pytest.raises(RuntimeError, match='solve_tensors is unavailable'):
         fallback.prepare({'target': torch.randn(1, 4, 2)})
 
 
 def test_standard_cost_supports_receding_horizon_and_warm_start():
-    class RecordingSolver(AcceleratedCEMSolver):
+    class RecordingSolver(FastCEMSolver):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.init_actions = []
@@ -242,7 +240,7 @@ def test_standard_cost_supports_receding_horizon_and_warm_start():
 
 
 def test_tensor_api_is_device_resident_and_deterministic(capsys):
-    solver = AcceleratedCEMSolver(
+    solver = FastCEMSolver(
         TargetCost(),
         num_samples=12,
         n_steps=3,
@@ -273,7 +271,7 @@ def test_tensor_api_is_device_resident_and_deterministic(capsys):
 )
 def test_rejects_incompatible_settings(kwargs):
     with pytest.raises(ValueError):
-        AcceleratedCEMSolver(TargetCost(), **kwargs)
+        FastCEMSolver(TargetCost(), **kwargs)
 
 
 def test_compile_failure_falls_back_to_eager(monkeypatch):
@@ -281,7 +279,7 @@ def test_compile_failure_falls_back_to_eager(monkeypatch):
         raise RuntimeError('synthetic compiler failure')
 
     monkeypatch.setattr(torch, 'compile', fail_compile)
-    solver = AcceleratedCEMSolver(
+    solver = FastCEMSolver(
         TargetCost(),
         num_samples=8,
         n_steps=2,
@@ -311,7 +309,7 @@ def test_real_lewm_standard_cost_is_fully_capturable():
         ),
         nn.Linear(2, 4),
     ).eval()
-    solver = AcceleratedCEMSolver(
+    solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
         num_samples=4,
         n_steps=2,
@@ -322,14 +320,28 @@ def test_real_lewm_standard_cost_is_fully_capturable():
     )
     _configure(solver, 1)
 
-    output = solver.solve_tensors(
-        solver.prepare(
-            {
-                'emb': torch.randn(1, 1, 4),
-                'goal_emb': torch.randn(1, 1, 4),
-            }
-        )
+    candidates = torch.randn(1, 4, 4, 2)
+    prepared = solver.prepare(
+        {
+            'emb': torch.randn(1, 1, 4),
+            'goal_emb': torch.randn(1, 1, 4),
+        }
     )
+    current, goal, history = prepared
+    reference = model.rollout(
+        {
+            'pixels': torch.empty(1, 4, 1, 1),
+            'emb': current[:, None].expand(-1, 4, -1, -1),
+            'action_history': history[:, None].expand(-1, 4, -1, -1),
+        },
+        candidates,
+    )['predicted_emb'][:, :, -1]
+    actual = solver._tensor_cost(candidates, *prepared)
+    torch.testing.assert_close(
+        actual, (reference - goal[:, None]).square().sum(-1)
+    )
+
+    output = solver.solve_tensors(prepared)
 
     assert output['actions'].shape == (1, 4, 2)
     assert output['compiled'] is True
@@ -337,7 +349,7 @@ def test_real_lewm_standard_cost_is_fully_capturable():
 
 def test_compiled_loop_reads_updated_parameters():
     cost = TargetCost()
-    solver = AcceleratedCEMSolver(
+    solver = FastCEMSolver(
         cost,
         num_samples=32,
         n_steps=3,

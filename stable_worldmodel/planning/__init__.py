@@ -19,9 +19,9 @@ from stable_worldmodel.planning.objective import (
 # so ``from stable_worldmodel.planning import CEMSolver`` works alongside
 # ``from stable_worldmodel.planning.solver import CEMSolver``.
 from stable_worldmodel.planning.solver import (
-    AcceleratedCEMSolver,
     CategoricalCEMSolver,
     CEMSolver,
+    FastCEMSolver,
     GradientSolver,
     ICEMSolver,
     LagrangianSolver,
@@ -41,13 +41,13 @@ from stable_worldmodel.protocols import (
 )
 
 __all__ = [
-    'AcceleratedCEMSolver',
     'CEMSolver',
     'CategoricalCEMSolver',
     'Constrainable',
     'ControlPenalty',
     'Costable',
     'Dynamics',
+    'FastCEMSolver',
     'GoalMSE',
     'GradientSolver',
     'ICEMSolver',

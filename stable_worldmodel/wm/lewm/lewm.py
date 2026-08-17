@@ -50,111 +50,75 @@ class LeWM(nn.Module):
         preds = rearrange(preds, '(b t) d -> b t d', b=emb.size(0))
         return preds
 
-    def _predict_next(self, emb, act_emb):
-        """Project only the final predictor token used by rollouts."""
-        return self.pred_proj(self.predictor(emb, act_emb)[:, -1])
-
     ####################
     ## Inference only ##
     ####################
 
-    def rollout_from_embeddings(
-        self,
-        emb: torch.Tensor,
-        action_sequence: torch.Tensor,
-        action_history: torch.Tensor | None = None,
-        history_size: int | None = None,
-        *,
-        terminal_only: bool = False,
-    ) -> torch.Tensor:
-        """Roll out pre-encoded context without dictionary mutation.
-
-        Set ``terminal_only`` for terminal costs to keep only the active
-        predictor window and return ``(B, S, D)`` instead of the full
-        ``(B, S, H + T, D)`` sequence.
+    def rollout(self, info, action_sequence, history_size: int = None):
+        """Rollout the model given an initial info dict and action sequence.
+        pixels: (B, S, H, C, h, w) — H context frames (block timesteps)
+        action_sequence: (B, S, T, action_dim) — strictly-future candidates
+        info['action_history']: (B, S, H - 1, action_dim) — executed action
+            blocks between the context frames (required when H > 1)
+         - S is the number of action plan samples
+         - T is the planning horizon
+        Returns ``info`` with ``predicted_emb`` of shape (B, S, H + T, D);
+        the first H entries are the encoded context frames.
         """
-        history_size = history_size or getattr(self.predictor, 'num_frames', 3)
-        B, S, T = action_sequence.shape[:3]
-        if emb.ndim == 3:
-            emb = emb[:, None].expand(B, S, -1, -1)
-        H = emb.size(2)
+        if history_size is None:
+            history_size = getattr(self.predictor, 'num_frames', 3)
 
-        if action_history is None:
-            action_history = action_sequence.new_zeros(
-                B, S, 0, action_sequence.size(-1)
-            )
-        elif action_history.ndim == 3:
-            action_history = action_history[:, None].expand(B, S, -1, -1)
-        assert action_history.size(2) == H - 1, (
-            f'action_history must hold H-1={H - 1} executed blocks'
-        )
-
-        emb = rearrange(emb, 'b s ... -> (b s) ...')
-        actions = rearrange(action_sequence, 'b s ... -> (b s) ...')
-        if H > 1:
-            actions = torch.cat(
-                [
-                    rearrange(action_history, 'b s ... -> (b s) ...'),
-                    actions,
-                ],
-                dim=1,
-            )
-        act_emb = self.action_encoder(actions)
-
-        frames = list(emb.unbind(dim=1))
-        for t in range(T):
-            lo = max(0, H + t - history_size)
-            frames.append(
-                self._predict_next(
-                    torch.stack(frames[-history_size:], dim=1),
-                    act_emb[:, lo : H + t],
-                )
-            )
-            if terminal_only:
-                frames = frames[-history_size:]
-
-        if terminal_only:
-            return rearrange(frames[-1], '(b s) d -> b s d', b=B, s=S)
-        return rearrange(
-            torch.stack(frames, dim=1), '(b s) ... -> b s ...', b=B, s=S
-        )
-
-    def rollout(self, info, action_sequence, history_size: int | None = None):
-        """Roll out strictly-future candidates from observation context."""
         assert 'pixels' in info, 'pixels not in info_dict'
         H = info['pixels'].size(2)
-        B, S = action_sequence.shape[:2]
-        action_history = info.get('action_history')
-        if action_history is None:
-            action_history = action_sequence.new_zeros(
+        B, S, T = action_sequence.shape[:3]
+        act_past = info.get('action_history')
+        if act_past is None:
+            act_past = action_sequence.new_zeros(
                 B, S, 0, action_sequence.size(-1)
             )
-        assert action_history.size(2) == H - 1, (
-            f'action_history must hold H-1={H - 1} executed blocks'
+        assert act_past.size(2) == H - 1, (
+            f'action_history must hold H-1={H - 1} executed blocks, '
+            f'got {act_past.size(2)}'
         )
+        # action paired with context frame k is the block leaving it; the
+        # current frame (k = H-1) pairs with the first candidate
         info['action'] = torch.cat(
-            [action_history, action_sequence[:, :, :1]], dim=2
+            [act_past, action_sequence[:, :, :1]], dim=2
         )
 
+        # encode initial state, or reuse cached embedding from a prior rollout.
+        # detach: to avoid backprop in encoder
         if 'emb' not in info:
-            initial = {
-                key: value[:, 0]
-                for key, value in info.items()
-                if torch.is_tensor(value)
-            }
+            _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+            _init = self.encode(_init)
             info['emb'] = (
-                self.encode(initial)['emb']
-                .detach()
-                .unsqueeze(1)
-                .expand(B, S, -1, -1)
+                _init['emb'].detach().unsqueeze(1).expand(B, S, -1, -1)
             )
 
-        info['predicted_emb'] = self.rollout_from_embeddings(
-            info['emb'],
-            action_sequence,
-            action_history=action_history,
-            history_size=history_size,
-        )
+        # flatten batch and sample dimensions for rollout
+        emb_init = rearrange(info['emb'], 'b s ... -> (b s) ...')
+        act_past_flat = rearrange(act_past, 'b s ... -> (b s) ...')
+        act_cand_flat = rearrange(action_sequence, 'b s ... -> (b s) ...')
+        all_act_emb = self.action_encoder(
+            torch.cat([act_past_flat, act_cand_flat], dim=1)
+        )  # (BS, H - 1 + T, A_emb); index k = block leaving frame k
+
+        # rollout predictor autoregressively, one step per candidate
+        # emb_list holds individual (BS, D) frames, each with its own grad_fn
+        HS = history_size
+        emb_list = list(emb_init.unbind(dim=1))  # H tensors of shape (BS, D)
+        for t in range(T):
+            lo = max(0, H + t - HS)
+            emb_trunc = torch.stack(emb_list[lo:], dim=1)  # (BS, HS, D)
+            act_trunc = all_act_emb[:, lo : H + t]  # (BS, HS, A_emb)
+            emb_list.append(self.predict(emb_trunc, act_trunc)[:, -1])
+
+        emb = torch.stack(emb_list, dim=1)  # (BS, H + T, D)
+
+        # unflatten batch and sample dimensions
+        pred_rollout = rearrange(emb, '(b s) ... -> b s ...', b=B, s=S)
+        info['predicted_emb'] = pred_rollout
+
         return info
 
 

@@ -8,7 +8,7 @@ from stable_worldmodel.planning import (
     GoalMSE,
     ShootingCostEvaluator,
 )
-from stable_worldmodel.planning.tensor_cost import LatentGoalCost
+from stable_worldmodel.planning.tensor_cost import _LeWMTerminalCost
 
 
 class TinyLatentModel(nn.Module):
@@ -72,7 +72,7 @@ def test_tensor_cost_matches_dictionary_path_and_encodes_once():
     )
 
     model = TinyLatentModel()
-    cost = LatentGoalCost(model)
+    cost = _LeWMTerminalCost(model)
     prepared = cost.prepare(
         {'pixels': pixels, 'goal': goal},
         device='cpu',
@@ -88,7 +88,7 @@ def test_tensor_cost_matches_dictionary_path_and_encodes_once():
 
 
 def test_tensor_cost_rejects_mismatched_action_history():
-    cost = LatentGoalCost(TinyLatentModel())
+    cost = _LeWMTerminalCost(TinyLatentModel())
     with pytest.raises(ValueError, match='action_history'):
         cost.prepare(
             {

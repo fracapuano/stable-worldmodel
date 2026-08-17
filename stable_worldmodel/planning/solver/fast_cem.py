@@ -1,4 +1,4 @@
-"""Device-resident CEM for pure-tensor planning costs."""
+"""Fast CEM with a device-resident refinement loop."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from stable_worldmodel.planning.evaluator import (
     default_goal_encode,
 )
 from stable_worldmodel.planning.objective import GoalMSE
-from stable_worldmodel.planning.tensor_cost import LatentGoalCost
+from stable_worldmodel.planning.tensor_cost import _LeWMTerminalCost
 from stable_worldmodel.protocols import Costable
 
 from .callbacks import Callback
@@ -67,7 +67,7 @@ class _CEMLoop(nn.Module):
         return mean, std, cost
 
 
-class AcceleratedCEMSolver(CEMSolver):
+class FastCEMSolver(CEMSolver):
     """Drop-in CEM with an automatic device-resident fast path.
 
     Standard costs, including ``ShootingCostEvaluator(model, GoalMSE())``, use
@@ -132,9 +132,9 @@ class AcceleratedCEMSolver(CEMSolver):
             and cost.objective.pred_key == 'predicted_emb'
             and cost.objective.goal_key == 'goal_emb'
             and cost.encode_goal is default_goal_encode
-            and hasattr(cost.model, 'rollout_from_embeddings')
+            and _LeWMTerminalCost.supports(cost.model)
         ):
-            return LatentGoalCost(cost.model), None
+            return _LeWMTerminalCost(cost.model), None
         if isinstance(cost, nn.Module) and callable(
             getattr(cost, 'prepare', None)
         ):
@@ -234,7 +234,7 @@ class AcceleratedCEMSolver(CEMSolver):
                 raise
             self._compile_error = f'{type(exc).__name__}: {exc}'
             logging.warning(
-                f'accelerated CEM compilation failed; using eager: '
+                f'FastCEM compilation failed; using eager: '
                 f'{self._compile_error}'
             )
             return (*self._loop.eager(mean, std, noise, *prepared), False)
@@ -280,7 +280,7 @@ class AcceleratedCEMSolver(CEMSolver):
         """Solve through the standard planner interface."""
         if not self.fast_path_enabled:
             output = super().solve(info, init_action)
-            output['accelerated'] = False
+            output['fast_path'] = False
             output['compiled'] = False
             output['compile_error'] = None
             return output
@@ -322,10 +322,10 @@ class AcceleratedCEMSolver(CEMSolver):
             'mean': [actions],
             'var': [std],
             'solve_time_seconds': time.perf_counter() - started,
-            'accelerated': True,
+            'fast_path': True,
             'compiled': any(output['compiled'] for output in outputs),
             'compile_error': self._compile_error,
         }
 
 
-__all__ = ['AcceleratedCEMSolver']
+__all__ = ['FastCEMSolver']

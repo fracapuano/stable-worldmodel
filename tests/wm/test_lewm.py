@@ -12,7 +12,7 @@ import pytest
 import torch
 from torch import nn
 
-from stable_worldmodel.planning import GoalMSE, ShootingCostEvaluator
+from stable_worldmodel.planning import ShootingCostEvaluator, GoalMSE
 from stable_worldmodel.protocols import Dynamics
 from stable_worldmodel.wm.lewm.lewm import LeWM
 
@@ -192,64 +192,6 @@ def test_rollout_h1_matches_legacy_semantics():
     )
     assert 'action_history' not in out
     torch.testing.assert_close(out['action'], candidates[:, :, :1])
-
-
-def test_pure_tensor_rollout_matches_dictionary_rollout():
-    """The accelerated tensor seam must preserve the reference rollout."""
-    torch.manual_seed(0)
-    model = _toy_model()
-    emb = torch.randn(RB, 3, RD)
-    past = torch.randn(RB, 2, RD)
-    candidates = torch.randn(RB, RS, 4, RD)
-    info = _rollout_info(
-        hist_len=3,
-        emb=emb.unsqueeze(1).expand(RB, RS, -1, -1),
-    )
-    info['action_history'] = past.unsqueeze(1).expand(RB, RS, -1, -1)
-
-    reference = model.rollout(dict(info), candidates)['predicted_emb']
-    accelerated = model.rollout_from_embeddings(
-        emb, candidates, action_history=past
-    )
-
-    torch.testing.assert_close(accelerated, reference)
-
-
-@pytest.mark.parametrize('hist_len', [1, 3, 5])
-def test_terminal_tensor_rollout_matches_full_tensor_rollout(hist_len):
-    """Terminal-only planning must preserve the full rollout's last latent."""
-    torch.manual_seed(0)
-    model = _toy_model()
-    emb = torch.randn(RB, hist_len, RD)
-    past = torch.randn(RB, hist_len - 1, RD)
-    candidates = torch.randn(RB, RS, 4, RD)
-
-    full = model.rollout_from_embeddings(emb, candidates, action_history=past)
-    terminal = model.rollout_from_embeddings(
-        emb, candidates, action_history=past, terminal_only=True
-    )
-
-    torch.testing.assert_close(terminal, full[:, :, -1])
-
-
-def test_rollout_projects_only_the_final_predictor_token_equivalently():
-    """Projecting only the last token is equivalent during inference."""
-    torch.manual_seed(0)
-    model = _toy_model()
-    model.pred_proj = nn.Sequential(
-        nn.Linear(RD, 2 * RD),
-        nn.BatchNorm1d(2 * RD),
-        nn.GELU(),
-        nn.Linear(2 * RD, RD),
-    )
-    model.eval()
-    emb = torch.randn(RB * RS, 3, RD)
-    act_emb = torch.randn_like(emb)
-
-    expected = model.predict(emb, act_emb)[:, -1]
-    actual = model._predict_next(emb, act_emb)
-
-    torch.testing.assert_close(actual, expected)
 
 
 def test_rollout_consumes_past_actions_in_order():
