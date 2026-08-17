@@ -83,6 +83,10 @@ Prepared embeddings are reusable only while the observation, goal, action
 history, and encoder/projector parameters stay fixed. In particular, recompute
 them after each closed-loop observation or when optimizing the encoder.
 
+See `scripts/examples/fast_cem.py` for a complete learned-dynamics example
+that holds an evaluation protocol fixed while comparing planner budgets,
+success rates, model workload, and runtime.
+
 ::: stable_worldmodel.planning.solver.AcceleratedCEMSolver
     options:
         heading_level: 3
