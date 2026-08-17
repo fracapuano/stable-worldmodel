@@ -13,7 +13,6 @@ from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationTask
 from stable_worldmodel.planning import (
     FastCEMSolver,
     GoalMSE,
-    PopulationFastCEMSolver,
     ShootingCostEvaluator,
 )
 from stable_worldmodel.world.many_worlds import _same_device
@@ -200,7 +199,7 @@ def _many_worlds(**kwargs):
         worlds=[first, second], model_names=['positive', 'negative']
     )
     assert not any(model.training for model in many.models)
-    solver = PopulationFastCEMSolver.from_fast_cem(first.policy.solver)
+    solver = first.policy.solver
     return many, solver, (first_model, second_model)
 
 
@@ -334,7 +333,7 @@ def test_many_worlds_rejects_changes_outside_population_parameters() -> None:
     first, _ = _world(1.0, shared=0.0)
     second, _ = _world(-1.0, shared=1.0)
     many = swm.ManyWorlds(worlds=[first, second])
-    solver = PopulationFastCEMSolver.from_fast_cem(first.policy.solver)
+    solver = first.policy.solver
     try:
         with pytest.raises(ValueError, match='predictor-only variation'):
             many.evaluate(_protocol(), solver=solver, eval_budget=1)

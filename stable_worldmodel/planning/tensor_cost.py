@@ -122,31 +122,19 @@ class _LeWMTerminalCost(nn.Module):
         )
         return (terminal - goal[:, None]).square().sum(-1)
 
-
-class _PopulationLeWMTerminalCost(_LeWMTerminalCost):
-    """FastCEM terminal cost with an explicit model-population dimension.
-
-    The observation and goal encoders are shared by the supported LeWM
-    population. They receive all ``population * tasks`` inputs in one forward
-    call. Predictor parameters carry a leading population dimension and are
-    consumed without mutating the reference model.
-    """
-
-    def __init__(
-        self, model: nn.Module, *, history_size: int | None = None
-    ) -> None:
-        super().__init__(model, history_size=history_size)
-        if not hasattr(model, 'rollout_population_from_embeddings'):
+    def _require_population_support(self) -> None:
+        if not hasattr(self.model, 'rollout_population_from_embeddings'):
             raise TypeError(
                 'model must expose rollout_population_from_embeddings'
             )
-        if not hasattr(model, 'population_predictor_parameter_names'):
+        if not hasattr(self.model, 'population_predictor_parameter_names'):
             raise TypeError(
                 'model must expose population_predictor_parameter_names'
             )
 
     @property
-    def predictor_parameter_names(self) -> tuple[str, ...]:
+    def population_parameter_names(self) -> tuple[str, ...]:
+        self._require_population_support()
         return tuple(self.model.population_predictor_parameter_names)
 
     def prepare_population(
@@ -158,6 +146,7 @@ class _PopulationLeWMTerminalCost(_LeWMTerminalCost):
         action_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode inputs shaped ``(population, tasks, time, ...)`` once."""
+        self._require_population_support()
 
         def tensor(key: str) -> torch.Tensor:
             return torch.as_tensor(info[key], device=device, dtype=dtype)
@@ -204,10 +193,10 @@ class _PopulationLeWMTerminalCost(_LeWMTerminalCost):
             )
         return current.detach(), goal.detach(), history.detach()
 
-    def forward(
+    def forward_population(
         self,
         action_candidates: torch.Tensor,
-        predictor_parameters: tuple[torch.Tensor, ...],
+        population_parameters: tuple[torch.Tensor, ...],
         current: torch.Tensor,
         goal: torch.Tensor,
         history: torch.Tensor,
@@ -216,7 +205,7 @@ class _PopulationLeWMTerminalCost(_LeWMTerminalCost):
         terminal = self.model.rollout_population_from_embeddings(
             current,
             action_candidates,
-            predictor_parameters,
+            population_parameters,
             action_history=history,
             history_size=self.history_size,
             terminal_only=True,

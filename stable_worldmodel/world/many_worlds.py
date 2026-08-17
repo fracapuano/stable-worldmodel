@@ -19,7 +19,7 @@ from stable_worldmodel.evaluation import (
     EvaluationResults,
     StepRecord,
 )
-from stable_worldmodel.planning import FastCEMSolver, PopulationFastCEMSolver
+from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.policy import ACTION_HISTORY_KEY, WorldModelPolicy
 
 from .world import World
@@ -238,16 +238,13 @@ class ManyWorlds:
                     'all world models must have the same concrete type'
                 )
 
-    def _validate_population(self, solver: PopulationFastCEMSolver) -> None:
-        if not isinstance(solver, PopulationFastCEMSolver):
-            raise TypeError('solver must be a PopulationFastCEMSolver')
+    def _validate_population(self, solver: FastCEMSolver) -> None:
+        if not isinstance(solver, FastCEMSolver):
+            raise TypeError('solver must be a FastCEMSolver')
         if solver._tensor_cost.model is not self.models[0]:
-            raise ValueError(
-                'the population solver must be constructed from the first '
-                "World's FastCEM cost"
-            )
+            raise ValueError("solver must use the first World's FastCEM model")
 
-        names = solver.predictor_parameter_names
+        names = solver.population_parameter_names
         base_state = self.models[0].state_dict()
         base_parameters = dict(self.models[0].named_parameters())
         missing = sorted(set(names) - set(base_parameters))
@@ -297,7 +294,7 @@ class ManyWorlds:
                 )
 
     def _stack_parameters(
-        self, solver: PopulationFastCEMSolver
+        self, solver: FastCEMSolver
     ) -> tuple[torch.Tensor, ...]:
         by_model = tuple(
             dict(model.named_parameters()) for model in self.models
@@ -306,7 +303,7 @@ class ManyWorlds:
             torch.stack(
                 tuple(parameters[name].detach() for parameters in by_model)
             )
-            for name in solver.predictor_parameter_names
+            for name in solver.population_parameter_names
         )
 
     def _infer_eval_budget(self) -> int:
@@ -472,7 +469,7 @@ class ManyWorlds:
         self,
         protocol: EvaluationProtocol,
         *,
-        solver: PopulationFastCEMSolver,
+        solver: FastCEMSolver,
         eval_budget: int | None = None,
         record: bool = False,
     ) -> ManyWorldsEvaluationResults:

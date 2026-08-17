@@ -6,7 +6,6 @@ from .icem import ICEMSolver
 from .lagrangian import LagrangianSolver
 from .mppi import MPPISolver
 from .pgd import PGDSolver
-from .population_cem import PopulationFastCEMSolver
 from .predictive_sampling import PredictiveSamplingSolver
 from .solver import Solver
 
@@ -19,7 +18,6 @@ __all__ = [
     'LagrangianSolver',
     'MPPISolver',
     'PGDSolver',
-    'PopulationFastCEMSolver',
     'PredictiveSamplingSolver',
     'Solver',
 ]

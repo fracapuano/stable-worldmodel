@@ -173,7 +173,6 @@ import stable_worldmodel as swm
 from stable_worldmodel.planning import (
     FastCEMSolver,
     GoalMSE,
-    PopulationFastCEMSolver,
     ShootingCostEvaluator,
 )
 
@@ -202,11 +201,7 @@ def make_world(model):
 
 worlds = [make_world(model) for model in models]
 many = swm.ManyWorlds.init(worlds=worlds)
-population_solver = PopulationFastCEMSolver.from_fast_cem(
-    worlds[0].policy.solver
-)
-
-results = many.evaluate(protocol, solver=population_solver)
+results = many.evaluate(protocol, solver=worlds[0].policy.solver)
 
 # Device-resident planner outputs:
 results.planned_actions.shape  # (planning_calls, models, tasks, horizon, blocked_action_dim)

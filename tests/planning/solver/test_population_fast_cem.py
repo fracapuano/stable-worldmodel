@@ -13,7 +13,6 @@ from torch import nn
 from stable_worldmodel.planning import (
     FastCEMSolver,
     GoalMSE,
-    PopulationFastCEMSolver,
     ShootingCostEvaluator,
 )
 from stable_worldmodel.policy import PlanConfig
@@ -101,7 +100,7 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
         FastCEMSolver(ShootingCostEvaluator(model, GoalMSE()), **kwargs)
         for model in (first, second)
     )
-    population = PopulationFastCEMSolver(
+    population = FastCEMSolver(
         ShootingCostEvaluator(first, GoalMSE()), **kwargs
     )
     for solver in (*serial, population):
@@ -112,7 +111,7 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
         'goal_emb': torch.randn(2, 2, 1, 4),
     }
     parameters = _stack_predictors(
-        (first, second), population.predictor_parameter_names
+        (first, second), population.population_parameter_names
     )
     noise = population.sample_noise(2)
 
@@ -141,7 +140,7 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
 
 def test_population_fast_cem_compiles_as_one_full_graph():
     model = _model()
-    solver = PopulationFastCEMSolver(
+    solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
         num_samples=4,
         n_steps=2,
@@ -158,7 +157,7 @@ def test_population_fast_cem_compiles_as_one_full_graph():
     parameters = tuple(
         value.detach()[None].expand(2, *value.shape).clone()
         for name, value in model.named_parameters()
-        if name in solver.predictor_parameter_names
+        if name in solver.population_parameter_names
     )
 
     output = solver.solve_population(info, parameters)
@@ -169,7 +168,7 @@ def test_population_fast_cem_compiles_as_one_full_graph():
 
 def test_population_fast_cem_rejects_wrong_population_parameters():
     model = _model()
-    solver = PopulationFastCEMSolver(
+    solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
         num_samples=4,
         n_steps=2,
@@ -192,7 +191,7 @@ def test_population_fast_cem_rejects_wrong_population_parameters():
 
 def test_population_preparation_encodes_all_worlds_in_one_batch():
     model = CountingEncoderModel()
-    solver = PopulationFastCEMSolver(
+    solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
         num_samples=4,
         n_steps=2,

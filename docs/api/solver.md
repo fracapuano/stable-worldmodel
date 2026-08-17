@@ -37,14 +37,7 @@ summary: Model-based planning solvers for action optimization
         members: false
         show_source: false
 
-::: stable_worldmodel.planning.solver.PopulationFastCEMSolver
-    options:
-        heading_level: 3
-        members: false
-        show_source: false
-
-::: stable_worldmodel.planning.solver.PopulationFastCEMSolver.from_fast_cem
-::: stable_worldmodel.planning.solver.PopulationFastCEMSolver.solve_population
+::: stable_worldmodel.planning.solver.FastCEMSolver.solve_population
 
 ::: stable_worldmodel.planning.solver.ICEMSolver
     options:
