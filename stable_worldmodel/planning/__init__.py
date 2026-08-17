@@ -21,6 +21,7 @@ from stable_worldmodel.planning.objective import (
 from stable_worldmodel.planning.solver import (
     CategoricalCEMSolver,
     CEMSolver,
+    FastCEMSolver,
     GradientSolver,
     ICEMSolver,
     LagrangianSolver,
@@ -46,6 +47,7 @@ __all__ = [
     'ControlPenalty',
     'Costable',
     'Dynamics',
+    'FastCEMSolver',
     'GoalMSE',
     'GradientSolver',
     'ICEMSolver',
