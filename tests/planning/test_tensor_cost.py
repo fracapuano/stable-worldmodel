@@ -6,9 +6,9 @@ from torch import nn
 
 from stable_worldmodel.planning import (
     GoalMSE,
-    LatentGoalCost,
     ShootingCostEvaluator,
 )
+from stable_worldmodel.planning.tensor_cost import LatentGoalCost
 
 
 class TinyLatentModel(nn.Module):

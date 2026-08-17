@@ -24,7 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 
 import stable_worldmodel as swm
-from stable_worldmodel.planning import AcceleratedCEMSolver, LatentGoalCost
+from stable_worldmodel.planning import (
+    AcceleratedCEMSolver,
+    GoalMSE,
+    ShootingCostEvaluator,
+)
 from multiple_dynamics import (
     CHECKPOINT,
     ENV_ID,
@@ -114,7 +118,7 @@ def evaluate(world, model, protocol, config, *, device, video):
     """Compose the public model, planner, policy, and evaluation APIs."""
     metrics = PlannerMetrics(config)
     solver = AcceleratedCEMSolver(
-        cost=LatentGoalCost(model),
+        cost=ShootingCostEvaluator(model, GoalMSE()),
         batch_size=config.batch_size,
         num_samples=config.num_samples,
         var_scale=config.var_scale,
@@ -124,6 +128,8 @@ def evaluate(world, model, protocol, config, *, device, video):
         seed=config.seed,
         compile_kernel=config.compile_kernel,
     )
+    if not solver.fast_path_enabled:
+        raise RuntimeError(solver.fallback_reason)
     policy = swm.policy.WorldModelPolicy(
         solver=solver,
         config=config.mpc,

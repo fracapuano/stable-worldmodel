@@ -30,7 +30,6 @@ from stable_worldmodel.planning.solver import (
     PredictiveSamplingSolver,
     Solver,
 )
-from stable_worldmodel.planning.tensor_cost import LatentGoalCost
 
 # Re-exported from stable_worldmodel.protocols (their canonical home) so that
 # ``from stable_worldmodel.planning import Objective, Dynamics`` keeps working.
@@ -53,7 +52,6 @@ __all__ = [
     'GradientSolver',
     'ICEMSolver',
     'LagrangianSolver',
-    'LatentGoalCost',
     'MPPISolver',
     'Objective',
     'PGDSolver',

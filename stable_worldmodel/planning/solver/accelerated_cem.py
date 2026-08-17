@@ -10,6 +10,15 @@ import torch
 from loguru import logger as logging
 from torch import nn
 
+from stable_worldmodel.planning.evaluator import (
+    ShootingCostEvaluator,
+    default_goal_encode,
+)
+from stable_worldmodel.planning.objective import GoalMSE
+from stable_worldmodel.planning.tensor_cost import LatentGoalCost
+from stable_worldmodel.protocols import Costable
+
+from .callbacks import Callback
 from .cem import CEMSolver
 from .utils import prepare_init_action
 
@@ -59,17 +68,19 @@ class _CEMLoop(nn.Module):
 
 
 class AcceleratedCEMSolver(CEMSolver):
-    """CEM with one compiled, device-resident refinement loop.
+    """Drop-in CEM with an automatic device-resident fast path.
 
-    ``cost.prepare(info, ...)`` runs once per planning decision and
-    ``cost(candidates, *prepared)`` must be a pure tensor operation. The
-    regular :meth:`solve` returns the usual CPU result; :meth:`solve_tensors`
-    leaves its result on the planning device.
+    Standard costs, including ``ShootingCostEvaluator(model, GoalMSE())``, use
+    the same constructor and :meth:`solve` contract as :class:`CEMSolver`.
+    Compatible terminal LeWM costs are adapted internally to a pure-tensor
+    kernel; other costs and per-iteration callbacks use the inherited CEM
+    implementation. The advanced :meth:`solve_tensors` interface is available
+    only when the fast path is active.
     """
 
     def __init__(
         self,
-        cost: nn.Module,
+        cost: Costable | nn.Module,
         batch_size: int = 1,
         num_samples: int = 300,
         var_scale: float = 1,
@@ -77,7 +88,7 @@ class AcceleratedCEMSolver(CEMSolver):
         topk: int = 30,
         device: str | torch.device = 'cpu',
         seed: int = 1234,
-        callbacks: list[Any] | None = None,
+        callbacks: list[Callback] | None = None,
         *,
         compile_kernel: bool | None = None,
         compile_mode: str = 'reduce-overhead',
@@ -86,8 +97,6 @@ class AcceleratedCEMSolver(CEMSolver):
     ) -> None:
         if n_steps < 1 or num_samples < 2 or not 2 <= topk <= num_samples:
             raise ValueError('invalid CEM steps, samples, or top-k')
-        if callbacks:
-            raise ValueError('accelerated CEM does not expose loop callbacks')
         super().__init__(
             cost,
             batch_size,
@@ -97,18 +106,54 @@ class AcceleratedCEMSolver(CEMSolver):
             topk,
             device,
             seed,
+            callbacks,
         )
         self.compile_kernel = compile_kernel
         self.compile_mode = compile_mode
         self.compile_backend = compile_backend
         self.compile_fallback = compile_fallback
-        self._loop = _CEMLoop(cost, n_steps, topk)
+        self._tensor_cost, self._fallback_reason = self._adapt_cost(cost)
+        if callbacks:
+            self._tensor_cost = None
+            self._fallback_reason = 'callbacks require the reference CEM loop'
+        self._loop = (
+            _CEMLoop(self._tensor_cost, n_steps, topk)
+            if self._tensor_cost is not None
+            else None
+        )
         self._compiled_loop = None
         self._compile_error = None
 
+    @staticmethod
+    def _adapt_cost(cost):
+        if (
+            isinstance(cost, ShootingCostEvaluator)
+            and type(cost.objective) is GoalMSE
+            and cost.objective.pred_key == 'predicted_emb'
+            and cost.objective.goal_key == 'goal_emb'
+            and cost.encode_goal is default_goal_encode
+            and hasattr(cost.model, 'rollout_from_embeddings')
+        ):
+            return LatentGoalCost(cost.model), None
+        if isinstance(cost, nn.Module) and callable(
+            getattr(cost, 'prepare', None)
+        ):
+            return cost, None
+        return None, 'cost has no compatible pure-tensor terminal path'
+
+    @property
+    def fast_path_enabled(self) -> bool:
+        """Whether :meth:`solve` uses the device-resident CEM loop."""
+        return self._tensor_cost is not None
+
+    @property
+    def fallback_reason(self) -> str | None:
+        """Why the standard CEM implementation is used, if applicable."""
+        return self._fallback_reason
+
     @property
     def compilation_enabled(self) -> bool:
-        return (
+        return self.fast_path_enabled and (
             self.compile_kernel
             if self.compile_kernel is not None
             else torch.device(self.device).type == 'cuda'
@@ -120,7 +165,12 @@ class AcceleratedCEMSolver(CEMSolver):
 
     def prepare(self, info: dict[str, Any]) -> tuple[torch.Tensor, ...]:
         """Encode inputs once and move them to the planning device."""
-        return self.cost.prepare(
+        if self._tensor_cost is None:
+            raise RuntimeError(
+                'solve_tensors is unavailable on the reference CEM path: '
+                f'{self._fallback_reason}'
+            )
+        return self._tensor_cost.prepare(
             info,
             device=self.device,
             dtype=self.dtype,
@@ -165,6 +215,7 @@ class AcceleratedCEMSolver(CEMSolver):
         )
 
     def _run(self, mean, std, noise, prepared):
+        assert self._loop is not None
         if not self.compilation_enabled or self._compile_error is not None:
             return (*self._loop.eager(mean, std, noise, *prepared), False)
         try:
@@ -191,6 +242,11 @@ class AcceleratedCEMSolver(CEMSolver):
     @torch.inference_mode()
     def solve_tensors(self, prepared, *, noise=None, init_action=None):
         """Solve one prepared batch without transferring results to the CPU."""
+        if not self.fast_path_enabled:
+            raise RuntimeError(
+                'solve_tensors is unavailable on the reference CEM path: '
+                f'{self._fallback_reason}'
+            )
         batch_size = prepared[0].size(0)
         if noise is None:
             noise = self.sample_noise(batch_size)
@@ -222,6 +278,13 @@ class AcceleratedCEMSolver(CEMSolver):
         self, info: dict, init_action: torch.Tensor | None = None
     ) -> dict:
         """Solve through the standard planner interface."""
+        if not self.fast_path_enabled:
+            output = super().solve(info, init_action)
+            output['accelerated'] = False
+            output['compiled'] = False
+            output['compile_error'] = None
+            return output
+
         started = time.perf_counter()
         total = len(next(iter(info.values())))
         init_action = prepare_init_action(
@@ -259,6 +322,7 @@ class AcceleratedCEMSolver(CEMSolver):
             'mean': [actions],
             'var': [std],
             'solve_time_seconds': time.perf_counter() - started,
+            'accelerated': True,
             'compiled': any(output['compiled'] for output in outputs),
             'compile_error': self._compile_error,
         }
