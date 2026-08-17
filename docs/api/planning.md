@@ -88,6 +88,12 @@ class SmoothnessPenalty(nn.Module):
 
 ::: stable_worldmodel.planning.default_goal_encode
 
+::: stable_worldmodel.planning.LatentGoalCost
+    options:
+        heading_level: 3
+        members: false
+        show_source: false
+
 ## **[ Objectives ]**
 
 ::: stable_worldmodel.planning.GoalMSE

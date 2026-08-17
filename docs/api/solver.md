@@ -31,6 +31,68 @@ summary: Model-based planning solvers for action optimization
 
 ::: stable_worldmodel.planning.solver.CEMSolver.solve
 
+### Accelerated LeWM CEM
+
+`AcceleratedCEMSolver` is an opt-in, PyTorch-only execution path for tensor
+costs such as `LatentGoalCost`. It encodes observations once, keeps CEM state
+and all random candidates on the planning device, and copies only the final
+plan back to the host. CUDA uses `torch.compile` by default; MPS and CPU use
+the same tensor kernel eagerly unless `compile_kernel=True` is requested.
+For LeWM, the cost retains only the terminal goal latent and uses a
+bounded-context terminal rollout instead of allocating the complete predicted
+trajectory.
+
+This path evaluates one world-model parameterization at a time. Its
+`num_samples` axis is the CEM population of action sequences, not a population
+of world models.
+
+```python
+from stable_worldmodel.planning import (
+    AcceleratedCEMSolver,
+    LatentGoalCost,
+)
+
+cost = LatentGoalCost(learned_model_backend)
+solver = AcceleratedCEMSolver(
+    cost=cost,
+    num_samples=100,
+    n_steps=15,
+    topk=10,
+    device='cuda',
+)
+```
+
+The first CUDA solve includes graph compilation; reuse the solver to amortize
+it. Per-iteration callbacks are unavailable on this path because exposing loop
+intermediates would break the compiled execution contract. The regular
+`CEMSolver` remains the reference implementation and supports callbacks.
+
+`solve` preserves the ordinary solver protocol and copies only its final output
+to the CPU. Training and other accelerator-resident callers can prepare fixed
+inputs and random streams explicitly, then consume the result without a host
+transfer:
+
+```python
+prepared = solver.prepare(info)
+noise = solver.sample_noise(batch_size=prepared[0].size(0))
+result = solver.solve_tensors(prepared, noise=noise)
+# result["actions"] and result["costs"] remain on the planning device.
+```
+
+Prepared embeddings are reusable only while the observation, goal, action
+history, and encoder/projector parameters stay fixed. In particular, recompute
+them after each closed-loop observation or when optimizing the encoder.
+
+::: stable_worldmodel.planning.solver.AcceleratedCEMSolver
+    options:
+        heading_level: 3
+        members: false
+        show_source: false
+
+::: stable_worldmodel.planning.solver.AcceleratedCEMSolver.solve
+
+::: stable_worldmodel.planning.solver.AcceleratedCEMSolver.solve_tensors
+
 ::: stable_worldmodel.planning.solver.ICEMSolver
     options:
         heading_level: 3
