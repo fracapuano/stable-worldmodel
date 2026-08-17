@@ -128,8 +128,6 @@ def evaluate(world, model, protocol, config, *, device, video):
         seed=config.seed,
         compile_kernel=config.compile_kernel,
     )
-    if not solver.fast_path_enabled:
-        raise RuntimeError(solver.fallback_reason)
     policy = swm.policy.WorldModelPolicy(
         solver=solver,
         config=config.mpc,

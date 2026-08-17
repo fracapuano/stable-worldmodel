@@ -11,7 +11,6 @@ from stable_worldmodel.planning import (
     ShootingCostEvaluator,
 )
 from stable_worldmodel.planning.solver import CEMSolver, FastCEMSolver
-from stable_worldmodel.planning.solver.callbacks import BestCostRecorder
 from stable_worldmodel.policy import PlanConfig, WorldModelPolicy
 from stable_worldmodel.wm.lewm.lewm import LeWM
 from stable_worldmodel.wm.lewm.module import Predictor
@@ -144,8 +143,6 @@ def test_standard_shooting_cost_automatically_uses_fast_path():
     actual = fast.solve(dict(info))
 
     assert fast.cost is cost
-    assert fast.fast_path_enabled is True
-    assert actual['fast_path'] is True
     torch.testing.assert_close(actual['actions'], expected['actions'])
     torch.testing.assert_close(actual['var'][0], expected['var'][0])
     torch.testing.assert_close(
@@ -156,33 +153,21 @@ def test_standard_shooting_cost_automatically_uses_fast_path():
     )
 
 
-def test_unsupported_cost_and_callbacks_preserve_reference_cem():
-    callback = BestCostRecorder()
-    solver = FastCEMSolver(
-        TargetCost(),
-        num_samples=12,
-        n_steps=3,
-        topk=4,
-        callbacks=[callback],
-        compile_kernel=False,
-    )
-    _configure(solver, 1)
+def test_rejects_callbacks_instead_of_falling_back():
+    with pytest.raises(ValueError, match='does not support callbacks'):
+        FastCEMSolver(TargetCost(), callbacks=[object()])
 
-    output = solver.solve({'target': torch.randn(1, 4, 2)})
 
-    assert solver.fast_path_enabled is False
-    assert 'callbacks' in output
-    assert output['fast_path'] is False
-
-    fallback = FastCEMSolver(
-        ReferenceOnlyCost(), num_samples=8, n_steps=2, topk=2
-    )
-    _configure(fallback, 1)
-    output = fallback.solve({'target': torch.randn(1, 4, 2)})
-    assert fallback.fast_path_enabled is False
-    assert output['fast_path'] is False
-    with pytest.raises(RuntimeError, match='solve_tensors is unavailable'):
-        fallback.prepare({'target': torch.randn(1, 4, 2)})
+@pytest.mark.parametrize(
+    'cost',
+    [
+        ReferenceOnlyCost(),
+        ShootingCostEvaluator(nn.Identity(), GoalMSE()),
+    ],
+)
+def test_rejects_incompatible_cost_or_model_instead_of_falling_back(cost):
+    with pytest.raises(TypeError, match='use CEMSolver for other costs'):
+        FastCEMSolver(cost)
 
 
 def test_standard_cost_supports_receding_horizon_and_warm_start():
@@ -230,7 +215,6 @@ def test_standard_cost_supports_receding_horizon_and_warm_start():
     assert len(events) == 1
     policy.get_action(info(2))
 
-    assert solver.fast_path_enabled is True
     assert len(events) == 2
     assert solver.init_actions[0] is None
     assert solver.init_actions[1].shape == (1, 2, 2)
