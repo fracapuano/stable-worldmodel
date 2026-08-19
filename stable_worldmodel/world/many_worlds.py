@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
 import torch
 from torch import nn
+from typing_extensions import Self
 
 from stable_worldmodel.buffer import HistoryBuffer
 from stable_worldmodel.evaluation import (
