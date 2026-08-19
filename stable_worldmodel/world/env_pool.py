@@ -31,7 +31,24 @@ class EnvPool:
     """
 
     def __init__(self, env_fns: list):
-        self.envs = [fn() for fn in env_fns]
+        self._initialize([fn() for fn in env_fns])
+
+    @classmethod
+    def from_envs(cls, envs: list[gym.Env]) -> EnvPool:
+        """Build a pool view over already-constructed environments.
+
+        This is useful for composing smaller pools into one larger execution
+        batch without recreating or copying the underlying Gym environments.
+        The caller remains responsible for avoiding duplicate ``close`` calls.
+        """
+        pool = cls.__new__(cls)
+        pool._initialize(list(envs))
+        return pool
+
+    def _initialize(self, envs: list[gym.Env]) -> None:
+        if not envs:
+            raise ValueError('EnvPool requires at least one environment')
+        self.envs = envs
         self._single_env = self.envs[0]
         self._stacked_infos: dict[str, Any] | None = None
         self.seeds = np.zeros(len(self.envs), dtype=np.int64)

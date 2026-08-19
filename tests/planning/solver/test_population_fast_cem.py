@@ -1,4 +1,4 @@
-"""Behavioral tests for FastCEM's model-population dimension."""
+"""Behavioral tests for FastCEM over independent model instances."""
 
 from __future__ import annotations
 
@@ -47,23 +47,12 @@ def _configure(solver, tasks=2):
     )
 
 
-def _stack_predictors(models, names):
-    states = tuple(dict(model.named_parameters()) for model in models)
-    return tuple(
-        torch.stack(tuple(state[name].detach() for state in states))
-        for name in names
-    )
-
-
 class CountingEncoderModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.predictor = nn.Linear(1, 1, bias=False)
         self.encode_batches = []
-
-    @property
-    def population_predictor_parameter_names(self):
-        return ('predictor.weight',)
+        self.rollout_calls = 0
 
     def encode(self, info):
         self.encode_batches.append(info['pixels'].size(0))
@@ -72,13 +61,8 @@ class CountingEncoderModel(nn.Module):
 
     def rollout_from_embeddings(self, emb, actions, **kwargs):
         del kwargs
-        return emb[:, None, -1] + actions.sum((-1, -2), keepdim=True)
-
-    def rollout_population_from_embeddings(
-        self, emb, actions, parameters, **kwargs
-    ):
-        del parameters, kwargs
-        return emb[:, :, None, -1] + actions.sum((-1, -2), keepdim=True)
+        self.rollout_calls += 1
+        return emb[:, None, -1] + actions.sum(dim=(-1, -2))[..., None]
 
 
 def test_population_fast_cem_matches_independent_fast_cem_solves():
@@ -86,9 +70,10 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
     first = _model()
     second = deepcopy(first)
     with torch.no_grad():
-        for parameter in second.predictor.parameters():
+        for parameter in second.parameters():
             parameter.add_(0.01 * torch.randn_like(parameter))
 
+    models = (first, second)
     kwargs = {
         'batch_size': 2,
         'num_samples': 24,
@@ -98,7 +83,7 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
     }
     serial = tuple(
         FastCEMSolver(ShootingCostEvaluator(model, GoalMSE()), **kwargs)
-        for model in (first, second)
+        for model in models
     )
     population = FastCEMSolver(
         ShootingCostEvaluator(first, GoalMSE()), **kwargs
@@ -110,12 +95,10 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
         'emb': torch.randn(2, 2, 1, 4),
         'goal_emb': torch.randn(2, 2, 1, 4),
     }
-    parameters = _stack_predictors(
-        (first, second), population.population_parameter_names
-    )
     noise = population.sample_noise(2)
 
-    actual = population.solve_population(info, parameters, noise=noise)
+    actual = population.solve_population(info, models, noise=noise)
+    assert population.population_backend == 'functional_vmap'
     expected = tuple(
         solver.solve_tensors(
             solver.prepare({key: value[index] for key, value in info.items()}),
@@ -138,10 +121,75 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
     )
 
 
-def test_population_fast_cem_compiles_as_one_full_graph():
-    model = _model()
+def test_population_models_keep_native_parameter_shapes():
+    first = _model()
+    second = deepcopy(first)
+    expected = tuple(
+        tuple(parameter.shape for parameter in model.parameters())
+        for model in (first, second)
+    )
     solver = FastCEMSolver(
-        ShootingCostEvaluator(model, GoalMSE()),
+        ShootingCostEvaluator(first, GoalMSE()),
+        num_samples=4,
+        n_steps=2,
+        topk=2,
+        compile_kernel=False,
+    )
+    _configure(solver, tasks=1)
+
+    solver.solve_population(
+        {
+            'emb': torch.randn(2, 1, 1, 4),
+            'goal_emb': torch.randn(2, 1, 1, 4),
+        },
+        (first, second),
+    )
+
+    assert expected == tuple(
+        tuple(parameter.shape for parameter in model.parameters())
+        for model in (first, second)
+    )
+    assert hasattr(first, 'rollout_population_from_embeddings')
+    assert hasattr(first.predictor, 'forward_population')
+
+
+def test_population_uses_fused_predictor_backend_when_shared_state_matches():
+    first = _model()
+    second = deepcopy(first)
+    with torch.no_grad():
+        for parameter in second.predictor.parameters():
+            parameter.add_(0.01 * torch.randn_like(parameter))
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(first, GoalMSE()),
+        num_samples=8,
+        n_steps=2,
+        topk=2,
+        compile_kernel=False,
+    )
+    _configure(solver, tasks=1)
+
+    info = {
+        'emb': torch.randn(2, 1, 1, 4),
+        'goal_emb': torch.randn(2, 1, 1, 4),
+    }
+    prepared = solver.prepare_population(info, (first, second))
+    population_state = prepared[3:]
+    assert len(population_state) == len(
+        first.population_predictor_parameter_names
+    )
+    assert all(value.size(0) == 2 for value in population_state)
+
+    output = solver.solve_population(info, (first, second))
+
+    assert output['population_backend'] == 'fused_predictor'
+    assert output['actions'].shape == (2, 1, 3, 2)
+
+
+def test_population_fast_cem_compiles_as_one_full_graph():
+    first = _model()
+    second = deepcopy(first)
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(first, GoalMSE()),
         num_samples=4,
         n_steps=2,
         topk=2,
@@ -150,49 +198,46 @@ def test_population_fast_cem_compiles_as_one_full_graph():
         compile_fallback=False,
     )
     _configure(solver, tasks=1)
-    info = {
-        'emb': torch.randn(2, 1, 1, 4),
-        'goal_emb': torch.randn(2, 1, 1, 4),
-    }
-    parameters = tuple(
-        value.detach()[None].expand(2, *value.shape).clone()
-        for name, value in model.named_parameters()
-        if name in solver.population_parameter_names
-    )
 
-    output = solver.solve_population(info, parameters)
+    output = solver.solve_population(
+        {
+            'emb': torch.randn(2, 1, 1, 4),
+            'goal_emb': torch.randn(2, 1, 1, 4),
+        },
+        (first, second),
+    )
 
     assert output['actions'].shape == (2, 1, 3, 2)
     assert output['compiled'] is True
+    assert output['population_backend'] == 'fused_predictor'
 
 
-def test_population_fast_cem_rejects_wrong_population_parameters():
-    model = _model()
+def test_population_fast_cem_requires_solver_model_first():
+    first = _model()
+    second = deepcopy(first)
     solver = FastCEMSolver(
-        ShootingCostEvaluator(model, GoalMSE()),
+        ShootingCostEvaluator(first, GoalMSE()),
         num_samples=4,
         n_steps=2,
         topk=2,
         compile_kernel=False,
     )
     _configure(solver, tasks=1)
-    prepared = solver.prepare_population(
-        {
-            'emb': torch.randn(2, 1, 1, 4),
-            'goal_emb': torch.randn(2, 1, 1, 4),
-        }
-    )
 
-    with pytest.raises(ValueError, match='common population axis'):
-        solver.solve_population_tensors(
-            (torch.randn(2, 1), torch.randn(3, 1)), prepared
+    with pytest.raises(ValueError, match='first population model'):
+        solver.prepare_population(
+            {
+                'emb': torch.randn(1, 1, 1, 4),
+                'goal_emb': torch.randn(1, 1, 1, 4),
+            },
+            (second,),
         )
 
 
-def test_population_preparation_encodes_all_worlds_in_one_batch():
-    model = CountingEncoderModel()
+def test_population_preparation_uses_each_models_ordinary_encoder():
+    models = tuple(CountingEncoderModel().eval() for _ in range(3))
     solver = FastCEMSolver(
-        ShootingCostEvaluator(model, GoalMSE()),
+        ShootingCostEvaluator(models[0], GoalMSE()),
         num_samples=4,
         n_steps=2,
         topk=2,
@@ -200,14 +245,17 @@ def test_population_preparation_encodes_all_worlds_in_one_batch():
     )
     _configure(solver, tasks=2)
 
-    current, goal, history = solver.prepare_population(
+    current, goal, history, *_state = solver.prepare_population(
         {
             'pixels': torch.randn(3, 2, 1, 1),
             'goal': torch.randn(3, 2, 1, 1),
-        }
+        },
+        models,
     )
 
-    assert model.encode_batches == [6, 6]
+    # One functional/vmapped Python dispatch covers the whole population.
+    assert models[0].encode_batches == [2, 2]
+    assert all(not model.encode_batches for model in models[1:])
     assert current.shape == (3, 2, 1, 1)
     assert goal.shape == (3, 2, 1)
     assert history.shape == (3, 2, 0, 2)

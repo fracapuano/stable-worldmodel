@@ -206,18 +206,45 @@ results = many.evaluate(protocol, solver=worlds[0].policy.solver)
 # Device-resident planner outputs:
 results.planned_actions.shape  # (planning_calls, models, tasks, horizon, blocked_action_dim)
 results.planner_costs.shape    # (planning_calls, models, tasks)
+results.environment_actions.shape  # (models, tasks, env_steps, action_dim)
+results.task_returns.shape     # (models, tasks)
+results.fitness.shape          # (models,), mean return across tasks
+results.population_backend     # "fused_predictor" or "functional_vmap"
 
 # Standard realized World results, one entry per model:
 results.evaluations[0].episodes
 ```
 
 Closed-loop replanning, history, action blocks, warm starts, and early
-termination are supported. The current population kernel intentionally limits
-variation to LeWM predictor parameters; encoders, projections, buffers,
-preprocessing, action spaces, and `PlanConfig` must match. All models must
-already reside on the solver device. Gymnasium environment stepping remains a
-host operation, while every world-model and CEM refinement forward is batched
-over the complete model population.
+termination are supported. Every LeWM parameter and persistent buffer may
+differ across Worlds, including the observation encoder, action encoder,
+projector, predictor, and prediction projector. The source models remain
+ordinary modules with native parameter shapes. Before planning, their complete
+parameters and buffers are stacked onto a leading population axis on the
+generic backend. The fused predictor backend stacks only the varying predictor
+weights, avoiding a copy of the shared encoder and action-encoder state on each
+replan.
+
+The population axis runs through the complete FastCEM path. Means, variances,
+sampled candidates, model costs, elite selection, and warm starts have leading
+shape `(models, tasks, ...)`; candidate scoring is one functional/vmapped model
+call over `(models, tasks, samples, ...)`, with no Python loop over models in a
+CEM refinement. The fixed number of refinements can be captured as one
+compiled graph.
+
+When all non-predictor state is shared, LeWM automatically selects the
+`fused_predictor` backend: population-specific linear/normalization weights are
+applied explicitly and population is folded into attention's batch dimensions,
+preserving fused attention kernels. Fully different model state remains
+supported through the generic `functional_vmap` backend; backend support for
+individual operations determines whether that route is faster on a particular
+accelerator.
+
+Model architecture, preprocessing, action spaces, and `PlanConfig` must
+match, and every model must already reside on the solver device. Real rollout
+uses one flat pool of `models * tasks` Gymnasium environments and one flat step
+call per decision. `EnvPool` is still a synchronous host runner internally;
+that boundary is ready to be replaced by an async or GPU simulator later.
 
 ::: stable_worldmodel.world.ManyWorlds
     options:
@@ -225,6 +252,7 @@ over the complete model population.
         members:
           - init
           - population_size
+          - simulator_count
           - evaluate
           - close
         show_source: false

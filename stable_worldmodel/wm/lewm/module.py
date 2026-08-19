@@ -31,7 +31,7 @@ def _population_linear(x, weight, bias=None):
 
 
 def _population_layer_norm(x, weight=None, bias=None, *, eps=1e-5):
-    """Layer normalization with optional candidate-specific affine terms."""
+    """Layer normalization with optional population-specific affine terms."""
     mean = x.mean(dim=-1, keepdim=True)
     normalized = (x - mean) * torch.rsqrt(
         (x - mean).square().mean(dim=-1, keepdim=True) + eps
@@ -351,13 +351,17 @@ class Predictor(nn.Module):
         qkv = _population_linear(x, state[f'{prefix}.to_qkv.weight'])
         q, k, v = qkv.chunk(3, dim=-1)
         q, k, v = (
-            rearrange(t, 'p b t (h d) -> p b h t d', h=attention.heads)
+            rearrange(t, 'p b t (h d) -> (p b) h t d', h=attention.heads)
             for t in (q, k, v)
         )
         output = F.scaled_dot_product_attention(
             q, k, v, dropout_p=0.0, is_causal=True
         )
-        output = rearrange(output, 'p b h t d -> p b t (h d)')
+        output = rearrange(
+            output,
+            '(p b) h t d -> p b t (h d)',
+            p=x.size(0),
+        )
         return self._project_population(
             output,
             attention.to_out[0]
@@ -396,21 +400,7 @@ class Predictor(nn.Module):
         )
 
     def forward_population(self, x, c, parameters):
-        """Evaluate independently parameterized predictors in one tensor graph.
-
-        Args:
-            x: Embeddings shaped ``(population, batch, time, dim)``.
-            c: Conditioning embeddings with the same leading dimensions.
-            parameters: Tuple of tensors ordered like
-                :attr:`population_parameter_names`; every tensor has a leading
-                population dimension followed by the corresponding parameter
-                shape.
-
-        This inference-only path applies candidate-specific linear and
-        normalization weights explicitly.  Attention sees the population as
-        an ordinary batch dimension, avoiding ``vmap`` fallbacks around scaled
-        dot-product attention while retaining fused CUDA attention kernels.
-        """
+        """Evaluate independently parameterized predictors in one graph."""
         if self.training:
             raise RuntimeError(
                 'forward_population is inference-only; call eval()'

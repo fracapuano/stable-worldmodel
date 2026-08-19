@@ -3,7 +3,9 @@
 The sequential condition recreates, evaluates, and closes one weight-bound
 ``World`` at a time. The ManyWorlds condition creates the same number of
 weight-bound ``World`` instances and evaluates all of them through the model
-population dimension of their existing ``FastCEMSolver``.
+population axis of their existing ``FastCEMSolver``. Varying model state is
+stacked for one population call, and realized actions are stepped through one
+flat ``worlds * tasks`` Gymnasium pool.
 
 Run the default benchmark with::
 
@@ -19,8 +21,11 @@ quick smoke run, for example::
 
 Setup and evaluation time are reported separately. Checkpoint download and one
 untimed CPU load are excluded, while every timed condition still instantiates
-its own model copies. The ordered per-World success-rate vectors are reported
-and checked for exact parity between the two conditions.
+its own model copies. By default, predictor parameters receive a small,
+deterministic per-World perturbation, exercising the fused population backend.
+Use ``--perturbation-scope full`` to exercise fully different model state via
+the generic functional backend. The ordered per-World success-rate vectors are
+reported and checked for exact parity between the two conditions.
 """
 
 from __future__ import annotations
@@ -75,6 +80,8 @@ class Measurement:
     evaluation_seconds: float
     planning_calls: int
     success_rates: tuple[float, ...]
+    planner_actions: tuple[tuple[torch.Tensor, ...], ...]
+    population_backend: str
 
     @property
     def total_seconds(self) -> float:
@@ -147,8 +154,32 @@ def action_process() -> dict[str, object]:
     }
 
 
-def load_model(checkpoint: str, device: str):
-    model = swm.wm.utils.load_pretrained(checkpoint).to(device).eval()
+def load_model(
+    checkpoint: str,
+    device: str,
+    *,
+    model_index: int,
+    perturbation_scale: float,
+    perturbation_scope: str,
+):
+    model = swm.wm.utils.load_pretrained(checkpoint)
+    if perturbation_scale:
+        generator = torch.Generator().manual_seed(10_000 + model_index)
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if parameter.is_floating_point():
+                    if (
+                        perturbation_scope == 'predictor'
+                        and not name.startswith('predictor.')
+                    ):
+                        continue
+                    noise = torch.randn(
+                        parameter.shape,
+                        generator=generator,
+                        dtype=parameter.dtype,
+                    )
+                    parameter.add_(perturbation_scale * noise)
+    model = model.to(device).eval()
     model.requires_grad_(False)
     return model
 
@@ -157,12 +188,20 @@ def make_world(
     checkpoint: str,
     protocol: EvaluationProtocol,
     args: argparse.Namespace,
+    model_index: int,
 ):
-    model = load_model(checkpoint, args.device)
-    calls = {'count': 0}
+    model = load_model(
+        checkpoint,
+        args.device,
+        model_index=model_index,
+        perturbation_scale=args.weight_perturbation_scale,
+        perturbation_scope=args.perturbation_scope,
+    )
+    calls = {'count': 0, 'actions': []}
 
-    def on_plan(_event) -> None:
+    def on_plan(event) -> None:
         calls['count'] += 1
+        calls['actions'].append(event['selected_plan'].detach())
 
     solver = FastCEMSolver(
         cost=ShootingCostEvaluator(model, GoalMSE()),
@@ -198,13 +237,16 @@ def benchmark_sequential(
     evaluation_seconds = 0.0
     planning_calls = 0
     success_rates = []
+    planner_actions = []
 
     for index in range(args.worlds):
         world = None
         try:
             synchronize(args.device)
             started = time.perf_counter()
-            world, calls = make_world(args.checkpoint, protocol, args)
+            world, calls = make_world(
+                args.checkpoint, protocol, args, model_index=index
+            )
             synchronize(args.device)
             setup_seconds += time.perf_counter() - started
 
@@ -220,6 +262,7 @@ def benchmark_sequential(
 
             planning_calls += calls['count']
             success_rates.append(result.success_rate)
+            planner_actions.append(tuple(calls['actions']))
         finally:
             if world is not None:
                 world.close()
@@ -231,6 +274,8 @@ def benchmark_sequential(
         evaluation_seconds=evaluation_seconds,
         planning_calls=planning_calls,
         success_rates=tuple(success_rates),
+        planner_actions=tuple(planner_actions),
+        population_backend='serial',
     )
 
 
@@ -239,13 +284,17 @@ def benchmark_many_worlds(
     args: argparse.Namespace,
 ) -> Measurement:
     worlds = []
+    trackers = []
     many = None
     try:
         synchronize(args.device)
         started = time.perf_counter()
-        for _ in range(args.worlds):
-            world, _calls = make_world(args.checkpoint, protocol, args)
+        for index in range(args.worlds):
+            world, _calls = make_world(
+                args.checkpoint, protocol, args, model_index=index
+            )
             worlds.append(world)
+            trackers.append(_calls)
         many = swm.ManyWorlds.init(
             worlds=worlds,
             model_names=[f'model-{index}' for index in range(args.worlds)],
@@ -272,6 +321,10 @@ def benchmark_many_worlds(
             success_rates=tuple(
                 evaluation.success_rate for evaluation in result.evaluations
             ),
+            planner_actions=tuple(
+                tuple(tracker['actions']) for tracker in trackers
+            ),
+            population_backend=result.population_backend,
         )
     finally:
         if many is not None:
@@ -311,6 +364,7 @@ def print_report(
     print()
     print(f'evaluation speedup: {evaluation_speedup:.2f}x')
     print(f'end-to-end speedup: {total_speedup:.2f}x')
+    print(f'population backend: {batched.population_backend}')
     print(
         'sequential success rates: '
         f'{[round(value, 1) for value in sequential.success_rates]}'
@@ -338,6 +392,32 @@ def print_report(
             f'many-worlds={batched.success_rates}'
         )
     print('success-rate vectors match: yes')
+
+    plan_mismatches = []
+    for world_index, (expected_calls, actual_calls) in enumerate(
+        zip(
+            sequential.planner_actions,
+            batched.planner_actions,
+            strict=True,
+        )
+    ):
+        if len(expected_calls) != len(actual_calls):
+            plan_mismatches.append(world_index)
+            continue
+        try:
+            for expected, actual in zip(
+                expected_calls, actual_calls, strict=True
+            ):
+                torch.testing.assert_close(
+                    actual.cpu(), expected.cpu(), rtol=3e-5, atol=3e-6
+                )
+        except AssertionError:
+            plan_mismatches.append(world_index)
+    if plan_mismatches:
+        raise RuntimeError(
+            f'selected-plan parity failed for world indices {plan_mismatches}'
+        )
+    print('selected-plan tensors match: yes')
     print(
         'mean success rate: '
         f'{sum(sequential.success_rates) / args.worlds:.1f}% sequential, '
@@ -353,6 +433,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num-samples', type=int, default=64)
     parser.add_argument('--n-steps', type=int, default=3)
     parser.add_argument('--topk', type=int, default=8)
+    parser.add_argument(
+        '--weight-perturbation-scale',
+        type=float,
+        default=1e-4,
+        help=(
+            'deterministic per-World perturbation applied to every floating '
+            'model parameter'
+        ),
+    )
+    parser.add_argument(
+        '--perturbation-scope',
+        choices=('predictor', 'full'),
+        default='predictor',
+        help='perturb predictor weights (fused) or all weights (generic)',
+    )
     parser.add_argument('--device', default=default_device())
     parser.add_argument(
         '--compile',
@@ -366,6 +461,8 @@ def parse_args() -> argparse.Namespace:
         parser.error('--worlds and --eval-budget must be positive')
     if args.n_steps < 1 or not 2 <= args.topk <= args.num_samples:
         parser.error('require n-steps >= 1 and 2 <= topk <= num-samples')
+    if args.weight_perturbation_scale < 0:
+        parser.error('--weight-perturbation-scale must be nonnegative')
     return args
 
 
@@ -376,6 +473,8 @@ def main() -> None:
     print(f'checkpoint: {args.checkpoint}')
     print(f'device: {args.device}')
     print(f'world models: {args.worlds}')
+    print(f'weight perturbation: {args.weight_perturbation_scale:g}')
+    print(f'perturbation scope: {args.perturbation_scope}')
     print(
         'CEM: '
         f'{args.num_samples} samples, {args.topk} elites, '

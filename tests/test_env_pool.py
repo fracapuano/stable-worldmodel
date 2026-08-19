@@ -67,6 +67,17 @@ def test_num_envs():
     pool.close()
 
 
+def test_from_envs_composes_existing_instances():
+    envs = [CounterEnv(), CounterEnv()]
+    pool = EnvPool.from_envs(envs)
+
+    assert pool.envs == envs
+    pool.reset(seed=[3, 7])
+    pool.step(np.zeros((2, 2), dtype=np.float32))
+    assert [env._step_count for env in envs] == [1, 1]
+    pool.close()
+
+
 def test_spaces():
     pool = _make_pool(2)
     assert pool.action_space.shape == (2, 2)

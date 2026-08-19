@@ -148,15 +148,7 @@ class LeWM(nn.Module):
         *,
         terminal_only: bool = False,
     ) -> torch.Tensor:
-        """Roll out a population of predictors without mutating the model.
-
-        The observation/action encoders are shared across the population, but
-        every model may receive a different realized observation history.
-        Candidate actions have shape
-        ``(population, batch, samples, horizon, action_dim)``.  Predictor
-        parameter tensors follow :attr:`population_predictor_parameter_names`
-        and carry the population as their leading dimension.
-        """
+        """Roll out all predictor weights in one population tensor graph."""
         forward_population = getattr(
             self.predictor, 'forward_population', None
         )

@@ -77,11 +77,6 @@ class DirectionalWorldModel(nn.Module):
             torch.tensor(shared, dtype=torch.float32), requires_grad=False
         )
         self.serial_calls = 0
-        self.population_calls = 0
-
-    @property
-    def population_predictor_parameter_names(self) -> tuple[str, ...]:
-        return ('predictor.weight',)
 
     def encode(self, value):
         return value
@@ -104,30 +99,6 @@ class DirectionalWorldModel(nn.Module):
             return future[:, :, -1]
         context = emb[:, None].expand(-1, action_sequence.size(1), -1, -1)
         return torch.cat([context, future], dim=2)
-
-    def rollout_population_from_embeddings(
-        self,
-        emb,
-        action_sequence,
-        predictor_parameters,
-        action_history=None,
-        history_size=None,
-        *,
-        terminal_only=False,
-    ):
-        del action_history, history_size
-        self.population_calls += 1
-        direction = predictor_parameters[0][:, 0, 0].reshape(-1, 1, 1, 1, 1)
-        if emb.ndim == 3:
-            emb = emb[None].expand(action_sequence.size(0), -1, -1, -1)
-        delta = action_sequence.sum(dim=-1, keepdim=True)
-        future = emb[:, :, None, -1:, :] + direction * delta.cumsum(dim=3)
-        if terminal_only:
-            return future[:, :, :, -1]
-        context = emb[:, :, None].expand(
-            -1, -1, action_sequence.size(2), -1, -1
-        )
-        return torch.cat([context, future], dim=3)
 
 
 def _protocol() -> EvaluationProtocol:
@@ -226,6 +197,18 @@ def test_many_worlds_matches_individual_closed_loop_evaluations() -> None:
         assert batched.environment_actions.shape == (2, 2, 4, 1)
         assert batched.population_size == 2
         assert batched.planning_calls == 4
+        assert batched.task_returns.shape == (2, 2)
+        assert batched.fitness.shape == (2,)
+        assert batched.success_rates.shape == (2,)
+        np.testing.assert_allclose(
+            batched.fitness,
+            [
+                np.mean(
+                    [episode.episode_return for episode in result.episodes]
+                )
+                for result in batched.evaluations
+            ],
+        )
 
         for population_result, serial_result in zip(
             batched.evaluations, serial, strict=True
@@ -234,6 +217,9 @@ def test_many_worlds_matches_individual_closed_loop_evaluations() -> None:
             assert (
                 population_result.protocol_digest
                 == serial_result.protocol_digest
+            )
+            assert len(population_result.model_queries) == len(
+                serial_result.model_queries
             )
             for actual_episode, expected_episode in zip(
                 population_result.episodes,
@@ -258,7 +244,7 @@ def test_many_worlds_matches_individual_closed_loop_evaluations() -> None:
         many.close()
 
 
-def test_many_worlds_uses_population_rollout_not_model_loop() -> None:
+def test_many_worlds_batches_models_and_uses_one_flat_simulator_pool() -> None:
     many, solver, models = _many_worlds()
     before = tuple(
         {
@@ -267,13 +253,30 @@ def test_many_worlds_uses_population_rollout_not_model_loop() -> None:
         }
         for model in models
     )
+    assert many.simulator_count == many.population_size * many.num_tasks == 4
+    flat_step = many.envs.step
+    flat_step_calls = []
+
+    def counted_flat_step(*args, **kwargs):
+        flat_step_calls.append(1)
+        return flat_step(*args, **kwargs)
+
+    many.envs.step = counted_flat_step
+    for world in many.worlds:
+        world.envs.step = lambda *_args, **_kwargs: pytest.fail(
+            'ManyWorlds must step the flat P*T pool'
+        )
     try:
         result = many.evaluate(_protocol(), solver=solver, eval_budget=3)
 
         assert result.planning_calls == 3
-        assert models[0].population_calls == 3 * solver.n_steps
-        assert models[1].population_calls == 0
-        assert [model.serial_calls for model in models] == [0, 0]
+        assert len(flat_step_calls) == 3
+        # One functional/vmapped model dispatch per refinement step; the
+        # remaining population members are represented by stacked state.
+        assert [model.serial_calls for model in models] == [
+            3 * solver.n_steps,
+            0,
+        ]
         for model, expected in zip(models, before, strict=True):
             for name, value in model.state_dict().items():
                 assert torch.equal(value, expected[name])
@@ -329,14 +332,36 @@ def test_many_worlds_infers_budget_and_accepts_named_constructor() -> None:
         many.close()
 
 
-def test_many_worlds_rejects_changes_outside_population_parameters() -> None:
+def test_many_worlds_accepts_changes_across_complete_model_state() -> None:
     first, _ = _world(1.0, shared=0.0)
     second, _ = _world(-1.0, shared=1.0)
     many = swm.ManyWorlds(worlds=[first, second])
     solver = first.policy.solver
     try:
-        with pytest.raises(ValueError, match='predictor-only variation'):
-            many.evaluate(_protocol(), solver=solver, eval_budget=1)
+        result = many.evaluate(_protocol(), solver=solver, eval_budget=1)
+        assert result.population_size == 2
+    finally:
+        many.close()
+
+
+def test_many_worlds_preserves_policy_callbacks_and_query_records() -> None:
+    many, solver, _ = _many_worlds()
+    events = [[], []]
+    for index, policy in enumerate(many.policies):
+        policy.on_plan = events[index].append
+    try:
+        result = many.evaluate(
+            _protocol(), solver=solver, eval_budget=2, record=True
+        )
+
+        for index, evaluation in enumerate(result.evaluations):
+            assert events[index]
+            assert len(events[index]) == len(evaluation.model_queries)
+            assert events[index][0]['env_indices'] == (0, 1)
+            assert events[index][0]['solver_output']['actions'].shape[:2] == (
+                2,
+                2,
+            )
     finally:
         many.close()
 

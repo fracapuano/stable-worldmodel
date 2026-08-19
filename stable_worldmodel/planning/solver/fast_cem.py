@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
-from loguru import logger as logging
 from torch import nn
 
 from stable_worldmodel.planning.evaluator import (
@@ -15,12 +15,18 @@ from stable_worldmodel.planning.evaluator import (
     default_goal_encode,
 )
 from stable_worldmodel.planning.objective import GoalMSE
-from stable_worldmodel.planning.tensor_cost import _LeWMTerminalCost
+from stable_worldmodel.planning.tensor_cost import (
+    _LeWMModelPopulationCost,
+    _LeWMTerminalCost,
+)
 from stable_worldmodel.protocols import Costable
 
 from .callbacks import Callback
 from .cem import CEMSolver
 from .utils import prepare_init_action
+
+
+logger = logging.getLogger(__name__)
 
 
 def _same_device(actual: torch.device, expected: torch.device) -> bool:
@@ -76,13 +82,13 @@ class _CEMLoop(nn.Module):
 class _PopulationCEMLoop(_CEMLoop):
     """Fixed-shape CEM loop over ``(population, tasks, samples, ...)``."""
 
-    def _step(self, mean, std, noise, parameters, *prepared):
+    def _step(self, mean, std, noise, *prepared):
         # Common random numbers across models, independent distributions.
         candidates = torch.addcmul(
             mean[:, :, None], noise[None], std[:, :, None]
         )
         candidates[:, :, 0].copy_(mean)
-        costs = self.cost.forward_population(candidates, parameters, *prepared)
+        costs = self.cost(candidates, *prepared)
         values, indices = costs.topk(self.topk, dim=2, largest=False)
         indices = indices[:, :, :, None, None].expand(
             -1, -1, -1, candidates.size(3), candidates.size(4)
@@ -92,6 +98,14 @@ class _PopulationCEMLoop(_CEMLoop):
         )
         return elite_mean, elite_std, values.mean(2)
 
+    def forward(self, mean, std, noise, *prepared):
+        if self.cost.backend == 'fused_predictor':
+            return super().forward(mean, std, noise, *prepared)
+        # ``functional_call``/``vmap`` cannot currently be nested inside a
+        # ``torch.while_loop`` capture. n_steps is static, so Dynamo safely
+        # unrolls the generic full-state path into one graph.
+        return self.eager(mean, std, noise, *prepared)
+
 
 class FastCEMSolver(CEMSolver):
     """Drop-in CEM with an automatic device-resident fast path.
@@ -99,7 +113,11 @@ class FastCEMSolver(CEMSolver):
     Standard costs, including ``ShootingCostEvaluator(model, GoalMSE())``, use
     the same constructor and :meth:`solve` contract as :class:`CEMSolver`.
     Compatible terminal LeWM costs are adapted internally to a pure-tensor
-    kernel and can use :meth:`solve_population` with batched model parameters.
+    kernel and can use :meth:`solve_population` with independent model
+    instances. Model state and CEM tensors carry a population axis, so all
+    candidate slices are ranked by one population model call. The generic
+    backend stacks complete state; the fused backend stacks only differing
+    predictor weights.
     Incompatible costs and per-iteration callbacks are rejected at construction
     rather than silently running reference CEM.
     """
@@ -142,9 +160,8 @@ class FastCEMSolver(CEMSolver):
         self.compile_fallback = compile_fallback
         self._tensor_cost = self._adapt_cost(cost)
         self._loop = _CEMLoop(self._tensor_cost, n_steps, topk)
-        self._population_loop = _PopulationCEMLoop(
-            self._tensor_cost, n_steps, topk
-        )
+        self._population_loop: _PopulationCEMLoop | None = None
+        self._population_models: tuple[nn.Module, ...] = ()
         self._compiled_loop = None
         self._compiled_population_loop = None
         self._compile_error = None
@@ -186,6 +203,13 @@ class FastCEMSolver(CEMSolver):
     def compile_error(self) -> str | None:
         return self._population_compile_error or self._compile_error
 
+    @property
+    def population_backend(self) -> str | None:
+        """Active population model execution backend, if models are bound."""
+        if self._population_loop is None:
+            return None
+        return self._population_loop.cost.backend
+
     def prepare(self, info: dict[str, Any]) -> tuple[torch.Tensor, ...]:
         """Encode inputs once and move them to the planning device."""
         return self._tensor_cost.prepare(
@@ -195,28 +219,77 @@ class FastCEMSolver(CEMSolver):
             action_dim=self.action_dim,
         )
 
-    @property
-    def population_parameter_names(self) -> tuple[str, ...]:
-        """Model parameters that may vary along the population dimension."""
-        names = getattr(self._tensor_cost, 'population_parameter_names', None)
-        if names is None:
+    def _bind_population_models(
+        self, models: Sequence[nn.Module]
+    ) -> _LeWMModelPopulationCost:
+        """Bind independent models to one population-batched CEM graph."""
+        models = tuple(models)
+        if not models:
+            raise ValueError('model population cannot be empty')
+        if not isinstance(self._tensor_cost, _LeWMTerminalCost):
             raise TypeError(
-                'this FastCEM cost does not support model populations'
+                'model populations require a compatible LeWM terminal cost'
             )
-        return tuple(names)
+        if models[0] is not self._tensor_cost.model:
+            raise ValueError(
+                'the first population model must be the solver cost model'
+            )
+        if len(models) == len(self._population_models) and all(
+            model is bound
+            for model, bound in zip(
+                models, self._population_models, strict=True
+            )
+        ):
+            assert self._population_loop is not None
+            return self._population_loop.cost
+
+        expected_device = torch.device(self.device)
+        for index, model in enumerate(models):
+            if not isinstance(model, nn.Module):
+                raise TypeError('models must contain only torch modules')
+            if model.training:
+                raise ValueError(
+                    f'population model {index} must be in evaluation mode'
+                )
+            wrong_device = next(
+                (
+                    value.device
+                    for value in (
+                        *tuple(model.parameters()),
+                        *tuple(model.buffers()),
+                    )
+                    if not _same_device(value.device, expected_device)
+                ),
+                None,
+            )
+            if wrong_device is not None:
+                raise ValueError(
+                    f'population model {index} must reside on '
+                    f'{expected_device}, got {wrong_device}'
+                )
+
+        population_cost = _LeWMModelPopulationCost(
+            models, history_size=self._tensor_cost.history_size
+        )
+        self._population_loop = _PopulationCEMLoop(
+            population_cost, self.n_steps, self.topk
+        )
+        self._population_models = models
+        self._compiled_population_loop = None
+        self._population_compile_error = None
+        return population_cost
 
     def prepare_population(
-        self, info: dict[str, Any]
+        self,
+        info: dict[str, Any],
+        models: Sequence[nn.Module],
     ) -> tuple[torch.Tensor, ...]:
-        """Prepare inputs shaped ``(population, tasks, time, ...)``."""
-        prepare = getattr(self._tensor_cost, 'prepare_population', None)
-        forward = getattr(self._tensor_cost, 'forward_population', None)
-        if not callable(prepare) or not callable(forward):
-            raise TypeError(
-                'this FastCEM cost does not support model populations'
-            )
-        return prepare(
+        """Stack model state and prepare the population input batch."""
+        cost = self._bind_population_models(models)
+        state = cost.stack_state(models)
+        return cost.prepare(
             info,
+            state,
             device=self.device,
             dtype=self.dtype,
             action_dim=self.action_dim,
@@ -288,9 +361,7 @@ class FastCEMSolver(CEMSolver):
                 raise
             error = f'{type(exc).__name__}: {exc}'
             setattr(self, error_attribute, error)
-            logging.warning(
-                f'{label} compilation failed; using eager: {error}'
-            )
+            logger.warning(f'{label} compilation failed; using eager: {error}')
             return (*loop.eager(*args), False)
 
     def _run(self, mean, std, noise, prepared):
@@ -336,37 +407,9 @@ class FastCEMSolver(CEMSolver):
             std.unflatten(0, (population, tasks)),
         )
 
-    @staticmethod
-    def _validate_population_parameters(
-        parameters: tuple[torch.Tensor, ...], device: torch.device
-    ) -> int:
-        if not parameters:
-            raise ValueError('population parameters cannot be empty')
-        if any(not torch.is_tensor(value) for value in parameters):
-            raise TypeError('population parameters must be a tuple of tensors')
-        population = parameters[0].size(0)
-        if population < 1 or any(
-            value.size(0) != population for value in parameters
-        ):
-            raise ValueError(
-                'all population parameters need one common population axis'
-            )
-        wrong_device = next(
-            (
-                value.device
-                for value in parameters
-                if not _same_device(value.device, device)
-            ),
-            None,
-        )
-        if wrong_device is not None:
-            raise ValueError(
-                'population parameters must already reside on the solver '
-                f'device; expected {device}, got {wrong_device}'
-            )
-        return population
-
-    def _run_population(self, mean, std, noise, parameters, prepared):
+    def _run_population(self, mean, std, noise, prepared):
+        if self._population_loop is None:
+            raise RuntimeError('population models have not been bound')
         return self._run_loop(
             self._population_loop,
             '_compiled_population_loop',
@@ -375,7 +418,6 @@ class FastCEMSolver(CEMSolver):
             mean,
             std,
             noise,
-            parameters,
             *prepared,
         )
 
@@ -411,7 +453,7 @@ class FastCEMSolver(CEMSolver):
     @torch.inference_mode()
     def solve_population_tensors(
         self,
-        parameters: tuple[torch.Tensor, ...],
+        models: Sequence[nn.Module],
         prepared: tuple[torch.Tensor, ...],
         *,
         noise: torch.Tensor | None = None,
@@ -419,16 +461,29 @@ class FastCEMSolver(CEMSolver):
     ) -> dict[str, Any]:
         """Solve a model population without transferring results to the CPU."""
         device = torch.device(self.device)
-        population = self._validate_population_parameters(parameters, device)
+        models = tuple(models)
+        population = len(models)
+        self._bind_population_models(models)
         if not prepared or any(
             not torch.is_tensor(value) for value in prepared
         ):
             raise TypeError('prepared must be a non-empty tuple of tensors')
-        if prepared[0].size(0) != population:
+        if any(value.size(0) != population for value in prepared):
             raise ValueError(
-                'prepared inputs and parameters disagree on population'
+                'prepared inputs and models disagree on population'
             )
         tasks = prepared[0].size(1)
+        if any(
+            value.ndim < 2 or value.size(1) != tasks for value in prepared[:3]
+        ):
+            raise ValueError(
+                'observation, goal, and history must share population and '
+                'task axes'
+            )
+        if any(not _same_device(value.device, device) for value in prepared):
+            raise ValueError(
+                'prepared inputs must already reside on the solver device'
+            )
         if noise is None:
             noise = self.sample_noise(tasks)
         expected = (
@@ -447,7 +502,7 @@ class FastCEMSolver(CEMSolver):
             population, tasks, init_action
         )
         mean, std, costs, compiled = self._run_population(
-            mean, std, noise, parameters, prepared
+            mean, std, noise, prepared
         )
         return {
             'actions': mean,
@@ -456,21 +511,22 @@ class FastCEMSolver(CEMSolver):
             'var': [std],
             'compiled': compiled,
             'compile_error': self._population_compile_error,
+            'population_backend': self.population_backend,
         }
 
     @torch.inference_mode()
     def solve_population(
         self,
         info: dict[str, Any],
-        parameters: tuple[torch.Tensor, ...],
+        models: Sequence[nn.Module],
         *,
         noise: torch.Tensor | None = None,
         init_action: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Solve one population using this solver's existing configuration."""
         return self.solve_population_tensors(
-            parameters,
-            self.prepare_population(info),
+            models,
+            self.prepare_population(info, models),
             noise=noise,
             init_action=init_action,
         )

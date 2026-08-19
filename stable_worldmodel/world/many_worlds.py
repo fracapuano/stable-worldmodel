@@ -19,9 +19,11 @@ from stable_worldmodel.evaluation import (
     EvaluationResults,
     StepRecord,
 )
+from stable_worldmodel.evaluation.records import recordable
 from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.policy import ACTION_HISTORY_KEY, WorldModelPolicy
 
+from .env_pool import EnvPool
 from .world import World
 
 
@@ -81,6 +83,7 @@ class ManyWorldsEvaluationResults:
     evaluations: tuple[EvaluationResults, ...]
     compiled: bool
     compile_error: str | None
+    population_backend: str
 
     @property
     def population_size(self) -> int:
@@ -89,6 +92,30 @@ class ManyWorldsEvaluationResults:
     @property
     def planning_calls(self) -> int:
         return self.planned_actions.size(0)
+
+    @property
+    def task_returns(self) -> np.ndarray:
+        """Realized returns shaped ``(population, tasks)``."""
+        return np.asarray(
+            [
+                [episode.episode_return for episode in result.episodes]
+                for result in self.evaluations
+            ],
+            dtype=np.float64,
+        )
+
+    @property
+    def fitness(self) -> np.ndarray:
+        """Mean realized environment return per population member, ``(P,)``."""
+        return self.task_returns.mean(axis=1)
+
+    @property
+    def success_rates(self) -> np.ndarray:
+        """Success percentage per population member, ``(P,)``."""
+        return np.asarray(
+            [result.success_rate for result in self.evaluations],
+            dtype=np.float64,
+        )
 
 
 class ManyWorlds:
@@ -101,9 +128,10 @@ class ManyWorlds:
     decision, then steps the real Gymnasium environments with the independently
     selected plans.
 
-    The current population kernel supports LeWM populations whose predictor
-    parameters may differ while encoder, action encoder, projections, buffers,
-    policy preprocessing, action space, and MPC configuration are identical.
+    Every LeWM parameter and persistent buffer may differ across Worlds. The
+    model architecture, policy preprocessing, action space, and MPC
+    configuration must remain identical so the population stays one tensor
+    program.
     """
 
     def __init__(
@@ -128,6 +156,10 @@ class ManyWorlds:
         for model in self.models:
             model.eval()
         self._validate_world_shapes()
+        self.envs = EnvPool.from_envs(
+            [env for world in self.worlds for env in world.envs.envs]
+        )
+        self._flat_infos: dict[str, Any] = {}
 
         if model_names is None:
             model_names = tuple(
@@ -185,6 +217,11 @@ class ManyWorlds:
         return self.worlds[0].num_envs
 
     @property
+    def simulator_count(self) -> int:
+        """Number of real Gym environments in the flat ``P * T`` pool."""
+        return self.envs.num_envs
+
+    @property
     def config(self):
         return self.policies[0].cfg
 
@@ -197,6 +234,7 @@ class ManyWorlds:
         first_world = self.worlds[0]
         first_policy = self.policies[0]
         first_model = self.models[0]
+        first_solver = first_policy.solver
         first_space = first_world.envs.single_action_space
         if not isinstance(first_space, gym.spaces.Box):
             raise TypeError(
@@ -237,74 +275,50 @@ class ManyWorlds:
                 raise TypeError(
                     'all world models must have the same concrete type'
                 )
+            for attribute in (
+                'batch_size',
+                'num_samples',
+                'var_scale',
+                'n_steps',
+                'topk',
+                'device',
+                'dtype',
+            ):
+                if getattr(policy.solver, attribute) != getattr(
+                    first_solver, attribute
+                ):
+                    raise ValueError(
+                        f'all Worlds must use the same FastCEM {attribute}'
+                    )
 
     def _validate_population(self, solver: FastCEMSolver) -> None:
         if not isinstance(solver, FastCEMSolver):
             raise TypeError('solver must be a FastCEMSolver')
-        if solver._tensor_cost.model is not self.models[0]:
+        if getattr(solver._tensor_cost, 'model', None) is not self.models[0]:
             raise ValueError("solver must use the first World's FastCEM model")
 
-        names = solver.population_parameter_names
         base_state = self.models[0].state_dict()
-        base_parameters = dict(self.models[0].named_parameters())
-        missing = sorted(set(names) - set(base_parameters))
-        if missing:
-            raise KeyError(
-                'population parameters are absent from the first model: '
-                + ', '.join(missing[:5])
-            )
-        population_names = set(names)
         expected_device = torch.device(solver.device)
-
         for index, model in enumerate(self.models):
             state = model.state_dict()
             if state.keys() != base_state.keys():
                 raise ValueError(
                     f'model {index} has a different state-dict schema'
                 )
-            parameters = dict(model.named_parameters())
-            for name in names:
-                value = parameters[name]
-                reference = base_parameters[name]
+            for name, reference in base_state.items():
+                value = state[name]
                 if value.shape != reference.shape:
                     raise ValueError(
-                        f'model {index} parameter {name!r} has shape '
+                        f'model {index} state tensor {name!r} has shape '
                         f'{tuple(value.shape)}, expected {tuple(reference.shape)}'
                     )
-                if value.dtype != solver.dtype or not _same_device(
+                if value.dtype != reference.dtype or not _same_device(
                     value.device, expected_device
                 ):
                     raise ValueError(
-                        f'model {index} parameter {name!r} must use '
-                        f'{expected_device}/{solver.dtype}'
+                        f'model {index} state tensor {name!r} must use '
+                        f'{expected_device}/{reference.dtype}'
                     )
-            changed_shared = next(
-                (
-                    name
-                    for name, expected in base_state.items()
-                    if name not in population_names
-                    and not torch.equal(state[name], expected)
-                ),
-                None,
-            )
-            if changed_shared is not None:
-                raise ValueError(
-                    'ManyWorlds currently supports predictor-only variation; '
-                    f'model {index} changes shared tensor {changed_shared!r}'
-                )
-
-    def _stack_parameters(
-        self, solver: FastCEMSolver
-    ) -> tuple[torch.Tensor, ...]:
-        by_model = tuple(
-            dict(model.named_parameters()) for model in self.models
-        )
-        return tuple(
-            torch.stack(
-                tuple(parameters[name].detach() for parameters in by_model)
-            )
-            for name in solver.population_parameter_names
-        )
 
     def _infer_eval_budget(self) -> int:
         budgets = []
@@ -324,28 +338,95 @@ class ManyWorlds:
         return int(budgets[0])
 
     def _reset(self, protocol: EvaluationProtocol, eval_budget: int) -> None:
+        seeds = []
+        options = []
         for world in self.worlds:
-            world._reset_from_protocol(protocol, eval_budget)
+            first_env = world.envs.envs[0]
+            spec = getattr(first_env, 'spec', None)
+            env_id = getattr(spec, 'id', None)
+            accepted_names = {
+                env_id,
+                getattr(first_env.unwrapped, 'env_name', None),
+            }
+            if protocol.environment not in accepted_names:
+                raise ValueError(
+                    f'protocol environment {protocol.environment!r} does not '
+                    f'match World environment {env_id!r}'
+                )
+            if len(protocol.tasks) != world.num_envs:
+                raise ValueError(
+                    'protocol evaluation requires one World env per task: '
+                    f'{len(protocol.tasks)} tasks != {world.num_envs} envs'
+                )
+            if eval_budget < 1:
+                raise ValueError(
+                    'protocol evaluation requires eval_budget >= 1'
+                )
+            seeds.extend(task.environment_seed for task in protocol.tasks)
+            options.extend(
+                world._task_reset_options(task) for task in protocol.tasks
+            )
+
+        _, infos = self.envs.reset(seed=seeds, options=options)
+        infos['controller_seed'] = np.tile(
+            np.asarray(protocol.controller_seeds, dtype=np.int64),
+            self.population_size,
+        )[:, None]
+        infos['task_key'] = [
+            [key]
+            for _ in range(self.population_size)
+            for key in protocol.task_keys
+        ]
+        self._sync_world_batches(infos=infos)
+        for policy in self.policies:
+            if hasattr(policy, 'reset_state'):
+                policy.reset_state()
+
+    @staticmethod
+    def _slice_batch(value: Any, start: int, end: int) -> Any:
+        if torch.is_tensor(value) or isinstance(value, np.ndarray):
+            return value[start:end]
+        if isinstance(value, list):
+            return value[start:end]
+        return value
+
+    def _sync_world_batches(
+        self,
+        *,
+        infos: dict[str, Any],
+        rewards: np.ndarray | None = None,
+        terminateds: np.ndarray | None = None,
+        truncateds: np.ndarray | None = None,
+        actions: np.ndarray | None = None,
+    ) -> None:
+        """Expose flat ``P*T`` pool state through the constituent Worlds."""
+        self._flat_infos = infos
+        tasks = self.num_tasks
+        for population_index, world in enumerate(self.worlds):
+            start = population_index * tasks
+            end = start + tasks
+            world.infos = {
+                key: self._slice_batch(value, start, end)
+                for key, value in infos.items()
+            }
+            world.envs._stacked_infos = world.infos
+            world.envs.seeds = self.envs.seeds[start:end].copy()
+            world.rewards = None if rewards is None else rewards[start:end]
+            world.terminateds = (
+                np.zeros(tasks, dtype=bool)
+                if terminateds is None
+                else terminateds[start:end]
+            )
+            world.truncateds = (
+                np.zeros(tasks, dtype=bool)
+                if truncateds is None
+                else truncateds[start:end]
+            )
+            if actions is not None:
+                world.actions = np.asarray(actions[population_index]).copy()
 
     def _combined_info(self) -> dict[str, Any]:
-        keys = self.worlds[0].infos.keys()
-        if any(world.infos.keys() != keys for world in self.worlds[1:]):
-            raise ValueError(
-                'World info dictionaries must have identical keys'
-            )
-        combined = {}
-        for key in keys:
-            values = tuple(world.infos[key] for world in self.worlds)
-            first = values[0]
-            if torch.is_tensor(first):
-                combined[key] = torch.cat(values, dim=0)
-            elif isinstance(first, np.ndarray):
-                combined[key] = np.concatenate(values, axis=0)
-            elif isinstance(first, list):
-                combined[key] = [item for value in values for item in value]
-            else:
-                combined[key] = first
-        return combined
+        return self._flat_infos
 
     def _population_info(self, flat_info: dict[str, Any]) -> dict[str, Any]:
         population, tasks = self.population_size, self.num_tasks
@@ -453,16 +534,84 @@ class ManyWorlds:
         return actions.reshape(population, tasks, actions_per_plan, *raw_shape)
 
     def _step_worlds(self, actions: np.ndarray, alive: np.ndarray) -> None:
-        for index, world in enumerate(self.worlds):
-            world.actions = np.asarray(actions[index]).copy()
-            mask = alive[index] if not alive[index].all() else None
-            (
-                _,
-                world.rewards,
-                world.terminateds,
-                world.truncateds,
-                world.infos,
-            ) = world.envs.step(actions[index], mask=mask)
+        flat_actions = actions.reshape(
+            self.simulator_count, *actions.shape[2:]
+        )
+        flat_alive = alive.reshape(self.simulator_count)
+        _, rewards, terminateds, truncateds, infos = self.envs.step(
+            flat_actions,
+            mask=None if flat_alive.all() else flat_alive,
+        )
+        self._sync_world_batches(
+            infos=infos,
+            rewards=rewards,
+            terminateds=terminateds,
+            truncateds=truncateds,
+            actions=actions,
+        )
+
+    @staticmethod
+    def _select_tasks(value: Any, world: int, tasks: list[int]) -> Any:
+        """Select one World's active tasks from a population value."""
+        if torch.is_tensor(value):
+            index = torch.as_tensor(tasks, device=value.device)
+            return value[world].index_select(0, index)
+        if isinstance(value, np.ndarray):
+            return value[world, tasks]
+        if isinstance(value, (tuple, list)):
+            member = value[world]
+            return type(member)(member[index] for index in tasks)
+        return value
+
+    def _notify_plans(
+        self,
+        info: dict[str, Any],
+        output: dict[str, Any],
+        alive: np.ndarray,
+        model_queries: list[list[dict[str, Any]]],
+        *,
+        record: bool,
+    ) -> None:
+        """Preserve each policy's ordinary post-plan observer contract."""
+        for world_index, policy in enumerate(self.policies):
+            task_indices = np.flatnonzero(alive[world_index]).tolist()
+            if not task_indices:
+                continue
+            controller_input = {
+                key: self._select_tasks(value, world_index, task_indices)
+                for key, value in info.items()
+            }
+            actions = self._select_tasks(
+                output['actions'], world_index, task_indices
+            )
+            solver_output = {
+                'actions': actions,
+                'costs': self._select_tasks(
+                    output['costs'], world_index, task_indices
+                ),
+                'mean': [
+                    self._select_tasks(
+                        output['mean'][0], world_index, task_indices
+                    )
+                ],
+                'var': [
+                    self._select_tasks(
+                        output['var'][0], world_index, task_indices
+                    )
+                ],
+                'compiled': output['compiled'],
+                'compile_error': output['compile_error'],
+            }
+            event = {
+                'env_indices': tuple(task_indices),
+                'controller_input': controller_input,
+                'solver_output': solver_output,
+                'selected_plan': actions[:, : self.config.receding_horizon],
+            }
+            if record:
+                model_queries[world_index].append(recordable(event))
+            if policy.on_plan is not None:
+                policy.on_plan(event)
 
     @torch.inference_mode()
     def evaluate(
@@ -477,9 +626,9 @@ class ManyWorlds:
 
         This is the population analogue of
         ``tuple(world.evaluate(protocol=protocol) for world in worlds)``. Real
-        Gym environments still execute on the host, but there is no per-model
-        world-model or CEM forward loop: every refinement step carries a model
-        population dimension on the accelerator.
+        Gym environments still execute on the host through one flat ``P*T``
+        pool. There is no per-World solver call or model loop: CEM and model
+        ranking both carry the population axis on the accelerator.
         """
         if not isinstance(protocol, EvaluationProtocol):
             raise TypeError('protocol must be an EvaluationProtocol')
@@ -494,7 +643,6 @@ class ManyWorlds:
             config=self.config,
         )
         self._validate_population(solver)
-        parameters = self._stack_parameters(solver)
         self._reset(protocol, eval_budget)
 
         population, tasks = self.population_size, self.num_tasks
@@ -519,6 +667,9 @@ class ManyWorlds:
             else None
         )
         step_records = [[[] for _ in range(tasks)] for _ in range(population)]
+        model_queries: list[list[dict[str, Any]]] = [
+            [] for _ in range(population)
+        ]
 
         history = None
         if self.config.history_len > 1:
@@ -556,7 +707,7 @@ class ManyWorlds:
                 )
                 output = solver.solve_population(
                     info,
-                    parameters,
+                    self.models,
                     noise=noise,
                     init_action=next_init,
                 )
@@ -565,6 +716,13 @@ class ManyWorlds:
                 planner_costs.append(output['costs'])
                 planner_variances.append(output['var'][0])
                 compiled.append(bool(output['compiled']))
+                self._notify_plans(
+                    info,
+                    output,
+                    alive,
+                    model_queries,
+                    record=record,
+                )
                 action_plan = self._environment_plan(planned)
                 plan_offset = 0
 
@@ -683,6 +841,7 @@ class ManyWorlds:
                     )
                     for task_index, task in enumerate(protocol.tasks)
                 ),
+                model_queries=tuple(model_queries[world_index]),
                 metadata={
                     'split': protocol.split,
                     'environment': protocol.environment,
@@ -702,6 +861,7 @@ class ManyWorlds:
             evaluations=evaluations,
             compiled=all(compiled),
             compile_error=solver.compile_error,
+            population_backend=solver.population_backend or 'unknown',
         )
 
 
