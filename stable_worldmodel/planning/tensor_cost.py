@@ -141,10 +141,9 @@ class _LeWMEncoder(nn.Module):
 class _LeWMModelPopulationCost(nn.Module):
     """Score all independent LeWMs in one population-batched tensor call.
 
-    Fully independent model parameters and buffers can be stacked on a leading
-    population axis for ``torch.func.vmap``. When only predictor parameters
-    differ, the smaller fused path stacks just that varying state. Both paths
-    avoid a Python model loop inside the CEM refinement kernel.
+    Fully independent model parameters and buffers are stacked on a leading
+    population axis for ``torch.func.vmap``, avoiding a Python model loop
+    inside the CEM refinement kernel.
     """
 
     def __init__(
@@ -166,10 +165,6 @@ class _LeWMModelPopulationCost(nn.Module):
         self._population_size = len(models)
         self._parameter_names: tuple[str, ...] = ()
         self._buffer_names: tuple[str, ...] = ()
-        self._predictor_names = tuple(
-            getattr(models[0], 'population_predictor_parameter_names', ())
-        )
-        self._fused_predictor = self._can_fuse_predictor(models)
 
     @property
     def population_size(self) -> int:
@@ -177,58 +172,12 @@ class _LeWMModelPopulationCost(nn.Module):
 
     @property
     def backend(self) -> str:
-        return (
-            'fused_predictor' if self._fused_predictor else 'functional_vmap'
-        )
-
-    def _can_fuse_predictor(self, models: Sequence[nn.Module]) -> bool:
-        if not self._predictor_names or not callable(
-            getattr(models[0], 'rollout_population_from_embeddings', None)
-        ):
-            return False
-        predictor_names = set(self._predictor_names)
-        reference = models[0].state_dict()
-        return all(
-            all(
-                name in predictor_names or torch.equal(value, state[name])
-                for name, value in reference.items()
-            )
-            for state in (model.state_dict() for model in models[1:])
-        )
+        return 'functional_vmap'
 
     def stack_state(
         self, models: Sequence[nn.Module]
     ) -> tuple[torch.Tensor, ...]:
-        """Stack the state needed by the selected population backend."""
-        if self._fused_predictor:
-            parameter_names = tuple(
-                f'model.{name}' for name in self._predictor_names
-            )
-            parameters_by_model = tuple(
-                dict(model.named_parameters()) for model in models
-            )
-            missing = tuple(
-                name
-                for name in self._predictor_names
-                if any(
-                    name not in parameters
-                    for parameters in parameters_by_model
-                )
-            )
-            if missing:
-                raise ValueError(
-                    f'population predictor parameters are missing: {missing}'
-                )
-            self._validate_state_schema(parameter_names, ())
-            return tuple(
-                torch.stack(
-                    tuple(
-                        parameters[name] for parameters in parameters_by_model
-                    )
-                ).detach()
-                for name in self._predictor_names
-            )
-
+        """Stack all model parameters and buffers on a population axis."""
         costs = tuple(
             _LeWMTerminalCost(model, history_size=self.template.history_size)
             for model in models
@@ -306,18 +255,9 @@ class _LeWMModelPopulationCost(nn.Module):
         else:
             pixels = tensor('pixels')
             goals = tensor('goal')[:, :, -1:]
-            if self._fused_predictor:
-                population, tasks = pixels.shape[:2]
-                current = self.template.model.encode(
-                    {'pixels': pixels.flatten(0, 1)}
-                )['emb'].unflatten(0, (population, tasks))
-                goal = self.template.model.encode(
-                    {'pixels': goals.flatten(0, 1)}
-                )['emb'][:, 0].unflatten(0, (population, tasks))
-            else:
-                current, goal = self._call_population(
-                    self.encoder, parameters, buffers, pixels, goals
-                )
+            current, goal = self._call_population(
+                self.encoder, parameters, buffers, pixels, goals
+            )
         if 'goal_emb' in info:
             goal = tensor('goal_emb')[:, :, -1]
 
@@ -348,19 +288,6 @@ class _LeWMModelPopulationCost(nn.Module):
 
     def forward(self, candidates, current, goal, history, *state):
         parameters, buffers = self._unpack_state(state)
-        if self._fused_predictor:
-            predictor_parameters = tuple(
-                parameters[f'model.{name}'] for name in self._predictor_names
-            )
-            terminal = self.template.model.rollout_population_from_embeddings(
-                current,
-                candidates,
-                predictor_parameters,
-                action_history=history,
-                history_size=self.template.history_size,
-                terminal_only=True,
-            )
-            return (terminal - goal[:, :, None]).square().sum(dim=-1)
         return self._call_population(
             self.template,
             parameters,

@@ -209,7 +209,7 @@ results.planner_costs.shape    # (planning_calls, models, tasks)
 results.environment_actions.shape  # (models, tasks, env_steps, action_dim)
 results.task_returns.shape     # (models, tasks)
 results.fitness.shape          # (models,), mean return across tasks
-results.population_backend     # "fused_predictor" or "functional_vmap"
+results.population_backend     # "functional_vmap"
 
 # Standard realized World results, one entry per model:
 results.evaluations[0].episodes
@@ -220,10 +220,7 @@ termination are supported. Every LeWM parameter and persistent buffer may
 differ across Worlds, including the observation encoder, action encoder,
 projector, predictor, and prediction projector. The source models remain
 ordinary modules with native parameter shapes. Before planning, their complete
-parameters and buffers are stacked onto a leading population axis on the
-generic backend. The fused predictor backend stacks only the varying predictor
-weights, avoiding a copy of the shared encoder and action-encoder state on each
-replan.
+parameters and buffers are stacked onto a leading population axis.
 
 The population axis runs through the complete FastCEM path. Means, variances,
 sampled candidates, model costs, elite selection, and warm starts have leading
@@ -232,13 +229,10 @@ call over `(models, tasks, samples, ...)`, with no Python loop over models in a
 CEM refinement. The fixed number of refinements can be captured as one
 compiled graph.
 
-When all non-predictor state is shared, LeWM automatically selects the
-`fused_predictor` backend: population-specific linear/normalization weights are
-applied explicitly and population is folded into attention's batch dimensions,
-preserving fused attention kernels. Fully different model state remains
-supported through the generic `functional_vmap` backend; backend support for
-individual operations determines whether that route is faster on a particular
-accelerator.
+Population model evaluation uses PyTorch's `functional_call` and `vmap` so the
+same path supports arbitrary differences in model parameters and buffers.
+Backend support for individual operations determines performance on a
+particular accelerator.
 
 Model architecture, preprocessing, action spaces, and `PlanConfig` must
 match, and every model must already reside on the solver device. Real rollout

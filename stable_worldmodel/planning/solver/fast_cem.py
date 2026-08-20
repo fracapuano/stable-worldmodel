@@ -25,7 +25,6 @@ from .callbacks import Callback
 from .cem import CEMSolver
 from .utils import prepare_init_action
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -99,11 +98,9 @@ class _PopulationCEMLoop(_CEMLoop):
         return elite_mean, elite_std, values.mean(2)
 
     def forward(self, mean, std, noise, *prepared):
-        if self.cost.backend == 'fused_predictor':
-            return super().forward(mean, std, noise, *prepared)
         # ``functional_call``/``vmap`` cannot currently be nested inside a
         # ``torch.while_loop`` capture. n_steps is static, so Dynamo safely
-        # unrolls the generic full-state path into one graph.
+        # unrolls the population path into one graph.
         return self.eager(mean, std, noise, *prepared)
 
 
@@ -115,9 +112,8 @@ class FastCEMSolver(CEMSolver):
     Compatible terminal LeWM costs are adapted internally to a pure-tensor
     kernel and can use :meth:`solve_population` with independent model
     instances. Model state and CEM tensors carry a population axis, so all
-    candidate slices are ranked by one population model call. The generic
-    backend stacks complete state; the fused backend stacks only differing
-    predictor weights.
+    candidate slices are ranked by one population model call with complete
+    model state stacked on the population axis.
     Incompatible costs and per-iteration callbacks are rejected at construction
     rather than silently running reference CEM.
     """

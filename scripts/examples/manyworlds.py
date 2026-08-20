@@ -22,10 +22,10 @@ quick smoke run, for example::
 Setup and evaluation time are reported separately. Checkpoint download and one
 untimed CPU load are excluded, while every timed condition still instantiates
 its own model copies. By default, predictor parameters receive a small,
-deterministic per-World perturbation, exercising the fused population backend.
-Use ``--perturbation-scope full`` to exercise fully different model state via
-the generic functional backend. The ordered per-World success-rate vectors are
-reported and checked for exact parity between the two conditions.
+deterministic per-World perturbation. Use ``--perturbation-scope full`` to
+perturb all model weights instead. Both cases use the same functional
+population path. The ordered per-World success-rate vectors are reported and
+checked for exact parity between the two conditions.
 """
 
 from __future__ import annotations
@@ -446,7 +446,7 @@ def parse_args() -> argparse.Namespace:
         '--perturbation-scope',
         choices=('predictor', 'full'),
         default='predictor',
-        help='perturb predictor weights (fused) or all weights (generic)',
+        help='perturb predictor weights only or all model weights',
     )
     parser.add_argument('--device', default=default_device())
     parser.add_argument(

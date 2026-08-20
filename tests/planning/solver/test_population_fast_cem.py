@@ -137,7 +137,7 @@ def test_population_models_keep_native_parameter_shapes():
     )
     _configure(solver, tasks=1)
 
-    solver.solve_population(
+    output = solver.solve_population(
         {
             'emb': torch.randn(2, 1, 1, 4),
             'goal_emb': torch.randn(2, 1, 1, 4),
@@ -149,11 +149,10 @@ def test_population_models_keep_native_parameter_shapes():
         tuple(parameter.shape for parameter in model.parameters())
         for model in (first, second)
     )
-    assert hasattr(first, 'rollout_population_from_embeddings')
-    assert hasattr(first.predictor, 'forward_population')
+    assert output['population_backend'] == 'functional_vmap'
 
 
-def test_population_uses_fused_predictor_backend_when_shared_state_matches():
+def test_population_stacks_complete_model_state():
     first = _model()
     second = deepcopy(first)
     with torch.no_grad():
@@ -175,13 +174,13 @@ def test_population_uses_fused_predictor_backend_when_shared_state_matches():
     prepared = solver.prepare_population(info, (first, second))
     population_state = prepared[3:]
     assert len(population_state) == len(
-        first.population_predictor_parameter_names
+        tuple(first.parameters()) + tuple(first.buffers())
     )
     assert all(value.size(0) == 2 for value in population_state)
 
     output = solver.solve_population(info, (first, second))
 
-    assert output['population_backend'] == 'fused_predictor'
+    assert output['population_backend'] == 'functional_vmap'
     assert output['actions'].shape == (2, 1, 3, 2)
 
 
@@ -209,7 +208,7 @@ def test_population_fast_cem_compiles_as_one_full_graph():
 
     assert output['actions'].shape == (2, 1, 3, 2)
     assert output['compiled'] is True
-    assert output['population_backend'] == 'fused_predictor'
+    assert output['population_backend'] == 'functional_vmap'
 
 
 def test_population_fast_cem_requires_solver_model_first():
