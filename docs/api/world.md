@@ -225,8 +225,8 @@ results.planned_actions.shape  # (planning_calls, models, tasks, horizon, blocke
 results.planner_costs.shape    # (planning_calls, models, tasks)
 results.environment_actions.shape  # (models, tasks, env_steps, action_dim)
 results.task_returns.shape     # (models, tasks)
-results.scores.shape           # (models,), device-resident TwoRooms score
-results.fitness.shape          # (models,), host view of scores/mean returns
+results.scores.shape           # (models,), device-resident TwoRoom score
+results.fitness.shape          # (models,), host view of score/mean return
 results.task_final_distances.shape  # (models, tasks), device-resident
 results.population_backend     # "functional_vmap"
 results.simulator_backend      # "envx" for TwoRooms, otherwise "gym"
@@ -234,6 +234,13 @@ results.simulator_backend      # "envx" for TwoRooms, otherwise "gym"
 # Standard realized World results, one entry per model:
 results.evaluations[0].episodes
 ```
+
+For TwoRoom protocols, both Gym and envX use the same task aggregation. Set
+protocol metadata `score="success"` for mean success or `score="distance"`
+for `1 - mean_final_distance / hypot(224, 224)`; distance is the default.
+Other environments retain mean episode return as `fitness`. The envX result is
+self-contained: it does not claim that the constituent Gym `World` instances
+were advanced to the JAX terminal states.
 
 The envX path is deliberately open-loop: `eval_budget` may not exceed
 `horizon * action_block`, and per-step records are not materialized. It plans
