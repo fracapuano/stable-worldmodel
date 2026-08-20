@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -16,6 +16,7 @@ from stable_worldmodel.planning.evaluator import (
 )
 from stable_worldmodel.planning.objective import GoalMSE
 from stable_worldmodel.planning.tensor_cost import (
+    _LeWMFactorizedPopulationCost,
     _LeWMModelPopulationCost,
     _LeWMTerminalCost,
 )
@@ -111,9 +112,9 @@ class FastCEMSolver(CEMSolver):
     the same constructor and :meth:`solve` contract as :class:`CEMSolver`.
     Compatible terminal LeWM costs are adapted internally to a pure-tensor
     kernel and can use :meth:`solve_population` with independent model
-    instances. Model state and CEM tensors carry a population axis, so all
-    candidate slices are ranked by one population model call with complete
-    model state stacked on the population axis.
+    instances, or :meth:`solve_factorized_population` with one base model and
+    batched low-rank buffers. Model state and CEM tensors carry a population
+    axis, so all candidate slices are ranked by one population model call.
     Incompatible costs and per-iteration callbacks are rejected at construction
     rather than silently running reference CEM.
     """
@@ -158,6 +159,7 @@ class FastCEMSolver(CEMSolver):
         self._loop = _CEMLoop(self._tensor_cost, n_steps, topk)
         self._population_loop: _PopulationCEMLoop | None = None
         self._population_models: tuple[nn.Module, ...] = ()
+        self._population_factor_names: tuple[str, ...] = ()
         self._compiled_loop = None
         self._compiled_population_loop = None
         self._compile_error = None
@@ -271,6 +273,63 @@ class FastCEMSolver(CEMSolver):
             population_cost, self.n_steps, self.topk
         )
         self._population_models = models
+        self._population_factor_names = ()
+        self._compiled_population_loop = None
+        self._population_compile_error = None
+        return population_cost
+
+    def _bind_factorized_population(
+        self, factor_state: Mapping[str, torch.Tensor]
+    ) -> _LeWMFactorizedPopulationCost:
+        """Bind batched low-rank buffers without constructing model copies."""
+        factor_names = tuple(factor_state)
+        if (
+            factor_names == self._population_factor_names
+            and self._population_loop is not None
+            and isinstance(
+                self._population_loop.cost, _LeWMFactorizedPopulationCost
+            )
+        ):
+            return self._population_loop.cost
+        if not isinstance(self._tensor_cost, _LeWMTerminalCost):
+            raise TypeError(
+                'factorized populations require a compatible LeWM terminal '
+                'cost'
+            )
+
+        model = self._tensor_cost.model
+        if model.training:
+            raise ValueError(
+                'the factorized population model must be in eval mode'
+            )
+        expected_device = torch.device(self.device)
+        wrong_device = next(
+            (
+                value.device
+                for value in (
+                    *tuple(model.parameters()),
+                    *tuple(model.buffers()),
+                )
+                if not _same_device(value.device, expected_device)
+            ),
+            None,
+        )
+        if wrong_device is not None:
+            raise ValueError(
+                f'the factorized population model must reside on '
+                f'{expected_device}, got {wrong_device}'
+            )
+
+        population_cost = _LeWMFactorizedPopulationCost(
+            model,
+            factor_names,
+            history_size=self._tensor_cost.history_size,
+        )
+        self._population_loop = _PopulationCEMLoop(
+            population_cost, self.n_steps, self.topk
+        )
+        self._population_models = ()
+        self._population_factor_names = factor_names
         self._compiled_population_loop = None
         self._population_compile_error = None
         return population_cost
@@ -283,6 +342,29 @@ class FastCEMSolver(CEMSolver):
         """Stack model state and prepare the population input batch."""
         cost = self._bind_population_models(models)
         state = cost.stack_state(models)
+        return cost.prepare(
+            info,
+            state,
+            device=self.device,
+            dtype=self.dtype,
+            action_dim=self.action_dim,
+        )
+
+    def prepare_factorized_population(
+        self,
+        info: dict[str, Any],
+        factor_state: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, ...]:
+        """Prepare one shared model with population-batched factor buffers."""
+        cost = self._bind_factorized_population(factor_state)
+        state = cost.pack_state(factor_state)
+        expected_device = torch.device(self.device)
+        if any(
+            not _same_device(value.device, expected_device) for value in state
+        ):
+            raise ValueError(
+                'factor state must already reside on the solver device'
+            )
         return cost.prepare(
             info,
             state,
@@ -405,7 +487,7 @@ class FastCEMSolver(CEMSolver):
 
     def _run_population(self, mean, std, noise, prepared):
         if self._population_loop is None:
-            raise RuntimeError('population models have not been bound')
+            raise RuntimeError('population cost has not been bound')
         return self._run_loop(
             self._population_loop,
             '_compiled_population_loop',
@@ -456,18 +538,31 @@ class FastCEMSolver(CEMSolver):
         init_action: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Solve a model population without transferring results to the CPU."""
-        device = torch.device(self.device)
         models = tuple(models)
         population = len(models)
         self._bind_population_models(models)
+        return self._solve_bound_population_tensors(
+            population,
+            prepared,
+            noise=noise,
+            init_action=init_action,
+        )
+
+    def _solve_bound_population_tensors(
+        self,
+        population: int,
+        prepared: tuple[torch.Tensor, ...],
+        *,
+        noise: torch.Tensor | None,
+        init_action: torch.Tensor | None,
+    ) -> dict[str, Any]:
+        device = torch.device(self.device)
         if not prepared or any(
             not torch.is_tensor(value) for value in prepared
         ):
             raise TypeError('prepared must be a non-empty tuple of tensors')
         if any(value.size(0) != population for value in prepared):
-            raise ValueError(
-                'prepared inputs and models disagree on population'
-            )
+            raise ValueError('prepared inputs disagree on population')
         tasks = prepared[0].size(1)
         if any(
             value.ndim < 2 or value.size(1) != tasks for value in prepared[:3]
@@ -511,6 +606,25 @@ class FastCEMSolver(CEMSolver):
         }
 
     @torch.inference_mode()
+    def solve_factorized_population_tensors(
+        self,
+        factor_state: Mapping[str, torch.Tensor],
+        prepared: tuple[torch.Tensor, ...],
+        *,
+        noise: torch.Tensor | None = None,
+        init_action: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Solve a factorized population without dense model state."""
+        cost = self._bind_factorized_population(factor_state)
+        state = cost.pack_state(factor_state)
+        return self._solve_bound_population_tensors(
+            state[0].size(0),
+            prepared,
+            noise=noise,
+            init_action=init_action,
+        )
+
+    @torch.inference_mode()
     def solve_population(
         self,
         info: dict[str, Any],
@@ -523,6 +637,24 @@ class FastCEMSolver(CEMSolver):
         return self.solve_population_tensors(
             models,
             self.prepare_population(info, models),
+            noise=noise,
+            init_action=init_action,
+        )
+
+    @torch.inference_mode()
+    def solve_factorized_population(
+        self,
+        info: dict[str, Any],
+        factor_state: Mapping[str, torch.Tensor],
+        *,
+        noise: torch.Tensor | None = None,
+        init_action: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Plan for all batched factor sets using one shared base model."""
+        prepared = self.prepare_factorized_population(info, factor_state)
+        return self.solve_factorized_population_tensors(
+            factor_state,
+            prepared,
             noise=noise,
             init_action=init_action,
         )

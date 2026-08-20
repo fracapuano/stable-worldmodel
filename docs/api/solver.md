@@ -39,6 +39,8 @@ summary: Model-based planning solvers for action optimization
 
 ::: stable_worldmodel.planning.solver.FastCEMSolver.solve_population
 
+::: stable_worldmodel.planning.solver.FastCEMSolver.solve_factorized_population
+
 ::: stable_worldmodel.planning.solver.ICEMSolver
     options:
         heading_level: 3

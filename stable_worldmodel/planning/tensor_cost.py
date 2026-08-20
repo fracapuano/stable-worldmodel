@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -292,6 +292,160 @@ class _LeWMModelPopulationCost(nn.Module):
             self.template,
             parameters,
             buffers,
+            candidates,
+            current,
+            goal,
+            history,
+        )
+
+
+class _LeWMFactorizedPopulationCost(nn.Module):
+    """Score a population represented by batched model-state overrides.
+
+    The base model is shared. Only the supplied factor tensors carry a
+    population axis, so this path never constructs model copies or dense
+    population parameters. Each factor name is the name of a registered
+    buffer on the base model, as accepted by ``torch.func.functional_call``.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        factor_names: Sequence[str],
+        *,
+        history_size: int | None = None,
+    ) -> None:
+        super().__init__()
+        factor_names = tuple(factor_names)
+        if not factor_names:
+            raise ValueError('factor state cannot be empty')
+        if len(set(factor_names)) != len(factor_names):
+            raise ValueError('factor state names must be unique')
+        available = dict(model.named_buffers())
+        missing = tuple(name for name in factor_names if name not in available)
+        if missing:
+            raise KeyError(
+                f'factor state is absent from the model: {missing[0]}'
+            )
+        if not _LeWMTerminalCost.supports(model):
+            raise TypeError('factorized population requires a compatible LeWM')
+
+        self.template = _LeWMTerminalCost(model, history_size=history_size)
+        self.encoder = _LeWMEncoder(model)
+        self.factor_names = factor_names
+        self.factor_shapes = {
+            name: tuple(available[name].shape) for name in factor_names
+        }
+
+    @property
+    def backend(self) -> str:
+        return 'factorized_vmap'
+
+    def pack_state(
+        self, factor_state: Mapping[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, ...]:
+        """Return factor tensors in the stable schema used by the graph."""
+        if tuple(factor_state) != self.factor_names:
+            raise ValueError('factor state schema changed')
+        state = tuple(factor_state.values())
+        if any(not torch.is_tensor(value) for value in state):
+            raise TypeError('factor state values must be tensors')
+        if any(value.ndim < 1 for value in state):
+            raise ValueError('factor state tensors need a population axis')
+        for name, value in factor_state.items():
+            if tuple(value.shape[1:]) != self.factor_shapes[name]:
+                raise ValueError(
+                    f'factor state {name!r} must have trailing shape '
+                    f'{self.factor_shapes[name]}'
+                )
+        population = state[0].size(0)
+        if population < 1 or any(
+            value.size(0) != population for value in state
+        ):
+            raise ValueError(
+                'factor state tensors must share a population axis'
+            )
+        return tuple(value.detach() for value in state)
+
+    def _overrides(
+        self, state: tuple[torch.Tensor, ...]
+    ) -> dict[str, torch.Tensor]:
+        if len(state) != len(self.factor_names):
+            raise ValueError(
+                f'expected {len(self.factor_names)} factor tensors, got '
+                f'{len(state)}'
+            )
+        return {
+            f'model.{name}': value
+            for name, value in zip(self.factor_names, state, strict=True)
+        }
+
+    @staticmethod
+    def _call_population(module, overrides, *args):
+        def call_member(member_overrides, *member_args):
+            return functional_call(
+                module,
+                member_overrides,
+                member_args,
+                strict=False,
+            )
+
+        return vmap(
+            call_member,
+            in_dims=(0, *(0 for _ in args)),
+            randomness='different',
+        )(overrides, *args)
+
+    def prepare(
+        self,
+        info: dict[str, Any],
+        state: tuple[torch.Tensor, ...],
+        *,
+        device: str | torch.device,
+        dtype: torch.dtype,
+        action_dim: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """Encode population inputs with one base model and batched factors."""
+
+        def tensor(key):
+            return torch.as_tensor(info[key], device=device, dtype=dtype)
+
+        overrides = self._overrides(state)
+        if 'emb' in info:
+            current = tensor('emb')
+        else:
+            pixels = tensor('pixels')
+            goals = tensor('goal')[:, :, -1:]
+            current, goal = self._call_population(
+                self.encoder, overrides, pixels, goals
+            )
+        if 'goal_emb' in info:
+            goal = tensor('goal_emb')[:, :, -1]
+
+        history = (
+            tensor('action_history')
+            if 'action_history' in info
+            else current.new_zeros(
+                current.size(0),
+                current.size(1),
+                current.size(2) - 1,
+                action_dim,
+            )
+        )
+        expected = (
+            current.size(0),
+            current.size(1),
+            current.size(2) - 1,
+            action_dim,
+        )
+        if tuple(history.shape) != expected:
+            raise ValueError(f'expected action_history shape {expected}')
+        return current.detach(), goal.detach(), history.detach(), *state
+
+    def forward(self, candidates, current, goal, history, *state):
+        return self._call_population(
+            self.template,
+            self._overrides(state),
             candidates,
             current,
             goal,
