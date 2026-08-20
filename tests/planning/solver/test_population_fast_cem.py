@@ -233,6 +233,40 @@ def test_population_fast_cem_requires_solver_model_first():
         )
 
 
+def test_population_fast_cem_explains_cuda_launch_limit(monkeypatch):
+    models = (_model(), _model())
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(models[0], GoalMSE()),
+        num_samples=4,
+        n_steps=2,
+        topk=2,
+        compile_kernel=False,
+    )
+    _configure(solver, tasks=1)
+    prepared = solver.prepare_population(
+        {
+            'emb': torch.randn(2, 1, 1, 4),
+            'goal_emb': torch.randn(2, 1, 1, 4),
+        },
+        models,
+    )
+    assert solver._population_loop is not None
+
+    def fail(*_args):
+        raise RuntimeError('CUDA error: invalid argument')
+
+    monkeypatch.setattr(solver._population_loop.cost, '_call_population', fail)
+    candidates = torch.randn(2, 1, 4, 3, 2)
+    with pytest.raises(RuntimeError) as raised:
+        solver._population_loop.cost(candidates, *prepared)
+
+    message = str(raised.value)
+    assert 'population=2, tasks=1, samples=4' in message
+    assert 'effective_attention_batch=8' in message
+    assert 'No automatic tiling or fallback is performed' in message
+    assert raised.value.__cause__ is not None
+
+
 def test_population_preparation_uses_each_models_ordinary_encoder():
     models = tuple(CountingEncoderModel().eval() for _ in range(3))
     solver = FastCEMSolver(
