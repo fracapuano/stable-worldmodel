@@ -61,21 +61,9 @@ class _CEMLoop(nn.Module):
         return mean, std, cost
 
     def forward(self, mean, std, noise, *prepared):
-        step = torch.zeros((), dtype=torch.int64, device=mean.device)
-        cost = mean.new_zeros(mean.shape[:-2])
-
-        def cond(step, _mean, _std, _cost):
-            return step < self.n_steps
-
-        def body(step, mean, std, _cost):
-            step_noise = noise.index_select(0, step[None]).squeeze(0)
-            mean, std, cost = self._step(mean, std, step_noise, *prepared)
-            return step + 1, mean, std, cost
-
-        _, mean, std, cost = torch.while_loop(
-            cond, body, (step, mean, std, cost)
-        )
-        return mean, std, cost
+        # n_steps is static, so Dynamo unrolls this without the
+        # CUDA-graph-unsafe torch.while_loop node.
+        return self.eager(mean, std, noise, *prepared)
 
 
 class _PopulationCEMLoop(_CEMLoop):

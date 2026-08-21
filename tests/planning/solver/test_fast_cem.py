@@ -278,7 +278,11 @@ def test_compile_failure_falls_back_to_eager(monkeypatch):
     assert 'synthetic compiler failure' in output['compile_error']
 
 
-def test_real_lewm_standard_cost_is_fully_capturable():
+def test_real_lewm_standard_cost_is_fully_capturable(monkeypatch):
+    def reject_while_loop(*_args, **_kwargs):
+        raise AssertionError('compiled FastCEM must use the static loop')
+
+    monkeypatch.setattr(torch, 'while_loop', reject_while_loop)
     model = LeWM(
         nn.Identity(),
         Predictor(
