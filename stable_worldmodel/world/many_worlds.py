@@ -1,10 +1,11 @@
-"""Closed-loop evaluation of multiple weight-bound Worlds with FastCEM."""
+"""Population evaluation of multiple weight-bound Worlds with FastCEM."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from importlib.util import find_spec
 from typing import Any
 
 import gymnasium as gym
@@ -72,19 +73,24 @@ class ManyWorldsEvaluationResults:
 
     The leading dimension of planner tensors is the number of synchronized
     planning calls. The remaining leading dimensions are ``population`` and
-    ``tasks``. Planner tensors stay on the solver device; realized environment
-    actions are copied to the host once per planning call and accumulated here.
+    ``tasks``. Planner tensors stay on the solver device. envX actions and
+    scores also stay device-resident; the Gym backend returns NumPy actions.
     """
 
     model_names: tuple[str, ...]
     planned_actions: torch.Tensor
     planner_costs: torch.Tensor
     planner_variances: torch.Tensor
-    environment_actions: np.ndarray
+    environment_actions: np.ndarray | torch.Tensor
     evaluations: tuple[EvaluationResults, ...]
     compiled: bool
     compile_error: str | None
     population_backend: str
+    simulator_backend: str = 'gym'
+    task_successes: torch.Tensor | None = None
+    task_final_distances: torch.Tensor | None = None
+    scores: torch.Tensor | None = None
+    score_name: str | None = None
 
     @property
     def population_size(self) -> int:
@@ -107,7 +113,9 @@ class ManyWorldsEvaluationResults:
 
     @property
     def fitness(self) -> np.ndarray:
-        """Mean realized environment return per population member, ``(P,)``."""
+        """Configured score, or mean return for the Gym backend, ``(P,)``."""
+        if self.scores is not None:
+            return self.scores.detach().cpu().numpy()
         return self.task_returns.mean(axis=1)
 
     @property
@@ -125,9 +133,9 @@ class ManyWorlds:
     Each input ``World`` must already have a ``WorldModelPolicy`` backed by a
     compatible ``FastCEMSolver``. This preserves the invariant that one World
     owns one concrete model instance and weight set. ``evaluate`` replaces the
-    individual solver calls with one population FastCEM graph at every MPC
-    decision, then steps the real Gymnasium environments with the independently
-    selected plans.
+    individual solver calls with one population FastCEM graph. TwoRooms uses
+    one open-loop envX rollout by default; other environments retain the
+    closed-loop Gymnasium evaluator.
 
     Every LeWM parameter and persistent buffer may differ across Worlds. The
     model architecture, policy preprocessing, action space, and MPC
@@ -140,6 +148,7 @@ class ManyWorlds:
         worlds: Sequence[World],
         *,
         model_names: Sequence[str] | None = None,
+        simulator_backend: str = 'auto',
     ) -> None:
         worlds = tuple(worlds)
         if not worlds:
@@ -157,10 +166,18 @@ class ManyWorlds:
         for model in self.models:
             model.eval()
         self._validate_world_shapes()
-        self.envs = EnvPool.from_envs(
-            [env for world in self.worlds for env in world.envs.envs]
+        self.simulator_backend = self._resolve_simulator_backend(
+            simulator_backend
+        )
+        self.envs = (
+            EnvPool.from_envs(
+                [env for world in self.worlds for env in world.envs.envs]
+            )
+            if self.simulator_backend == 'gym'
+            else self.worlds[0].envs
         )
         self._flat_infos: dict[str, Any] = {}
+        self._jax_rollout = None
 
         if model_names is None:
             model_names = tuple(
@@ -181,9 +198,35 @@ class ManyWorlds:
         *,
         worlds: Sequence[World],
         model_names: Sequence[str] | None = None,
+        simulator_backend: str = 'auto',
     ) -> Self:
         """Named constructor matching ``ManyWorlds.init(worlds=[...])``."""
-        return cls(worlds=worlds, model_names=model_names)
+        return cls(
+            worlds=worlds,
+            model_names=model_names,
+            simulator_backend=simulator_backend,
+        )
+
+    def _resolve_simulator_backend(self, requested: str) -> str:
+        if requested not in {'auto', 'gym', 'envx'}:
+            raise ValueError(
+                "simulator_backend must be 'auto', 'gym', or 'envx'"
+            )
+        first_env = self.worlds[0].envs.envs[0]
+        spec = getattr(first_env, 'spec', None)
+        names = {
+            getattr(spec, 'id', None),
+            getattr(first_env.unwrapped, 'env_name', None),
+        }
+        is_two_rooms = bool({'swm/TwoRoom-v1', 'TwoRoom'} & names)
+        if requested == 'auto':
+            return 'envx' if is_two_rooms and find_spec('envx') else 'gym'
+        if requested == 'envx' and not is_two_rooms:
+            raise ValueError(
+                'the envX ManyWorlds backend currently supports only '
+                'swm/TwoRoom-v1'
+            )
+        return requested
 
     @staticmethod
     def _policy_for(world: World) -> WorldModelPolicy:
@@ -219,8 +262,19 @@ class ManyWorlds:
 
     @property
     def simulator_count(self) -> int:
-        """Number of real Gym environments in the flat ``P * T`` pool."""
+        """Number of independently simulated population/task states."""
+        if self.simulator_backend == 'envx':
+            return self.population_size * self.num_tasks
         return self.envs.num_envs
+
+    @property
+    def bootstrap_simulator_count(self) -> int:
+        """Gym envs stepped/reset for observations by this evaluator."""
+        return (
+            self.num_tasks
+            if self.simulator_backend == 'envx'
+            else self.simulator_count
+        )
 
     @property
     def config(self):
@@ -534,6 +588,29 @@ class ManyWorlds:
             ).reshape(actions.shape)
         return actions.reshape(population, tasks, actions_per_plan, *raw_shape)
 
+    def _environment_plan_tensor(
+        self, planned: torch.Tensor, eval_budget: int
+    ) -> torch.Tensor:
+        """Expand a complete blocked plan on-device for an envX rollout."""
+        population, tasks = planned.shape[:2]
+        raw_shape = self.worlds[0].envs.single_action_space.shape
+        raw_dim = int(np.prod(raw_shape))
+        actions = planned.reshape(
+            population,
+            tasks,
+            self.config.plan_len,
+            raw_dim,
+        )[:, :, :eval_budget]
+        actions = actions.detach().float()
+        process = self.policies[0].process
+        if 'action' in process:
+            actions = (
+                process['action']
+                .inverse_transform(actions.reshape(-1, raw_dim))
+                .reshape(population, tasks, eval_budget, raw_dim)
+            )
+        return actions.reshape(population, tasks, eval_budget, *raw_shape)
+
     def _step_worlds(self, actions: np.ndarray, alive: np.ndarray) -> None:
         flat_actions = actions.reshape(
             self.simulator_count, *actions.shape[2:]
@@ -572,8 +649,11 @@ class ManyWorlds:
         model_queries: list[list[dict[str, Any]]],
         *,
         record: bool,
+        selected_horizon: int | None = None,
     ) -> None:
         """Preserve each policy's ordinary post-plan observer contract."""
+        if selected_horizon is None:
+            selected_horizon = self.config.receding_horizon
         for world_index, policy in enumerate(self.policies):
             task_indices = np.flatnonzero(alive[world_index]).tolist()
             if not task_indices:
@@ -607,12 +687,233 @@ class ManyWorlds:
                 'env_indices': tuple(task_indices),
                 'controller_input': controller_input,
                 'solver_output': solver_output,
-                'selected_plan': actions[:, : self.config.receding_horizon],
+                'selected_plan': actions[:, :selected_horizon],
             }
             if record:
                 model_queries[world_index].append(recordable(event))
             if policy.on_plan is not None:
                 policy.on_plan(event)
+
+    def _reset_envx(
+        self, protocol: EvaluationProtocol, eval_budget: int
+    ) -> dict[str, Any]:
+        """Reset only the task-sized Gym pool used for initial/goal pixels."""
+        first = self.worlds[0]
+        first._reset_from_protocol(protocol, eval_budget)
+        for world in self.worlds[1:]:
+            env = world.envs.envs[0]
+            spec = getattr(env, 'spec', None)
+            accepted_names = {
+                getattr(spec, 'id', None),
+                getattr(env.unwrapped, 'env_name', None),
+            }
+            if protocol.environment not in accepted_names:
+                raise ValueError(
+                    f'protocol environment {protocol.environment!r} does not '
+                    f'match World environment {getattr(spec, "id", None)!r}'
+                )
+            if world.num_envs != len(protocol.tasks):
+                raise ValueError(
+                    'protocol evaluation requires one World env per task'
+                )
+        for policy in self.policies[1:]:
+            policy.reset_state()
+
+        # Pixel preprocessing is performed for T initial/goal frames, not P*T.
+        task_info = self.policies[0]._prepare_info(first.infos)
+        population_info = {}
+        for key, value in task_info.items():
+            if torch.is_tensor(value) and value.size(0) == self.num_tasks:
+                population_info[key] = value.unsqueeze(0).expand(
+                    self.population_size, *value.shape
+                )
+            elif (
+                isinstance(value, np.ndarray)
+                and value.shape[0] == self.num_tasks
+            ):
+                population_info[key] = np.broadcast_to(
+                    value[None], (self.population_size, *value.shape)
+                )
+        return population_info
+
+    @staticmethod
+    def _score_envx(
+        protocol: EvaluationProtocol,
+        successes: torch.Tensor,
+        distances: torch.Tensor,
+    ) -> tuple[str, torch.Tensor]:
+        score_name = str(dict(protocol.metadata).get('score', 'distance'))
+        if score_name == 'success':
+            return score_name, successes.float().mean(dim=1)
+        if score_name == 'distance':
+            image_diagonal = float(np.hypot(224, 224))
+            return score_name, 1.0 - distances.float().mean(
+                dim=1
+            ) / image_diagonal
+        raise ValueError(
+            "envX protocol metadata score must be 'distance' or 'success', "
+            f'got {score_name!r}'
+        )
+
+    def _update_world_envx_info(
+        self,
+        final_observations: torch.Tensor,
+        successes: torch.Tensor,
+        distances: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Expose final envX metrics through the existing World info API."""
+        observations = final_observations.detach().cpu().numpy()
+        success_values = successes.detach().cpu().numpy().astype(bool)
+        distance_values = distances.detach().cpu().numpy()
+        final_actions = actions[:, :, -1].detach().cpu().numpy()
+        for index, world in enumerate(self.worlds):
+            info = dict(self.worlds[0].infos)
+            info['state'] = observations[index, :, None, :2]
+            info['proprio'] = observations[index, :, None, :2]
+            info['distance_to_target'] = distance_values[index, :, None]
+            info['terminated'] = success_values[index, :, None]
+            world.infos = info
+            world.envs._stacked_infos = info
+            world.rewards = np.zeros(self.num_tasks, dtype=np.float32)
+            world.terminateds = success_values[index]
+            world.truncateds = np.zeros(self.num_tasks, dtype=bool)
+            world.actions = final_actions[index]
+        return observations, success_values, distance_values
+
+    @torch.inference_mode()
+    def _evaluate_envx(
+        self,
+        protocol: EvaluationProtocol,
+        *,
+        solver: FastCEMSolver,
+        eval_budget: int,
+        record: bool,
+    ) -> ManyWorldsEvaluationResults:
+        """Plan once and score every full plan in one compiled envX rollout."""
+        if record:
+            raise ValueError(
+                'envX ManyWorlds rollouts do not materialize per-step records'
+            )
+        if eval_budget > self.config.plan_len:
+            raise ValueError(
+                f'eval_budget {eval_budget} exceeds the generated plan length '
+                f'{self.config.plan_len}'
+            )
+
+        info = self._reset_envx(protocol, eval_budget)
+        seeds = info.get('controller_seed')
+        noise = solver._batch_noise(
+            self.num_tasks,
+            0,
+            None if seeds is None else seeds[0],
+            np.zeros((self.num_tasks, 1), dtype=np.int64),
+        )
+        output = solver.solve_population(info, self.models, noise=noise)
+        planned = output['actions']
+        model_queries: list[list[dict[str, Any]]] = [
+            [] for _ in range(self.population_size)
+        ]
+        self._notify_plans(
+            info,
+            output,
+            np.ones((self.population_size, self.num_tasks), dtype=bool),
+            model_queries,
+            record=False,
+            selected_horizon=self.config.horizon,
+        )
+        actions = self._environment_plan_tensor(planned, eval_budget)
+
+        from .jax_two_rooms import JaxTwoRoomsRollout
+
+        if (
+            self._jax_rollout is None
+            or self._jax_rollout.eval_budget != eval_budget
+        ):
+            self._jax_rollout = JaxTwoRoomsRollout(
+                population_size=self.population_size,
+                num_tasks=self.num_tasks,
+                eval_budget=eval_budget,
+            )
+        initial_state = self._jax_rollout.initial_state(self.worlds[0])
+        outcome = self._jax_rollout(initial_state, actions)
+        score_name, scores = self._score_envx(
+            protocol, outcome.successes, outcome.final_distances
+        )
+        _, success_values, distance_values = self._update_world_envx_info(
+            outcome.final_observations,
+            outcome.successes,
+            outcome.final_distances,
+            actions,
+        )
+        control_costs = actions.float().square().sum(dim=(2, 3)).cpu().numpy()
+        returns = outcome.returns.detach().cpu().numpy()
+        path_costs = outcome.path_costs.detach().cpu().numpy()
+        collisions = outcome.collisions.detach().cpu().numpy()
+
+        evaluations = tuple(
+            EvaluationResults(
+                backend=self.model_names[population_index],
+                backend_type=(
+                    f'{type(self.models[population_index]).__module__}.'
+                    f'{type(self.models[population_index]).__qualname__}'
+                ),
+                protocol_digest=protocol.digest,
+                episodes=tuple(
+                    EpisodeResult(
+                        task_key=task.key,
+                        environment_seed=task.environment_seed,
+                        controller_seed=task.controller_seed,
+                        success=bool(
+                            success_values[population_index, task_index]
+                        ),
+                        episode_return=float(
+                            returns[population_index, task_index]
+                        ),
+                        length=eval_budget,
+                        path_cost=float(
+                            path_costs[population_index, task_index]
+                        ),
+                        control_cost=float(
+                            control_costs[population_index, task_index]
+                        ),
+                        collisions=int(
+                            collisions[population_index, task_index]
+                        ),
+                        constraint_violations=0,
+                    )
+                    for task_index, task in enumerate(protocol.tasks)
+                ),
+                model_queries=tuple(model_queries[population_index]),
+                metadata={
+                    'split': protocol.split,
+                    'environment': protocol.environment,
+                    'eval_budget': eval_budget,
+                    'population_index': population_index,
+                    'simulator_backend': 'envx',
+                    'mean_final_distance': float(
+                        distance_values[population_index].mean()
+                    ),
+                },
+            )
+            for population_index in range(self.population_size)
+        )
+        return ManyWorldsEvaluationResults(
+            model_names=self.model_names,
+            planned_actions=planned.unsqueeze(0),
+            planner_costs=output['costs'].unsqueeze(0),
+            planner_variances=output['var'][0].unsqueeze(0),
+            environment_actions=actions,
+            evaluations=evaluations,
+            compiled=bool(output['compiled']),
+            compile_error=output['compile_error'],
+            population_backend=output['population_backend'] or 'unknown',
+            simulator_backend='envx',
+            task_successes=outcome.successes,
+            task_final_distances=outcome.final_distances,
+            scores=scores,
+            score_name=score_name,
+        )
 
     @torch.inference_mode()
     def evaluate(
@@ -623,13 +924,13 @@ class ManyWorlds:
         eval_budget: int | None = None,
         record: bool = False,
     ) -> ManyWorldsEvaluationResults:
-        """Evaluate all Worlds with one population FastCEM call per replan.
+        """Evaluate all Worlds with population-batched FastCEM.
 
         This is the population analogue of
-        ``tuple(world.evaluate(protocol=protocol) for world in worlds)``. Real
-        Gym environments still execute on the host through one flat ``P*T``
-        pool. There is no per-World solver call or model loop: CEM and model
-        ranking both carry the population axis on the accelerator.
+        ``tuple(world.evaluate(protocol=protocol) for world in worlds)``.
+        There is no per-World solver call or model loop: CEM and model ranking
+        both carry the population axis on the accelerator. TwoRooms plans are
+        executed by envX; other environments use one flat ``P*T`` Gym pool.
         """
         if not isinstance(protocol, EvaluationProtocol):
             raise TypeError('protocol must be an EvaluationProtocol')
@@ -644,6 +945,13 @@ class ManyWorlds:
             config=self.config,
         )
         self._validate_population(solver)
+        if self.simulator_backend == 'envx':
+            return self._evaluate_envx(
+                protocol,
+                solver=solver,
+                eval_budget=eval_budget,
+                record=record,
+            )
         self._reset(protocol, eval_budget)
 
         population, tasks = self.population_size, self.num_tasks
@@ -863,6 +1171,7 @@ class ManyWorlds:
             compiled=all(compiled),
             compile_error=solver.compile_error,
             population_backend=solver.population_backend or 'unknown',
+            simulator_backend='gym',
         )
 
 
