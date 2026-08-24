@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from torch.func import functional_call, stack_module_state, vmap
 
+_CUDA_SDPA_GRID_Y_LIMIT = 65_535
+
 
 class _LeWMTerminalCost(nn.Module):
     """Internal FastCEM adapter for terminal LeWM goal distance."""
@@ -288,15 +290,34 @@ class _LeWMModelPopulationCost(nn.Module):
 
     def forward(self, candidates, current, goal, history, *state):
         parameters, buffers = self._unpack_state(state)
-        return self._call_population(
-            self.template,
-            parameters,
-            buffers,
-            candidates,
-            current,
-            goal,
-            history,
-        )
+        try:
+            return self._call_population(
+                self.template,
+                parameters,
+                buffers,
+                candidates,
+                current,
+                goal,
+                history,
+            )
+        except RuntimeError as error:
+            if 'CUDA error: invalid argument' not in str(error):
+                raise
+            population, tasks, samples = candidates.shape[:3]
+            effective_batch = population * tasks * samples
+            max_population = _CUDA_SDPA_GRID_Y_LIMIT // (tasks * samples)
+            max_samples = _CUDA_SDPA_GRID_Y_LIMIT // (population * tasks)
+            raise RuntimeError(
+                'CUDA rejected the unsplit population FastCEM model-scoring '
+                'launch. This is commonly caused by scaled-dot-product '
+                'attention exceeding CUDA grid-y limits: '
+                f'population={population}, tasks={tasks}, samples={samples}, '
+                f'effective_attention_batch={effective_batch}. No automatic '
+                'tiling or fallback is performed. For the usual CUDA grid-y '
+                f'limit of {_CUDA_SDPA_GRID_Y_LIMIT}, use population <= '
+                f'{max_population} with the current tasks/samples, or samples '
+                f'<= {max_samples} with the current population/tasks.'
+            ) from error
 
 
 __all__: list[str] = []

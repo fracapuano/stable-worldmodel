@@ -49,6 +49,9 @@ env = [
     "shapely",
     "ogbench",
     "minigrid",
+    # Gymnasium-Robotics 1.4.2 is incompatible with MuJoCo 3.12's enum
+    # equality semantics. Keep the last working release until upstream fixes it.
+    "mujoco<3.12",
     "gymnasium[all]",
     "gymnasium-robotics",
     "opencv-python-headless",
@@ -68,8 +71,21 @@ lerobot = [
     "lerobot>=0.4.4,<0.5; python_version >= '3.12'",
 ]
 
+manyworlds-jax = [
+    "envx @ git+https://github.com/fracapuano/envX.git@main; python_version >= '3.11' and python_version < '3.13'",
+    "mujoco<3.12; python_version >= '3.11' and python_version < '3.13'",
+    "mujoco-mjx<3.12; python_version >= '3.11' and python_version < '3.13'",
+]
+
+manyworlds-jax-cuda13 = [
+    "envx[cuda13] @ git+https://github.com/fracapuano/envX.git@main; sys_platform == 'linux' and python_version >= '3.11' and python_version < '3.13'",
+    "mujoco<3.12; sys_platform == 'linux' and python_version >= '3.11' and python_version < '3.13'",
+    "mujoco-mjx<3.12; sys_platform == 'linux' and python_version >= '3.11' and python_version < '3.13'",
+]
+
 all = [
-    "stable-worldmodel[train,env,format]",
+    "stable-worldmodel[train,env,format,manyworlds-jax]",
+    "stable-worldmodel[manyworlds-jax-cuda13]; sys_platform == 'linux'",
 ]
 
 [dependency-groups]

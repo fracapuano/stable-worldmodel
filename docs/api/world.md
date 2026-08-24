@@ -164,9 +164,22 @@ Non-array values (strings, nested objects) stay as a Python list of length `num_
 
 `ManyWorlds` composes existing, weight-bound `World` instances and replaces
 their separate FastCEM calls with one population FastCEM graph. Every model
-retains its own CEM mean, variance, elite set, selected plan, realized
-environment state, and MPC warm start. Task-specific CEM random numbers are
-shared across the population for paired comparisons.
+retains its own CEM mean, variance, elite set, and selected plan. Task-specific
+CEM random numbers are shared across the population for paired comparisons.
+
+For `swm/TwoRoom-v1`, the default `simulator_backend="auto"` uses envX. It
+prepares the initial and goal pixels with only the first task-sized Gym pool,
+plans the complete `horizon * action_block` sequence once, and executes all
+`population * tasks` plans in one state-only JAX rollout. Actions and final
+metrics cross the Torch/JAX boundary with DLPack and remain on the accelerator.
+Install the CUDA 12 path with:
+
+```bash
+pip install "stable-worldmodel[manyworlds-jax-cuda12]"
+```
+
+The portable CPU extra is `stable-worldmodel[manyworlds-jax]`. Both currently
+require Python 3.11 or 3.12 because that is envX's supported range.
 
 ```python
 import stable_worldmodel as swm
@@ -208,19 +221,24 @@ results.planned_actions.shape  # (planning_calls, models, tasks, horizon, blocke
 results.planner_costs.shape    # (planning_calls, models, tasks)
 results.environment_actions.shape  # (models, tasks, env_steps, action_dim)
 results.task_returns.shape     # (models, tasks)
-results.fitness.shape          # (models,), mean return across tasks
+results.scores.shape           # (models,), device-resident TwoRooms score
+results.fitness.shape          # (models,), host view of scores/mean returns
+results.task_final_distances.shape  # (models, tasks), device-resident
 results.population_backend     # "functional_vmap"
+results.simulator_backend      # "envx" for TwoRooms, otherwise "gym"
 
 # Standard realized World results, one entry per model:
 results.evaluations[0].episodes
 ```
 
-Closed-loop replanning, history, action blocks, warm starts, and early
-termination are supported. Every LeWM parameter and persistent buffer may
-differ across Worlds, including the observation encoder, action encoder,
-projector, predictor, and prediction projector. The source models remain
-ordinary modules with native parameter shapes. Before planning, their complete
-parameters and buffers are stacked onto a leading population axis.
+The envX path is deliberately open-loop: `eval_budget` may not exceed
+`horizon * action_block`, and per-step records are not materialized. It plans
+from the initial frame, matching the existing history warm-up behavior. Set
+`simulator_backend="gym"` when closed-loop replanning, filled histories, warm
+starts, early termination, or transition records are required.
+Every LeWM parameter and persistent buffer may differ across Worlds, including
+the observation encoder, action encoder, projector, predictor, and prediction
+projector.
 
 The population axis runs through the complete FastCEM path. Means, variances,
 sampled candidates, model costs, elite selection, and warm starts have leading
@@ -234,11 +252,9 @@ same path supports arbitrary differences in model parameters and buffers.
 Backend support for individual operations determines performance on a
 particular accelerator.
 
-Model architecture, preprocessing, action spaces, and `PlanConfig` must
-match, and every model must already reside on the solver device. Real rollout
-uses one flat pool of `models * tasks` Gymnasium environments and one flat step
-call per decision. `EnvPool` is still a synchronous host runner internally;
-that boundary is ready to be replaced by an async or GPU simulator later.
+Model architecture, preprocessing, action spaces, and `PlanConfig` must match,
+and every model must already reside on the solver device. Non-TwoRooms worlds
+continue to use the synchronous flat Gym pool.
 
 ::: stable_worldmodel.world.ManyWorlds
     options:
@@ -247,6 +263,7 @@ that boundary is ready to be replaced by an async or GPU simulator later.
           - init
           - population_size
           - simulator_count
+          - bootstrap_simulator_count
           - evaluate
           - close
         show_source: false
