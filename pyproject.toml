@@ -85,7 +85,6 @@ manyworlds-jax-cuda13 = [
 
 all = [
     "stable-worldmodel[train,env,format,manyworlds-jax]",
-    "stable-worldmodel[manyworlds-jax-cuda13]; sys_platform == 'linux'",
 ]
 
 [dependency-groups]

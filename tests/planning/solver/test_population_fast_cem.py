@@ -292,3 +292,33 @@ def test_population_preparation_uses_each_models_ordinary_encoder():
     assert current.shape == (3, 2, 1, 1)
     assert goal.shape == (3, 2, 1)
     assert history.shape == (3, 2, 0, 2)
+
+
+@pytest.mark.parametrize('cached_key', ['emb', 'goal_emb'])
+def test_population_preparation_accepts_independently_cached_embeddings(
+    cached_key,
+):
+    models = tuple(CountingEncoderModel().eval() for _ in range(2))
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(models[0], GoalMSE()),
+        num_samples=4,
+        n_steps=2,
+        topk=2,
+        compile_kernel=False,
+    )
+    _configure(solver, tasks=1)
+    pixels = torch.randn(2, 1, 1, 1)
+    goal = torch.randn(2, 1, 1, 1)
+    info = (
+        {'emb': pixels.clone(), 'goal': goal}
+        if cached_key == 'emb'
+        else {'pixels': pixels, 'goal_emb': goal.clone()}
+    )
+
+    current, prepared_goal, history, *_state = solver.prepare_population(
+        info, models
+    )
+
+    torch.testing.assert_close(current, pixels)
+    torch.testing.assert_close(prepared_goal, goal[:, :, 0])
+    assert history.shape == (2, 1, 0, 2)

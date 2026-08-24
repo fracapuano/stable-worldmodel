@@ -73,8 +73,8 @@ class ManyWorldsEvaluationResults:
 
     The leading dimension of planner tensors is the number of synchronized
     planning calls. The remaining leading dimensions are ``population`` and
-    ``tasks``. Planner tensors stay on the solver device. envX actions and
-    scores also stay device-resident; the Gym backend returns NumPy actions.
+    ``tasks``. Planner tensors and TwoRoom scores stay on the solver device.
+    envX actions are device-resident; the Gym backend returns NumPy actions.
     """
 
     model_names: tuple[str, ...]
@@ -113,7 +113,7 @@ class ManyWorldsEvaluationResults:
 
     @property
     def fitness(self) -> np.ndarray:
-        """Configured score, or mean return for the Gym backend, ``(P,)``."""
+        """TwoRoom score, or mean return for other environments, ``(P,)``."""
         if self.scores is not None:
             return self.scores.detach().cpu().numpy()
         return self.task_returns.mean(axis=1)
@@ -737,11 +737,12 @@ class ManyWorlds:
         return population_info
 
     @staticmethod
-    def _score_envx(
+    def _score_two_rooms(
         protocol: EvaluationProtocol,
         successes: torch.Tensor,
         distances: torch.Tensor,
     ) -> tuple[str, torch.Tensor]:
+        """Aggregate per-task TwoRoom outcomes identically across backends."""
         score_name = str(dict(protocol.metadata).get('score', 'distance'))
         if score_name == 'success':
             return score_name, successes.float().mean(dim=1)
@@ -751,35 +752,9 @@ class ManyWorlds:
                 dim=1
             ) / image_diagonal
         raise ValueError(
-            "envX protocol metadata score must be 'distance' or 'success', "
+            "TwoRoom protocol metadata score must be 'distance' or 'success', "
             f'got {score_name!r}'
         )
-
-    def _update_world_envx_info(
-        self,
-        final_observations: torch.Tensor,
-        successes: torch.Tensor,
-        distances: torch.Tensor,
-        actions: torch.Tensor,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Expose final envX metrics through the existing World info API."""
-        observations = final_observations.detach().cpu().numpy()
-        success_values = successes.detach().cpu().numpy().astype(bool)
-        distance_values = distances.detach().cpu().numpy()
-        final_actions = actions[:, :, -1].detach().cpu().numpy()
-        for index, world in enumerate(self.worlds):
-            info = dict(self.worlds[0].infos)
-            info['state'] = observations[index, :, None, :2]
-            info['proprio'] = observations[index, :, None, :2]
-            info['distance_to_target'] = distance_values[index, :, None]
-            info['terminated'] = success_values[index, :, None]
-            world.infos = info
-            world.envs._stacked_infos = info
-            world.rewards = np.zeros(self.num_tasks, dtype=np.float32)
-            world.terminateds = success_values[index]
-            world.truncateds = np.zeros(self.num_tasks, dtype=bool)
-            world.actions = final_actions[index]
-        return observations, success_values, distance_values
 
     @torch.inference_mode()
     def _evaluate_envx(
@@ -837,15 +812,13 @@ class ManyWorlds:
             )
         initial_state = self._jax_rollout.initial_state(self.worlds[0])
         outcome = self._jax_rollout(initial_state, actions)
-        score_name, scores = self._score_envx(
+        score_name, scores = self._score_two_rooms(
             protocol, outcome.successes, outcome.final_distances
         )
-        _, success_values, distance_values = self._update_world_envx_info(
-            outcome.final_observations,
-            outcome.successes,
-            outcome.final_distances,
-            actions,
+        success_values = (
+            outcome.successes.detach().cpu().numpy().astype(bool)
         )
+        distance_values = outcome.final_distances.detach().cpu().numpy()
         control_costs = actions.float().square().sum(dim=(2, 3)).cpu().numpy()
         returns = outcome.returns.detach().cpu().numpy()
         path_costs = outcome.path_costs.detach().cpu().numpy()
@@ -963,6 +936,28 @@ class ManyWorlds:
         collisions = np.zeros((population, tasks), dtype=np.int64)
         violations = np.zeros((population, tasks), dtype=np.int64)
         successes = np.zeros((population, tasks), dtype=bool)
+        final_distances = (
+            np.asarray(
+                [
+                    [
+                        float(
+                            np.asarray(
+                                self._info_at(
+                                    world,
+                                    'distance_to_target',
+                                    task,
+                                )
+                            ).reshape(-1)[-1]
+                        )
+                        for task in range(tasks)
+                    ]
+                    for world in self.worlds
+                ],
+                dtype=np.float32,
+            )
+            if protocol.environment in {'swm/TwoRoom-v1', 'TwoRoom'}
+            else None
+        )
         previous_states = [
             [self._state_at(world, task) for task in range(tasks)]
             for world in self.worlds
@@ -1063,6 +1058,16 @@ class ManyWorlds:
                     successes[world_index, task_index] |= bool(
                         world.terminateds[task_index]
                     )
+                    if final_distances is not None:
+                        final_distances[world_index, task_index] = float(
+                            np.asarray(
+                                self._info_at(
+                                    world,
+                                    'distance_to_target',
+                                    int(task_index),
+                                )
+                            ).reshape(-1)[-1]
+                        )
                     control_costs[world_index, task_index] += float(
                         np.square(action).sum()
                     )
@@ -1161,6 +1166,24 @@ class ManyWorlds:
             for world_index in range(population)
         )
 
+        task_successes = None
+        task_final_distances = None
+        scores = None
+        score_name = None
+        if final_distances is not None:
+            result_device = planned_actions[0].device
+            task_successes = torch.as_tensor(
+                successes, device=result_device, dtype=torch.bool
+            )
+            task_final_distances = torch.as_tensor(
+                final_distances,
+                device=result_device,
+                dtype=torch.float32,
+            )
+            score_name, scores = self._score_two_rooms(
+                protocol, task_successes, task_final_distances
+            )
+
         return ManyWorldsEvaluationResults(
             model_names=self.model_names,
             planned_actions=torch.stack(planned_actions),
@@ -1172,6 +1195,10 @@ class ManyWorlds:
             compile_error=solver.compile_error,
             population_backend=solver.population_backend or 'unknown',
             simulator_backend='gym',
+            task_successes=task_successes,
+            task_final_distances=task_final_distances,
+            scores=scores,
+            score_name=score_name,
         )
 
 

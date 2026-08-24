@@ -174,11 +174,20 @@ def test_many_worlds_envx_returns_device_resident_population_scores() -> None:
             - result.task_final_distances.float().mean(dim=1)
             / math.hypot(224, 224),
         )
-        for population_index, world in enumerate(worlds):
-            np.testing.assert_allclose(
-                np.asarray(world.infos['distance_to_target'])[:, -1],
-                result.task_final_distances[population_index].cpu().numpy(),
-            )
+        # envX outcomes belong to the result object; they must not be published
+        # as the state of Gym environments which were never stepped.
+        starts = np.asarray([task.start for task in _protocol().tasks])
+        actual = np.stack(
+            [
+                np.asarray(wrapped.unwrapped.agent_position)
+                for wrapped in worlds[0].envs.envs
+            ]
+        )
+        np.testing.assert_allclose(actual, starts)
+        np.testing.assert_allclose(
+            np.asarray(worlds[0].infos['state'])[:, -1], starts
+        )
+        assert worlds[1].infos == {}
     finally:
         many.close()
 
@@ -186,8 +195,43 @@ def test_many_worlds_envx_returns_device_resident_population_scores() -> None:
 def test_many_worlds_envx_supports_success_score() -> None:
     successes = torch.tensor([[True, False], [True, True]])
     distances = torch.zeros(2, 2)
-    name, scores = swm.ManyWorlds._score_envx(
+    name, scores = swm.ManyWorlds._score_two_rooms(
         _protocol(score='success'), successes, distances
     )
     assert name == 'success'
     torch.testing.assert_close(scores, torch.tensor([0.5, 1.0]))
+
+
+def test_many_worlds_two_room_score_matches_gym_backend() -> None:
+    protocol = _protocol()
+    backend_results = {}
+    for backend in ('gym', 'envx'):
+        worlds = [_world(1.0), _world(-1.0)]
+        many = swm.ManyWorlds(worlds=worlds, simulator_backend=backend)
+        try:
+            backend_results[backend] = many.evaluate(
+                protocol,
+                solver=worlds[0].policy.solver,
+                # One complete action block keeps both paths open-loop and
+                # isolates simulator/score parity from replanning semantics.
+                eval_budget=2,
+            )
+        finally:
+            many.close()
+
+    gym_result = backend_results['gym']
+    envx_result = backend_results['envx']
+    assert gym_result.score_name == envx_result.score_name == 'distance'
+    torch.testing.assert_close(
+        gym_result.task_final_distances,
+        envx_result.task_final_distances,
+        rtol=1e-6,
+        atol=2e-5,
+    )
+    torch.testing.assert_close(
+        gym_result.scores,
+        envx_result.scores,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(gym_result.fitness, envx_result.fitness)
