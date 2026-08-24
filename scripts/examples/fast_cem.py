@@ -9,13 +9,6 @@ Pass ``--video`` to save one agent/goal video per task and planner.
 
 import argparse
 
-from stable_worldmodel.planning import (
-    FastCEMSolver,
-    GoalMSE,
-    ShootingCostEvaluator,
-)
-from stable_worldmodel.policy import WorldModelPolicy
-
 from commons import (
     ACTION_PROCESS,
     CHECKPOINT,
@@ -28,6 +21,10 @@ from commons import (
     pixel_transforms,
     video_dir,
 )
+
+from stable_worldmodel.planning import FastCEMSolver
+from stable_worldmodel.policy import WorldModelPolicy
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
 
 VIDEO_DIR = video_dir('fast_cem')
 
@@ -60,7 +57,7 @@ def evaluate(
 
     policy = WorldModelPolicy(
         solver=FastCEMSolver(
-            cost=ShootingCostEvaluator(model, GoalMSE()),
+            cost=LeWMGoalMSETensorCost(model),
             batch_size=len(eval_protocol.tasks),
             num_samples=num_samples,
             n_steps=n_steps,

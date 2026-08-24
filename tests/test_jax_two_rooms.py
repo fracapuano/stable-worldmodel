@@ -12,11 +12,8 @@ from torch import nn
 
 import stable_worldmodel as swm
 from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationTask
-from stable_worldmodel.planning import (
-    FastCEMSolver,
-    GoalMSE,
-    ShootingCostEvaluator,
-)
+from stable_worldmodel.planning import FastCEMSolver
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
 from stable_worldmodel.world.jax_two_rooms import JaxTwoRoomsRollout
 
 pytestmark = pytest.mark.skipif(
@@ -86,7 +83,7 @@ def _protocol(*, score: str = 'distance') -> EvaluationProtocol:
 def _world(direction: float) -> swm.World:
     model = TinyTwoRoomsModel(direction).eval()
     solver = FastCEMSolver(
-        ShootingCostEvaluator(model, GoalMSE()),
+        LeWMGoalMSETensorCost(model),
         batch_size=2,
         num_samples=4,
         n_steps=1,

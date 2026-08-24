@@ -10,11 +10,8 @@ from torch import nn
 
 import stable_worldmodel as swm
 from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationTask
-from stable_worldmodel.planning import (
-    FastCEMSolver,
-    GoalMSE,
-    ShootingCostEvaluator,
-)
+from stable_worldmodel.planning import FastCEMSolver, TensorPlanningCost
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
 from stable_worldmodel.world.many_worlds import _same_device
 
 ENV_ID = 'ManyWorldsTest-v0'
@@ -101,6 +98,48 @@ class DirectionalWorldModel(nn.Module):
         return torch.cat([context, future], dim=2)
 
 
+class DirectDirectionalCost(TensorPlanningCost):
+    """Planning cost with no model, encoder, or LeWM-style API."""
+
+    def __init__(self, direction: float):
+        super().__init__()
+        self.direction = nn.Parameter(torch.tensor(direction))
+
+    @staticmethod
+    def _tensor(info, key, *, device, dtype):
+        return torch.as_tensor(info[key], device=device, dtype=dtype)
+
+    def prepare(self, info, *, device, dtype, action_dim):
+        del action_dim
+        current = self._tensor(info, 'emb', device=device, dtype=dtype)[:, -1]
+        goal = self._tensor(info, 'goal_emb', device=device, dtype=dtype)[
+            :, -1
+        ]
+        return current, goal
+
+    def prepare_population(
+        self,
+        info,
+        *,
+        call_population,
+        device,
+        dtype,
+        action_dim,
+    ):
+        del call_population, action_dim
+        current = self._tensor(info, 'emb', device=device, dtype=dtype)[
+            :, :, -1
+        ]
+        goal = self._tensor(info, 'goal_emb', device=device, dtype=dtype)[
+            :, :, -1
+        ]
+        return current, goal
+
+    def forward(self, candidates, current, goal):
+        terminal = current[:, None] + self.direction * candidates.sum(dim=2)
+        return (terminal - goal[:, None]).square().sum(-1)
+
+
 def _protocol() -> EvaluationProtocol:
     return EvaluationProtocol(
         split='fitness',
@@ -141,7 +180,7 @@ def _world(
     )
     model = DirectionalWorldModel(direction, shared=shared).eval()
     solver = FastCEMSolver(
-        ShootingCostEvaluator(model, GoalMSE()),
+        LeWMGoalMSETensorCost(model),
         batch_size=2,
         num_samples=64,
         n_steps=3,
@@ -172,6 +211,45 @@ def _many_worlds(**kwargs):
     assert not any(model.training for model in many.models)
     solver = first.policy.solver
     return many, solver, (first_model, second_model)
+
+
+def _direct_cost_world(direction: float) -> swm.World:
+    solver = FastCEMSolver(
+        DirectDirectionalCost(direction),
+        batch_size=2,
+        num_samples=16,
+        n_steps=2,
+        topk=4,
+        compile_kernel=False,
+    )
+    policy = swm.policy.WorldModelPolicy(
+        solver=solver,
+        config=swm.PlanConfig(horizon=2, receding_horizon=1),
+        history_keys=('emb',),
+    )
+    world = swm.World(
+        ENV_ID,
+        num_envs=2,
+        max_episode_steps=1,
+        add_pixels=False,
+    )
+    world.set_policy(policy)
+    return world
+
+
+def test_many_worlds_does_not_require_a_world_model_interface() -> None:
+    worlds = (_direct_cost_world(1.0), _direct_cost_world(-1.0))
+    many = swm.ManyWorlds(worlds)
+    try:
+        result = many.evaluate(
+            _protocol(), solver=worlds[0].policy.solver, eval_budget=1
+        )
+
+        assert many.models == many.tensor_costs
+        assert result.planned_actions.shape == (1, 2, 2, 2, 1)
+        assert result.population_backend == 'functional_vmap'
+    finally:
+        many.close()
 
 
 def test_many_worlds_matches_individual_closed_loop_evaluations() -> None:

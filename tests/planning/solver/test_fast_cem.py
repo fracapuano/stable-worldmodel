@@ -14,6 +14,7 @@ from stable_worldmodel.planning.solver import CEMSolver, FastCEMSolver
 from stable_worldmodel.policy import PlanConfig, WorldModelPolicy
 from stable_worldmodel.wm.lewm.lewm import LeWM
 from stable_worldmodel.wm.lewm.module import Predictor
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
 
 
 class TargetCost(nn.Module):
@@ -115,7 +116,7 @@ def test_eager_path_matches_reference_cem(manifest_streams):
     assert actual['costs'] == pytest.approx(expected['costs'])
 
 
-def test_standard_shooting_cost_automatically_uses_fast_path():
+def test_lewm_tensor_adapter_matches_standard_shooting_cost():
     torch.manual_seed(0)
     model = TinyDynamics()
     kwargs = dict(
@@ -127,7 +128,7 @@ def test_standard_shooting_cost_automatically_uses_fast_path():
         seed=17,
     )
     reference = CEMSolver(ShootingCostEvaluator(model, GoalMSE()), **kwargs)
-    cost = ShootingCostEvaluator(model, GoalMSE())
+    cost = LeWMGoalMSETensorCost(model)
     fast = FastCEMSolver(cost, compile_kernel=False, **kwargs)
     _configure(reference)
     _configure(fast)
@@ -183,7 +184,7 @@ def test_standard_cost_supports_receding_horizon_and_warm_start():
             return super().solve(info, init_action)
 
     solver = RecordingSolver(
-        ShootingCostEvaluator(TinyDynamics(), GoalMSE()),
+        LeWMGoalMSETensorCost(TinyDynamics()),
         num_samples=8,
         n_steps=2,
         topk=2,
@@ -294,7 +295,7 @@ def test_real_lewm_standard_cost_is_fully_capturable():
         nn.Linear(2, 4),
     ).eval()
     solver = FastCEMSolver(
-        ShootingCostEvaluator(model, GoalMSE()),
+        LeWMGoalMSETensorCost(model),
         num_samples=4,
         n_steps=2,
         topk=2,

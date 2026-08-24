@@ -9,6 +9,33 @@ Solvers optimize action sequences against a [`Costable`][stable_worldmodel.plann
 
 `rollout(info_dict, action_candidates)` receives **strictly-future** candidates of shape `(B, S, horizon, action_dim)`. Observation context arrives via the info dict: `pixels` holds `H = history_len` frames `(B, S, H, C, h, w)`, and when `H > 1` the executed action blocks *between* those frames are supplied as `action_history` `(B, S, H - 1, action_dim)` — frozen inputs, never optimizer variables. Inside the rollout, context frame `k` pairs with the action block leaving it (`action_history[k]` for past frames; the **first candidate** for the current frame), matching the training-time `(frame[t], action[t])` alignment. The output `predicted_emb` has shape `(B, S, H + horizon, dim)` with the first `H` entries being the encoded context — objectives that read anything other than the last step must account for this ([`GoalMSE`][stable_worldmodel.planning.GoalMSE] reads `[..., -1:, :]` and is unaffected).
 
+### FastCEM tensor-cost adapters
+
+`FastCEMSolver` deliberately does not inspect a world model or a
+`ShootingCostEvaluator`. It executes a pure-tensor cost with three operations:
+
+- `prepare(info, ...)` prepares one task batch once before CEM refinement.
+- `prepare_population(info, call_population=..., ...)` prepares a
+  `(population, tasks, ...)` batch. Adapters use `call_population` when this
+  preparation depends on each member's parameters, such as image encoding.
+- `forward(candidates, *prepared)` returns costs shaped `(tasks, samples)` for
+  one population member.
+
+The LeWM implementation is intentionally separate:
+
+```python
+from stable_worldmodel.planning import FastCEMSolver
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
+
+solver = FastCEMSolver(LeWMGoalMSETensorCost(model))
+```
+
+Other model families can implement
+[`TensorPlanningCost`][stable_worldmodel.planning.TensorPlanningCost] without
+changing FastCEM or ManyWorlds. All members of one population must use the same
+tensor-cost type and state schema, but the executor makes no assumptions about
+encoders, rollout APIs, task keys, or objectives.
+
 
 
 ## **[ Quick Tour ]**
@@ -87,6 +114,13 @@ class SmoothnessPenalty(nn.Module):
 ::: stable_worldmodel.planning.ShootingCostEvaluator.criterion
 
 ::: stable_worldmodel.planning.default_goal_encode
+
+## **[ Accelerated Tensor Costs ]**
+
+::: stable_worldmodel.planning.TensorPlanningCost
+    options:
+        heading_level: 3
+        show_source: false
 
 ## **[ Objectives ]**
 

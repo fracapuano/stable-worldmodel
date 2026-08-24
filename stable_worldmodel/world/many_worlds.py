@@ -131,16 +131,15 @@ class ManyWorlds:
     """Compose weight-bound :class:`World` instances into one population run.
 
     Each input ``World`` must already have a ``WorldModelPolicy`` backed by a
-    compatible ``FastCEMSolver``. This preserves the invariant that one World
-    owns one concrete model instance and weight set. ``evaluate`` replaces the
+    population-capable ``FastCEMSolver`` tensor cost. ``evaluate`` replaces the
     individual solver calls with one population FastCEM graph. TwoRooms uses
     one open-loop envX rollout by default; other environments retain the
     closed-loop Gymnasium evaluator.
 
-    Every LeWM parameter and persistent buffer may differ across Worlds. The
-    model architecture, policy preprocessing, action space, and MPC
-    configuration must remain identical so the population stays one tensor
-    program.
+    Every tensor-cost parameter and persistent buffer may differ across
+    Worlds. The tensor-cost program, policy preprocessing, action space, and
+    MPC configuration must remain identical so the population stays one
+    tensor program.
     """
 
     def __init__(
@@ -160,11 +159,14 @@ class ManyWorlds:
 
         self.worlds = worlds
         self.policies = tuple(self._policy_for(world) for world in worlds)
-        self.models = tuple(
-            self._model_for(policy) for policy in self.policies
+        self.tensor_costs = tuple(
+            policy.solver.tensor_cost for policy in self.policies
         )
-        for model in self.models:
-            model.eval()
+        self.models = tuple(
+            self._model_for(cost) for cost in self.tensor_costs
+        )
+        for cost in self.tensor_costs:
+            cost.eval()
         self._validate_world_shapes()
         self.simulator_backend = self._resolve_simulator_backend(
             simulator_backend
@@ -244,13 +246,10 @@ class ManyWorlds:
         return policy
 
     @staticmethod
-    def _model_for(policy: WorldModelPolicy) -> nn.Module:
-        model = getattr(policy.solver.cost, 'model', None)
-        if not isinstance(model, nn.Module):
-            raise TypeError(
-                'each FastCEM cost must expose its world model as cost.model'
-            )
-        return model
+    def _model_for(cost: nn.Module) -> nn.Module:
+        """Retain the underlying model as a compatibility/metadata view."""
+        model = getattr(cost, 'model', None)
+        return model if isinstance(model, nn.Module) else cost
 
     @property
     def population_size(self) -> int:
@@ -288,7 +287,7 @@ class ManyWorlds:
     def _validate_world_shapes(self) -> None:
         first_world = self.worlds[0]
         first_policy = self.policies[0]
-        first_model = self.models[0]
+        first_cost = self.tensor_costs[0]
         first_solver = first_policy.solver
         first_space = first_world.envs.single_action_space
         if not isinstance(first_space, gym.spaces.Box):
@@ -296,11 +295,11 @@ class ManyWorlds:
                 'population FastCEM requires a continuous Box action space'
             )
 
-        for index, (world, policy, model) in enumerate(
+        for index, (world, policy, cost) in enumerate(
             zip(
                 self.worlds[1:],
                 self.policies[1:],
-                self.models[1:],
+                self.tensor_costs[1:],
                 strict=True,
             ),
             start=1,
@@ -326,9 +325,9 @@ class ManyWorlds:
                 or not np.array_equal(space.high, first_space.high)
             ):
                 raise ValueError('all Worlds must use the same action space')
-            if type(model) is not type(first_model):
+            if type(cost) is not type(first_cost):
                 raise TypeError(
-                    'all world models must have the same concrete type'
+                    'all Worlds must use the same tensor-cost type'
                 )
             for attribute in (
                 'batch_size',
@@ -349,29 +348,31 @@ class ManyWorlds:
     def _validate_population(self, solver: FastCEMSolver) -> None:
         if not isinstance(solver, FastCEMSolver):
             raise TypeError('solver must be a FastCEMSolver')
-        if getattr(solver._tensor_cost, 'model', None) is not self.models[0]:
-            raise ValueError("solver must use the first World's FastCEM model")
+        if solver.tensor_cost is not self.tensor_costs[0]:
+            raise ValueError(
+                "solver must use the first World's FastCEM tensor cost"
+            )
 
-        base_state = self.models[0].state_dict()
+        base_state = self.tensor_costs[0].state_dict()
         expected_device = torch.device(solver.device)
-        for index, model in enumerate(self.models):
-            state = model.state_dict()
+        for index, cost in enumerate(self.tensor_costs):
+            state = cost.state_dict()
             if state.keys() != base_state.keys():
                 raise ValueError(
-                    f'model {index} has a different state-dict schema'
+                    f'tensor cost {index} has a different state-dict schema'
                 )
             for name, reference in base_state.items():
                 value = state[name]
                 if value.shape != reference.shape:
                     raise ValueError(
-                        f'model {index} state tensor {name!r} has shape '
+                        f'tensor cost {index} state tensor {name!r} has shape '
                         f'{tuple(value.shape)}, expected {tuple(reference.shape)}'
                     )
                 if value.dtype != reference.dtype or not _same_device(
                     value.device, expected_device
                 ):
                     raise ValueError(
-                        f'model {index} state tensor {name!r} must use '
+                        f'tensor cost {index} state tensor {name!r} must use '
                         f'{expected_device}/{reference.dtype}'
                     )
 
@@ -784,7 +785,7 @@ class ManyWorlds:
             None if seeds is None else seeds[0],
             np.zeros((self.num_tasks, 1), dtype=np.int64),
         )
-        output = solver.solve_population(info, self.models, noise=noise)
+        output = solver.solve_population(info, self.tensor_costs, noise=noise)
         planned = output['actions']
         model_queries: list[list[dict[str, Any]]] = [
             [] for _ in range(self.population_size)
@@ -1009,7 +1010,7 @@ class ManyWorlds:
                 )
                 output = solver.solve_population(
                     info,
-                    self.models,
+                    self.tensor_costs,
                     noise=noise,
                     init_action=next_init,
                 )

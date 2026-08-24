@@ -10,14 +10,11 @@ import torch
 from gymnasium import spaces
 from torch import nn
 
-from stable_worldmodel.planning import (
-    FastCEMSolver,
-    GoalMSE,
-    ShootingCostEvaluator,
-)
+from stable_worldmodel.planning import FastCEMSolver, TensorPlanningCost
 from stable_worldmodel.policy import PlanConfig
 from stable_worldmodel.wm.lewm.lewm import LeWM
 from stable_worldmodel.wm.lewm.module import Predictor
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
 
 
 def _model() -> LeWM:
@@ -37,6 +34,10 @@ def _model() -> LeWM:
         ),
         action_encoder=nn.Linear(2, 4),
     ).eval()
+
+
+def _cost(model: nn.Module) -> LeWMGoalMSETensorCost:
+    return LeWMGoalMSETensorCost(model).eval()
 
 
 def _configure(solver, tasks=2):
@@ -65,6 +66,72 @@ class CountingEncoderModel(nn.Module):
         return emb[:, None, -1] + actions.sum(dim=(-1, -2))[..., None]
 
 
+class QuadraticActionCost(TensorPlanningCost):
+    """Population-capable tensor cost with no world-model concepts."""
+
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(scale))
+
+    @staticmethod
+    def _target(info, *, device, dtype):
+        return torch.as_tensor(info['target'], device=device, dtype=dtype)
+
+    def prepare(self, info, *, device, dtype, action_dim):
+        del action_dim
+        return (self._target(info, device=device, dtype=dtype),)
+
+    def prepare_population(
+        self,
+        info,
+        *,
+        call_population,
+        device,
+        dtype,
+        action_dim,
+    ):
+        del call_population, action_dim
+        return (self._target(info, device=device, dtype=dtype),)
+
+    def forward(self, candidates, target):
+        desired = target[:, None] * self.scale
+        return (candidates - desired).square().sum(dim=(-1, -2))
+
+
+def test_population_executor_is_model_agnostic():
+    costs = (QuadraticActionCost(1.0).eval(), QuadraticActionCost(-1.0).eval())
+    kwargs = {
+        'batch_size': 2,
+        'num_samples': 24,
+        'n_steps': 3,
+        'topk': 6,
+        'compile_kernel': False,
+    }
+    population = FastCEMSolver(costs[0], **kwargs)
+    serial = tuple(FastCEMSolver(cost, **kwargs) for cost in costs)
+    for solver in (population, *serial):
+        _configure(solver)
+
+    info = {'target': torch.randn(2, 2, 3, 2)}
+    noise = population.sample_noise(2)
+    actual = population.solve_population(info, costs, noise=noise)
+    expected = tuple(
+        solver.solve_tensors(
+            solver.prepare({'target': info['target'][index]}), noise=noise
+        )
+        for index, solver in enumerate(serial)
+    )
+
+    torch.testing.assert_close(
+        actual['actions'],
+        torch.stack(tuple(output['actions'] for output in expected)),
+    )
+    torch.testing.assert_close(
+        actual['costs'],
+        torch.stack(tuple(output['costs'] for output in expected)),
+    )
+
+
 def test_population_fast_cem_matches_independent_fast_cem_solves():
     torch.manual_seed(4)
     first = _model()
@@ -74,6 +141,7 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
             parameter.add_(0.01 * torch.randn_like(parameter))
 
     models = (first, second)
+    costs = tuple(_cost(model) for model in models)
     kwargs = {
         'batch_size': 2,
         'num_samples': 24,
@@ -81,13 +149,8 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
         'topk': 6,
         'compile_kernel': False,
     }
-    serial = tuple(
-        FastCEMSolver(ShootingCostEvaluator(model, GoalMSE()), **kwargs)
-        for model in models
-    )
-    population = FastCEMSolver(
-        ShootingCostEvaluator(first, GoalMSE()), **kwargs
-    )
+    serial = tuple(FastCEMSolver(cost, **kwargs) for cost in costs)
+    population = FastCEMSolver(costs[0], **kwargs)
     for solver in (*serial, population):
         _configure(solver)
 
@@ -97,7 +160,7 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
     }
     noise = population.sample_noise(2)
 
-    actual = population.solve_population(info, models, noise=noise)
+    actual = population.solve_population(info, costs, noise=noise)
     assert population.population_backend == 'functional_vmap'
     expected = tuple(
         solver.solve_tensors(
@@ -124,12 +187,13 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
 def test_population_models_keep_native_parameter_shapes():
     first = _model()
     second = deepcopy(first)
+    costs = (_cost(first), _cost(second))
     expected = tuple(
         tuple(parameter.shape for parameter in model.parameters())
         for model in (first, second)
     )
     solver = FastCEMSolver(
-        ShootingCostEvaluator(first, GoalMSE()),
+        costs[0],
         num_samples=4,
         n_steps=2,
         topk=2,
@@ -142,7 +206,7 @@ def test_population_models_keep_native_parameter_shapes():
             'emb': torch.randn(2, 1, 1, 4),
             'goal_emb': torch.randn(2, 1, 1, 4),
         },
-        (first, second),
+        costs,
     )
 
     assert expected == tuple(
@@ -158,8 +222,9 @@ def test_population_stacks_complete_model_state():
     with torch.no_grad():
         for parameter in second.predictor.parameters():
             parameter.add_(0.01 * torch.randn_like(parameter))
+    costs = (_cost(first), _cost(second))
     solver = FastCEMSolver(
-        ShootingCostEvaluator(first, GoalMSE()),
+        costs[0],
         num_samples=8,
         n_steps=2,
         topk=2,
@@ -171,14 +236,14 @@ def test_population_stacks_complete_model_state():
         'emb': torch.randn(2, 1, 1, 4),
         'goal_emb': torch.randn(2, 1, 1, 4),
     }
-    prepared = solver.prepare_population(info, (first, second))
+    prepared = solver.prepare_population(info, costs)
     population_state = prepared[3:]
     assert len(population_state) == len(
         tuple(first.parameters()) + tuple(first.buffers())
     )
     assert all(value.size(0) == 2 for value in population_state)
 
-    output = solver.solve_population(info, (first, second))
+    output = solver.solve_population(info, costs)
 
     assert output['population_backend'] == 'functional_vmap'
     assert output['actions'].shape == (2, 1, 3, 2)
@@ -187,8 +252,9 @@ def test_population_stacks_complete_model_state():
 def test_population_fast_cem_compiles_as_one_full_graph():
     first = _model()
     second = deepcopy(first)
+    costs = (_cost(first), _cost(second))
     solver = FastCEMSolver(
-        ShootingCostEvaluator(first, GoalMSE()),
+        costs[0],
         num_samples=4,
         n_steps=2,
         topk=2,
@@ -203,7 +269,7 @@ def test_population_fast_cem_compiles_as_one_full_graph():
             'emb': torch.randn(2, 1, 1, 4),
             'goal_emb': torch.randn(2, 1, 1, 4),
         },
-        (first, second),
+        costs,
     )
 
     assert output['actions'].shape == (2, 1, 3, 2)
@@ -211,11 +277,12 @@ def test_population_fast_cem_compiles_as_one_full_graph():
     assert output['population_backend'] == 'functional_vmap'
 
 
-def test_population_fast_cem_requires_solver_model_first():
+def test_population_fast_cem_requires_solver_cost_first():
     first = _model()
     second = deepcopy(first)
+    first_cost, second_cost = _cost(first), _cost(second)
     solver = FastCEMSolver(
-        ShootingCostEvaluator(first, GoalMSE()),
+        first_cost,
         num_samples=4,
         n_steps=2,
         topk=2,
@@ -223,20 +290,21 @@ def test_population_fast_cem_requires_solver_model_first():
     )
     _configure(solver, tasks=1)
 
-    with pytest.raises(ValueError, match='first population model'):
+    with pytest.raises(ValueError, match='first population tensor cost'):
         solver.prepare_population(
             {
                 'emb': torch.randn(1, 1, 1, 4),
                 'goal_emb': torch.randn(1, 1, 1, 4),
             },
-            (second,),
+            (second_cost,),
         )
 
 
 def test_population_fast_cem_explains_cuda_launch_limit(monkeypatch):
     models = (_model(), _model())
+    costs = tuple(_cost(model) for model in models)
     solver = FastCEMSolver(
-        ShootingCostEvaluator(models[0], GoalMSE()),
+        costs[0],
         num_samples=4,
         n_steps=2,
         topk=2,
@@ -248,7 +316,7 @@ def test_population_fast_cem_explains_cuda_launch_limit(monkeypatch):
             'emb': torch.randn(2, 1, 1, 4),
             'goal_emb': torch.randn(2, 1, 1, 4),
         },
-        models,
+        costs,
     )
     assert solver._population_loop is not None
 
@@ -262,15 +330,16 @@ def test_population_fast_cem_explains_cuda_launch_limit(monkeypatch):
 
     message = str(raised.value)
     assert 'population=2, tasks=1, samples=4' in message
-    assert 'effective_attention_batch=8' in message
+    assert 'effective_candidate_batch=8' in message
     assert 'No automatic tiling or fallback is performed' in message
     assert raised.value.__cause__ is not None
 
 
 def test_population_preparation_uses_each_models_ordinary_encoder():
     models = tuple(CountingEncoderModel().eval() for _ in range(3))
+    costs = tuple(_cost(model) for model in models)
     solver = FastCEMSolver(
-        ShootingCostEvaluator(models[0], GoalMSE()),
+        costs[0],
         num_samples=4,
         n_steps=2,
         topk=2,
@@ -283,7 +352,7 @@ def test_population_preparation_uses_each_models_ordinary_encoder():
             'pixels': torch.randn(3, 2, 1, 1),
             'goal': torch.randn(3, 2, 1, 1),
         },
-        models,
+        costs,
     )
 
     # One functional/vmapped Python dispatch covers the whole population.
@@ -299,8 +368,9 @@ def test_population_preparation_accepts_independently_cached_embeddings(
     cached_key,
 ):
     models = tuple(CountingEncoderModel().eval() for _ in range(2))
+    costs = tuple(_cost(model) for model in models)
     solver = FastCEMSolver(
-        ShootingCostEvaluator(models[0], GoalMSE()),
+        costs[0],
         num_samples=4,
         n_steps=2,
         topk=2,
@@ -316,7 +386,7 @@ def test_population_preparation_accepts_independently_cached_embeddings(
     )
 
     current, prepared_goal, history, *_state = solver.prepare_population(
-        info, models
+        info, costs
     )
 
     torch.testing.assert_close(current, pixels)

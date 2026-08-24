@@ -1,32 +1,29 @@
-"""Pure-tensor terminal cost for LeWM planning."""
+"""Model-agnostic tensor costs and functional population execution."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
 from torch import nn
 from torch.func import functional_call, stack_module_state, vmap
 
-_CUDA_SDPA_GRID_Y_LIMIT = 65_535
+_CUDA_GRID_Y_LIMIT = 65_535
+PopulationCall = Callable[..., Any]
 
 
-class _LeWMTerminalCost(nn.Module):
-    """Internal FastCEM adapter for terminal LeWM goal distance."""
+class TensorPlanningCost(nn.Module, ABC):
+    """Pure-tensor planning cost understood by :class:`FastCEMSolver`.
 
-    def __init__(
-        self, model: nn.Module, *, history_size: int | None = None
-    ) -> None:
-        super().__init__()
-        self.model = model
-        self.history_size = history_size
+    Implementations own every model-specific decision: which task inputs are
+    required, how candidate-independent context is prepared, how a rollout is
+    produced, and how that rollout is scored. The population executor only
+    stacks module state and maps these tensor operations over population.
+    """
 
-    @staticmethod
-    def supports(model: nn.Module) -> bool:
-        """Whether the model exposes the LeWM inference operations we need."""
-        return callable(getattr(model, 'rollout_from_embeddings', None))
-
+    @abstractmethod
     def prepare(
         self,
         info: dict[str, Any],
@@ -34,83 +31,72 @@ class _LeWMTerminalCost(nn.Module):
         device: str | torch.device,
         dtype: torch.dtype,
         action_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare candidate-independent observation, goal, and history."""
+    ) -> tuple[torch.Tensor, ...]:
+        """Prepare one task batch for repeated candidate scoring."""
 
-        def tensor(key):
-            return torch.as_tensor(info[key], device=device, dtype=dtype)
+    @abstractmethod
+    def prepare_population(
+        self,
+        info: dict[str, Any],
+        *,
+        call_population: PopulationCall,
+        device: str | torch.device,
+        dtype: torch.dtype,
+        action_dim: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """Prepare a population/task batch.
 
-        current = (
-            tensor('emb')
-            if 'emb' in info
-            else self.model.encode({'pixels': tensor('pixels')})['emb']
-        )
-        goal = (
-            tensor('goal_emb')[:, -1]
-            if 'goal_emb' in info
-            else self.model.encode({'pixels': tensor('goal')[:, -1:]})['emb'][
-                :, 0
-            ]
-        )
-        history = (
-            tensor('action_history')
-            if 'action_history' in info
-            else current.new_zeros(
-                current.size(0), current.size(1) - 1, action_dim
-            )
-        )
-        expected = (current.size(0), current.size(1) - 1, action_dim)
-        if history.shape != expected:
-            raise ValueError(f'expected action_history shape {expected}')
-        return current.detach(), goal.detach(), history.detach()
-
-    def forward(self, candidates, current, goal, history):
-        terminal = self.model.rollout_from_embeddings(
-            current,
-            candidates,
-            action_history=history,
-            history_size=self.history_size,
-            terminal_only=True,
-        )
-        return (terminal - goal[:, None]).square().sum(-1)
+        ``call_population(module, *tensors)`` executes ``module`` once under
+        ``functional_call``/``vmap`` using the complete stacked state of the
+        population costs. An adapter uses it only when preparation itself
+        depends on each member's parameters, such as observation encoding.
+        Every returned tensor must start with ``(population, tasks)``.
+        """
 
 
-class _LeWMEncoder(nn.Module):
-    """Functional-call wrapper for one model observation encoding."""
-
-    def __init__(self, model: nn.Module) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(self, pixels: torch.Tensor):
-        return self.model.encode({'pixels': pixels})['emb']
+def is_tensor_planning_cost(cost: Any) -> bool:
+    """Whether ``cost`` provides the scalar FastCEM tensor contract."""
+    return (
+        isinstance(cost, nn.Module)
+        and callable(getattr(cost, 'prepare', None))
+        and type(cost).forward is not nn.Module.forward
+    )
 
 
-class _LeWMModelPopulationCost(nn.Module):
-    """Score all independent LeWMs in one population-batched tensor call.
+def is_population_tensor_cost(cost: Any) -> bool:
+    """Whether ``cost`` additionally supports population preparation."""
+    return is_tensor_planning_cost(cost) and callable(
+        getattr(cost, 'prepare_population', None)
+    )
 
-    Fully independent model parameters and buffers are stacked on a leading
-    population axis for ``torch.func.vmap``, avoiding a Python model loop
-    inside the CEM refinement kernel.
+
+class FunctionalPopulationCost(nn.Module):
+    """Evaluate independent tensor costs with one population ``vmap``.
+
+    Members must use one tensor program (the same concrete cost type and state
+    schema), while their complete parameters and persistent buffers may differ.
+    No model architecture, rollout convention, or objective is assumed here.
     """
 
-    def __init__(
-        self,
-        models: Sequence[nn.Module],
-        *,
-        history_size: int | None = None,
-    ) -> None:
+    def __init__(self, costs: Sequence[nn.Module]) -> None:
         super().__init__()
-        models = tuple(models)
-        if not models:
-            raise ValueError('model population cannot be empty')
-        if not all(_LeWMTerminalCost.supports(model) for model in models):
+        costs = tuple(costs)
+        if not costs:
+            raise ValueError('tensor cost population cannot be empty')
+        if not all(is_population_tensor_cost(cost) for cost in costs):
             raise TypeError(
-                'every population member must support LeWM tensor rollouts'
+                'every population member must implement the tensor cost '
+                'prepare(...), prepare_population(...), and forward(...) '
+                'contract'
             )
-        self.template = _LeWMTerminalCost(models[0], history_size=history_size)
-        self.encoder = _LeWMEncoder(models[0])
-        self._population_size = len(models)
+        first_type = type(costs[0])
+        if any(type(cost) is not first_type for cost in costs[1:]):
+            raise TypeError(
+                'all population tensor costs must have the same concrete type'
+            )
+        self.template = costs[0]
+        self._population_size = len(costs)
+        self._members = costs
         self._parameter_names: tuple[str, ...] = ()
         self._buffer_names: tuple[str, ...] = ()
 
@@ -122,14 +108,27 @@ class _LeWMModelPopulationCost(nn.Module):
     def backend(self) -> str:
         return 'functional_vmap'
 
-    def stack_state(
-        self, models: Sequence[nn.Module]
-    ) -> tuple[torch.Tensor, ...]:
-        """Stack all model parameters and buffers on a population axis."""
-        costs = tuple(
-            _LeWMTerminalCost(model, history_size=self.template.history_size)
-            for model in models
+    @property
+    def state_size(self) -> int:
+        return len(self._parameter_names) + len(self._buffer_names)
+
+    def matches(self, costs: Sequence[nn.Module]) -> bool:
+        costs = tuple(costs)
+        return len(costs) == len(self._members) and all(
+            cost is member
+            for cost, member in zip(costs, self._members, strict=True)
         )
+
+    def stack_state(
+        self, costs: Sequence[nn.Module]
+    ) -> tuple[torch.Tensor, ...]:
+        """Stack complete cost state on a leading population axis."""
+        costs = tuple(costs)
+        if len(costs) != self.population_size:
+            raise ValueError(
+                f'expected {self.population_size} tensor costs, got '
+                f'{len(costs)}'
+            )
         parameters, buffers = stack_module_state(costs)
         parameter_names = tuple(parameters)
         buffer_names = tuple(buffers)
@@ -154,10 +153,9 @@ class _LeWMModelPopulationCost(nn.Module):
     def _unpack_state(
         self, state: tuple[torch.Tensor, ...]
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        expected = len(self._parameter_names) + len(self._buffer_names)
-        if len(state) != expected:
+        if len(state) != self.state_size:
             raise ValueError(
-                f'expected {expected} population state tensors, got '
+                f'expected {self.state_size} population state tensors, got '
                 f'{len(state)}'
             )
         split = len(self._parameter_names)
@@ -192,54 +190,74 @@ class _LeWMModelPopulationCost(nn.Module):
         dtype: torch.dtype,
         action_dim: int,
     ) -> tuple[torch.Tensor, ...]:
-        """Encode all population observations in one functional batch."""
-
-        def tensor(key):
-            return torch.as_tensor(info[key], device=device, dtype=dtype)
-
+        """Delegate population preparation to the tensor-cost adapter."""
         parameters, buffers = self._unpack_state(state)
-        if 'emb' in info:
-            current = tensor('emb')
-        else:
-            current = self._call_population(
-                self.encoder, parameters, buffers, tensor('pixels')
-            )
-        if 'goal_emb' in info:
-            goal = tensor('goal_emb')[:, :, -1]
-        else:
-            goal = self._call_population(
-                self.encoder,
-                parameters,
-                buffers,
-                tensor('goal')[:, :, -1:],
-            )[:, :, 0]
 
-        history = (
-            tensor('action_history')
-            if 'action_history' in info
-            else current.new_zeros(
-                current.size(0),
-                current.size(1),
-                current.size(2) - 1,
-                action_dim,
-            )
-        )
-        expected = (
-            current.size(0),
-            current.size(1),
-            current.size(2) - 1,
-            action_dim,
-        )
-        if tuple(history.shape) != expected:
-            raise ValueError(f'expected action_history shape {expected}')
-        return (
-            current.detach(),
-            goal.detach(),
-            history.detach(),
-            *state,
-        )
+        def call_population(module, *args):
+            return self._call_population(module, parameters, buffers, *args)
 
-    def forward(self, candidates, current, goal, history, *state):
+        prepared = self.template.prepare_population(
+            info,
+            call_population=call_population,
+            device=device,
+            dtype=dtype,
+            action_dim=action_dim,
+        )
+        if not isinstance(prepared, tuple) or not prepared:
+            raise TypeError(
+                'prepare_population must return a non-empty tuple of tensors'
+            )
+        if any(not torch.is_tensor(value) for value in prepared):
+            raise TypeError('population preparation returned a non-tensor')
+        self._validate_prepared_inputs(prepared)
+        return (*prepared, *state)
+
+    def _split_prepared(
+        self, prepared: tuple[torch.Tensor, ...]
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        if self.state_size:
+            if len(prepared) <= self.state_size:
+                raise ValueError('prepared population inputs are missing')
+            return prepared[: -self.state_size], prepared[-self.state_size :]
+        return prepared, ()
+
+    def _validate_prepared_inputs(
+        self, prepared: tuple[torch.Tensor, ...]
+    ) -> int:
+        first = prepared[0]
+        if first.ndim < 2 or first.size(0) != self.population_size:
+            raise ValueError(
+                'population-prepared tensors must start with population and '
+                'task axes'
+            )
+        tasks = first.size(1)
+        if any(
+            value.ndim < 2
+            or value.size(0) != self.population_size
+            or value.size(1) != tasks
+            for value in prepared
+        ):
+            raise ValueError(
+                'all population-prepared tensors must share population and '
+                'task axes'
+            )
+        return tasks
+
+    def validate_prepared(self, prepared: tuple[torch.Tensor, ...]) -> int:
+        """Validate a prepared tuple and return its task count."""
+        inputs, state = self._split_prepared(prepared)
+        tasks = self._validate_prepared_inputs(inputs)
+        if any(
+            value.ndim < 1 or value.size(0) != self.population_size
+            for value in state
+        ):
+            raise ValueError(
+                'stacked cost state must carry the population axis'
+            )
+        return tasks
+
+    def forward(self, candidates, *prepared):
+        inputs, state = self._split_prepared(prepared)
         parameters, buffers = self._unpack_state(state)
         try:
             return self._call_population(
@@ -247,28 +265,32 @@ class _LeWMModelPopulationCost(nn.Module):
                 parameters,
                 buffers,
                 candidates,
-                current,
-                goal,
-                history,
+                *inputs,
             )
         except RuntimeError as error:
             if 'CUDA error: invalid argument' not in str(error):
                 raise
             population, tasks, samples = candidates.shape[:3]
             effective_batch = population * tasks * samples
-            max_population = _CUDA_SDPA_GRID_Y_LIMIT // (tasks * samples)
-            max_samples = _CUDA_SDPA_GRID_Y_LIMIT // (population * tasks)
+            max_population = _CUDA_GRID_Y_LIMIT // (tasks * samples)
+            max_samples = _CUDA_GRID_Y_LIMIT // (population * tasks)
             raise RuntimeError(
-                'CUDA rejected the unsplit population FastCEM model-scoring '
-                'launch. This is commonly caused by scaled-dot-product '
-                'attention exceeding CUDA grid-y limits: '
+                'CUDA rejected the unsplit population FastCEM tensor-cost '
+                'launch. A common cause is a batched kernel, including '
+                'scaled-dot-product attention, exceeding CUDA grid limits: '
                 f'population={population}, tasks={tasks}, samples={samples}, '
-                f'effective_attention_batch={effective_batch}. No automatic '
+                f'effective_candidate_batch={effective_batch}. No automatic '
                 'tiling or fallback is performed. For the usual CUDA grid-y '
-                f'limit of {_CUDA_SDPA_GRID_Y_LIMIT}, use population <= '
+                f'limit of {_CUDA_GRID_Y_LIMIT}, use population <= '
                 f'{max_population} with the current tasks/samples, or samples '
                 f'<= {max_samples} with the current population/tasks.'
             ) from error
 
 
-__all__: list[str] = []
+__all__ = [
+    'FunctionalPopulationCost',
+    'PopulationCall',
+    'TensorPlanningCost',
+    'is_population_tensor_cost',
+    'is_tensor_planning_cost',
+]

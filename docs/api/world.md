@@ -14,7 +14,7 @@ import stable_worldmodel as swm
 from stable_worldmodel.policy import RandomPolicy
 
 world = swm.World(
-    env_name="swm/PushT-v1",
+    env_name='swm/PushT-v1',
     num_envs=4,
     image_shape=(64, 64),
 )
@@ -34,7 +34,7 @@ import stable_worldmodel as swm
 # rendering with add_pixels=False. `image_shape` is then optional and
 # no `pixels` key is added; the raw observation is lifted into info.
 world = swm.World(
-    env_name="swm/YourEnv-v0",   # your non-pixel env
+    env_name='swm/YourEnv-v0',  # your non-pixel env
     num_envs=4,
     add_pixels=False,
 )
@@ -53,11 +53,11 @@ it is unavailable when `add_pixels=False`.
 ```python
 import stable_worldmodel as swm
 
-world = swm.World("swm/PushT-v1", num_envs=8, image_shape=(64, 64))
+world = swm.World('swm/PushT-v1', num_envs=8, image_shape=(64, 64))
 world.set_policy(expert_policy)
 
 # Roll out 500 episodes in parallel and dump them to an HDF5 file.
-world.collect("data/pusht_expert.h5", episodes=500, seed=0)
+world.collect('data/pusht_expert.h5', episodes=500, seed=0)
 ```
 ///
 
@@ -66,7 +66,7 @@ world.collect("data/pusht_expert.h5", episodes=500, seed=0)
 import stable_worldmodel as swm
 from stable_worldmodel.data import ReplayBuffer
 
-world = swm.World("swm/PushT-v1", num_envs=8, image_shape=(64, 64))
+world = swm.World('swm/PushT-v1', num_envs=8, image_shape=(64, 64))
 world.set_policy(policy)
 
 # Pass any object implementing the Writer protocol (e.g. ReplayBuffer)
@@ -84,10 +84,10 @@ fill / sample / dump workflow.
 results = world.evaluate(
     episodes=100,
     seed=42,
-    video="videos/",          # optional: mp4 per episode
+    video='videos/',  # optional: mp4 per episode
 )
 
-print(f"Success rate: {results['success_rate']:.1f}%")
+print(f'Success rate: {results["success_rate"]:.1f}%')
 ```
 ///
 
@@ -101,7 +101,7 @@ results = world.evaluate(
     start_steps=[0, 10, 20, 30],
     goal_offset=30,
     eval_budget=50,
-    video="videos/",
+    video='videos/',
 )
 ```
 ///
@@ -111,9 +111,18 @@ results = world.evaluate(
 
 ```python
 per_env = [
-    {"variation": ["agent.color"], "variation_values": {"agent.color": [255, 0, 0]}},
-    {"variation": ["agent.color"], "variation_values": {"agent.color": [0, 255, 0]}},
-    {"variation": ["agent.color"], "variation_values": {"agent.color": [0, 0, 255]}},
+    {
+        'variation': ['agent.color'],
+        'variation_values': {'agent.color': [255, 0, 0]},
+    },
+    {
+        'variation': ['agent.color'],
+        'variation_values': {'agent.color': [0, 255, 0]},
+    },
+    {
+        'variation': ['agent.color'],
+        'variation_values': {'agent.color': [0, 0, 255]},
+    },
 ]
 world.reset(options=per_env)
 ```
@@ -163,7 +172,7 @@ Non-array values (strings, nested objects) stay as a Python list of length `num_
 ## ManyWorlds
 
 `ManyWorlds` composes existing, weight-bound `World` instances and replaces
-their separate FastCEM calls with one population FastCEM graph. Every model
+their separate FastCEM calls with one population FastCEM graph. Every member
 retains its own CEM mean, variance, elite set, and selected plan. Task-specific
 CEM random numbers are shared across the population for paired comparisons.
 
@@ -187,16 +196,14 @@ sublibraries in the shared process. The portable CPU extra is
 
 ```python
 import stable_worldmodel as swm
-from stable_worldmodel.planning import (
-    FastCEMSolver,
-    GoalMSE,
-    ShootingCostEvaluator,
-)
+from stable_worldmodel.planning import FastCEMSolver
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
+
 
 def make_world(model):
     solver = FastCEMSolver(
-        ShootingCostEvaluator(model, GoalMSE()),
-        device="cuda",
+        LeWMGoalMSETensorCost(model),
+        device='cuda',
         num_samples=100,
         n_steps=15,
         topk=10,
@@ -204,11 +211,11 @@ def make_world(model):
     policy = swm.policy.WorldModelPolicy(
         solver=solver,
         config=plan_config,
-        transform={"pixels": image_transform, "goal": image_transform},
-        process={"action": action_scaler},
+        transform={'pixels': image_transform, 'goal': image_transform},
+        process={'action': action_scaler},
     )
     world = swm.World(
-        "swm/TwoRoom-v1",
+        'swm/TwoRoom-v1',
         num_envs=len(protocol.tasks),
         image_shape=(224, 224),
         max_episode_steps=50,
@@ -216,20 +223,21 @@ def make_world(model):
     world.set_policy(policy)
     return world
 
+
 worlds = [make_world(model) for model in models]
 many = swm.ManyWorlds.init(worlds=worlds)
 results = many.evaluate(protocol, solver=worlds[0].policy.solver)
 
 # Device-resident planner outputs:
 results.planned_actions.shape  # (planning_calls, models, tasks, horizon, blocked_action_dim)
-results.planner_costs.shape    # (planning_calls, models, tasks)
+results.planner_costs.shape  # (planning_calls, models, tasks)
 results.environment_actions.shape  # (models, tasks, env_steps, action_dim)
-results.task_returns.shape     # (models, tasks)
-results.scores.shape           # (models,), device-resident TwoRoom score
-results.fitness.shape          # (models,), host view of score/mean return
+results.task_returns.shape  # (models, tasks)
+results.scores.shape  # (models,), device-resident TwoRoom score
+results.fitness.shape  # (models,), host view of score/mean return
 results.task_final_distances.shape  # (models, tasks), device-resident
-results.population_backend     # "functional_vmap"
-results.simulator_backend      # "envx" for TwoRooms, otherwise "gym"
+results.population_backend  # "functional_vmap"
+results.simulator_backend  # "envx" for TwoRooms, otherwise "gym"
 
 # Standard realized World results, one entry per model:
 results.evaluations[0].episodes
@@ -247,28 +255,31 @@ The envX path is deliberately open-loop: `eval_budget` may not exceed
 from the initial frame, matching the existing history warm-up behavior. Set
 `simulator_backend="gym"` when closed-loop replanning, filled histories, warm
 starts, early termination, or transition records are required.
-Every LeWM parameter and persistent buffer may differ across Worlds, including
-the observation encoder, action encoder, projector, predictor, and prediction
-projector.
+Every tensor-cost parameter and persistent buffer may differ across Worlds. A
+`LeWMGoalMSETensorCost` includes the complete LeWM, so this covers its
+observation encoder, action encoder, projector, predictor, and prediction
+projector. Other model families can provide their own tensor-cost adapters.
 
 The population axis runs through the complete FastCEM path. Means, variances,
 sampled candidates, model costs, elite selection, and warm starts have leading
-shape `(models, tasks, ...)`; candidate scoring is one functional/vmapped model
-call over `(models, tasks, samples, ...)`, with no Python loop over models in a
-CEM refinement. The fixed number of refinements can be captured as one
+shape `(models, tasks, ...)`; candidate scoring is one functional/vmapped
+tensor-cost call over `(models, tasks, samples, ...)`, with no Python loop over population
+members in a CEM refinement. The fixed number of refinements can be captured as one
 compiled graph. The evaluator never partitions the model population or the CEM
 sample batch. If CUDA rejects an oversized unsplit attention launch, the error
 reports the population, task and sample dimensions and suggests explicit
 population or sample limits; it never changes either value automatically.
 
-Population model evaluation uses PyTorch's `functional_call` and `vmap` so the
-same path supports arbitrary differences in model parameters and buffers.
-Backend support for individual operations determines performance on a
-particular accelerator.
+Population cost evaluation uses PyTorch's `functional_call` and `vmap`, so the
+same executor supports arbitrary differences in the adapter's parameters and
+buffers. The executor does not inspect the underlying model, rollout, task
+keys, or planning objective. Backend support for the operations selected by an
+adapter determines performance on a particular accelerator.
 
-Model architecture, preprocessing, action spaces, and `PlanConfig` must match,
-and every model must already reside on the solver device. Non-TwoRooms worlds
-continue to use the synchronous flat Gym pool.
+Tensor-cost type and state schema, preprocessing, action spaces, and
+`PlanConfig` must match, and every tensor cost must already reside on the
+solver device. Underlying models need not expose a common base class.
+Non-TwoRooms worlds continue to use the synchronous flat Gym pool.
 
 ::: stable_worldmodel.world.ManyWorlds
     options:

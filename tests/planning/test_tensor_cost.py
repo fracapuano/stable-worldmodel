@@ -8,7 +8,7 @@ from stable_worldmodel.planning import (
     GoalMSE,
     ShootingCostEvaluator,
 )
-from stable_worldmodel.planning.tensor_cost import _LeWMTerminalCost
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
 
 
 class TinyLatentModel(nn.Module):
@@ -54,6 +54,24 @@ class TinyLatentModel(nn.Module):
         return info
 
 
+class FallbackOnlyModel(nn.Module):
+    """LeWM-style model without rollout_from_embeddings."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()))
+        self.predictor = nn.Identity()
+        self.predictor.num_frames = 3
+        self.action_encoder = nn.Identity()
+
+    def encode(self, info):
+        info['emb'] = info['pixels']
+        return info
+
+    def predict(self, emb, action_emb):
+        return emb + self.scale * action_emb
+
+
 def test_tensor_cost_matches_dictionary_path_and_encodes_once():
     torch.manual_seed(0)
     batch, samples, horizon, action_dim = 2, 5, 3, 2
@@ -72,7 +90,7 @@ def test_tensor_cost_matches_dictionary_path_and_encodes_once():
     )
 
     model = TinyLatentModel()
-    cost = _LeWMTerminalCost(model)
+    cost = LeWMGoalMSETensorCost(model)
     prepared = cost.prepare(
         {'pixels': pixels, 'goal': goal},
         device='cpu',
@@ -88,7 +106,7 @@ def test_tensor_cost_matches_dictionary_path_and_encodes_once():
 
 
 def test_tensor_cost_rejects_mismatched_action_history():
-    cost = _LeWMTerminalCost(TinyLatentModel())
+    cost = LeWMGoalMSETensorCost(TinyLatentModel())
     with pytest.raises(ValueError, match='action_history'):
         cost.prepare(
             {
@@ -100,3 +118,15 @@ def test_tensor_cost_rejects_mismatched_action_history():
             dtype=torch.float32,
             action_dim=2,
         )
+
+
+def test_tensor_cost_preserves_lewm_predict_fallback():
+    cost = LeWMGoalMSETensorCost(FallbackOnlyModel())
+    candidates = torch.tensor([[[[1.0], [2.0]], [[-1.0], [0.5]]]])
+    current = torch.zeros(1, 1, 1)
+    goal = torch.zeros(1, 1)
+    history = torch.zeros(1, 0, 1)
+
+    actual = cost(candidates, current, goal, history)
+
+    torch.testing.assert_close(actual, torch.tensor([[9.0, 0.25]]))

@@ -40,12 +40,9 @@ from torchvision.transforms import v2 as transforms
 
 import stable_worldmodel as swm
 from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationTask
-from stable_worldmodel.planning import (
-    FastCEMSolver,
-    GoalMSE,
-    ShootingCostEvaluator,
-)
+from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.policy import PlanConfig, WorldModelPolicy
+from stable_worldmodel.wm.lewm.tensor_cost import LeWMGoalMSETensorCost
 
 CHECKPOINT = 'quentinll/lewm-pusht'
 ENV_ID = 'swm/PushT-v1'
@@ -204,7 +201,7 @@ def make_world(
         calls['actions'].append(event['selected_plan'].detach())
 
     solver = FastCEMSolver(
-        cost=ShootingCostEvaluator(model, GoalMSE()),
+        cost=LeWMGoalMSETensorCost(model),
         batch_size=len(protocol.tasks),
         num_samples=args.num_samples,
         n_steps=args.n_steps,
