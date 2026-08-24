@@ -25,14 +25,7 @@ class _LeWMTerminalCost(nn.Module):
     @staticmethod
     def supports(model: nn.Module) -> bool:
         """Whether the model exposes the LeWM inference operations we need."""
-        return (
-            callable(getattr(model, 'rollout_from_embeddings', None))
-            or all(
-                callable(getattr(model, name, None))
-                for name in ('encode', 'predict', 'action_encoder')
-            )
-            and hasattr(model, 'predictor')
-        )
+        return callable(getattr(model, 'rollout_from_embeddings', None))
 
     def prepare(
         self,
@@ -71,73 +64,26 @@ class _LeWMTerminalCost(nn.Module):
             raise ValueError(f'expected action_history shape {expected}')
         return current.detach(), goal.detach(), history.detach()
 
-    def _rollout_terminal(self, current, candidates, history):
-        """Run LeWM's existing rollout semantics without retaining its output."""
-        model = self.model
-        batch, samples, horizon = candidates.shape[:3]
-        context_len = current.size(1)
-        history_size = self.history_size
-        if history_size is None:
-            history_size = getattr(model.predictor, 'num_frames', 3)
-
-        frames = list(
-            current[:, None]
-            .expand(batch, samples, -1, -1)
-            .flatten(0, 1)
-            .unbind(1)
-        )
-        actions = candidates.flatten(0, 1)
-        if context_len > 1:
-            actions = torch.cat(
-                [
-                    history[:, None]
-                    .expand(batch, samples, -1, -1)
-                    .flatten(0, 1),
-                    actions,
-                ],
-                dim=1,
-            )
-        action_emb = model.action_encoder(actions)
-
-        for step in range(horizon):
-            lo = max(0, context_len + step - history_size)
-            frames.append(
-                model.predict(
-                    torch.stack(frames[-history_size:], dim=1),
-                    action_emb[:, lo : context_len + step],
-                )[:, -1]
-            )
-            frames = frames[-history_size:]
-
-        return frames[-1].unflatten(0, (batch, samples))
-
     def forward(self, candidates, current, goal, history):
-        rollout = getattr(self.model, 'rollout_from_embeddings', None)
-        terminal = (
-            rollout(
-                current,
-                candidates,
-                action_history=history,
-                history_size=self.history_size,
-                terminal_only=True,
-            )
-            if callable(rollout)
-            else self._rollout_terminal(current, candidates, history)
+        terminal = self.model.rollout_from_embeddings(
+            current,
+            candidates,
+            action_history=history,
+            history_size=self.history_size,
+            terminal_only=True,
         )
         return (terminal - goal[:, None]).square().sum(-1)
 
 
 class _LeWMEncoder(nn.Module):
-    """Functional-call wrapper for one model's current and goal encodings."""
+    """Functional-call wrapper for one model observation encoding."""
 
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
 
-    def forward(self, pixels: torch.Tensor, goal: torch.Tensor):
-        current = self.model.encode({'pixels': pixels})['emb']
-        goal_emb = self.model.encode({'pixels': goal})['emb'][:, 0]
-        return current, goal_emb
+    def forward(self, pixels: torch.Tensor):
+        return self.model.encode({'pixels': pixels})['emb']
 
 
 class _LeWMModelPopulationCost(nn.Module):
@@ -255,13 +201,18 @@ class _LeWMModelPopulationCost(nn.Module):
         if 'emb' in info:
             current = tensor('emb')
         else:
-            pixels = tensor('pixels')
-            goals = tensor('goal')[:, :, -1:]
-            current, goal = self._call_population(
-                self.encoder, parameters, buffers, pixels, goals
+            current = self._call_population(
+                self.encoder, parameters, buffers, tensor('pixels')
             )
         if 'goal_emb' in info:
             goal = tensor('goal_emb')[:, :, -1]
+        else:
+            goal = self._call_population(
+                self.encoder,
+                parameters,
+                buffers,
+                tensor('goal')[:, :, -1:],
+            )[:, :, 0]
 
         history = (
             tensor('action_history')
