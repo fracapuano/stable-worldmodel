@@ -162,28 +162,28 @@ Non-array values (strings, nested objects) stay as a Python list of length `num_
 
 ## ManyWorlds
 
-`ManyWorlds` composes existing, weight-bound `World` instances and replaces
-their separate FastCEM calls with one population FastCEM graph. Every model
-retains its own CEM mean, variance, elite set, and selected plan. Task-specific
+`ManyWorlds` is the opinionated, envX-only population evaluator for
+`swm/TwoRoom-v1`. It composes weight-bound `World` instances and replaces their
+separate FastCEM calls with one population FastCEM graph. Every model retains
+its own CEM mean, variance, elite set, and selected plan, while task-specific
 CEM random numbers are shared across the population for paired comparisons.
 
-For `swm/TwoRoom-v1`, the default `simulator_backend="auto"` uses envX when
-the optional dependency is installed, and otherwise preserves the Gym
-backend. It prepares the initial and goal pixels with only the first task-sized
-Gym pool, plans the complete `horizon * action_block` sequence once, and
-executes all `population * tasks` plans in one state-only JAX rollout. Actions
-and final metrics cross the Torch/JAX boundary with DLPack and remain on the
-accelerator. Install the extra matching PyTorch's CUDA major. For CUDA 13:
+Install the pinned envX revision directly. ManyWorlds currently requires
+Python 3.11 or 3.12. For CPU:
 
 ```bash
-pip install "stable-worldmodel[manyworlds-jax-cuda13]"
+pip install "envx @ git+https://github.com/fracapuano/envX.git@d26c817c1124229c819be574f137cd68bda4380a"
 ```
 
-Installing a different JAX CUDA major from PyTorch can load incompatible cuDNN
-sublibraries in the shared process. The portable CPU extra is
-`stable-worldmodel[manyworlds-jax]`; a CUDA 12 deployment can add envX's own
-`cuda12` extra to that environment. All paths currently require Python 3.11 or
-3.12 because that is envX's supported range.
+For an accelerator, install `envx[cuda12]` or `envx[cuda13]` from that same
+revision, matching PyTorch's CUDA major. Mixing CUDA majors can load
+incompatible cuDNN sublibraries in the shared process.
+
+Only the standard `World("swm/TwoRoom-v1", ...)` wrapper stack is accepted.
+Custom wrappers, other environments, modified action spaces, a missing envX
+installation, and action postprocessors that return NumPy arrays all raise.
+An action `inverse_transform`, when configured, must accept and return a
+same-device `torch.Tensor`.
 
 ```python
 import stable_worldmodel as swm
@@ -229,24 +229,28 @@ results.scores.shape           # (models,), device-resident TwoRoom score
 results.fitness.shape          # (models,), host view of score/mean return
 results.task_final_distances.shape  # (models, tasks), device-resident
 results.population_backend     # "functional_vmap"
-results.simulator_backend      # "envx" for TwoRooms, otherwise "gym"
 
 # Standard realized World results, one entry per model:
 results.evaluations[0].episodes
 ```
 
-For TwoRoom protocols, both Gym and envX use the same task aggregation. Set
-protocol metadata `score="success"` for mean success or `score="distance"`
-for `1 - mean_final_distance / hypot(224, 224)`; distance is the default.
-Other environments retain mean episode return as `fitness`. The envX result is
-self-contained: it does not claim that the constituent Gym `World` instances
-were advanced to the JAX terminal states.
+The first task-sized Gym pool supplies initial and goal observations. FastCEM
+then plans the complete `horizon * action_block` sequence once and envX
+executes all `population * tasks` plans in one state-only JAX rollout. Plans
+and final metrics cross the Torch/JAX boundary with DLPack and remain on the
+accelerator. The returned result is self-contained; the constituent Gym
+environments are not advanced to the envX terminal states.
 
-The envX path is deliberately open-loop: `eval_budget` may not exceed
+This evaluator is deliberately open-loop: `eval_budget` may not exceed
 `horizon * action_block`, and per-step records are not materialized. It plans
-from the initial frame, matching the existing history warm-up behavior. Set
-`simulator_backend="gym"` when closed-loop replanning, filled histories, warm
-starts, early termination, or transition records are required.
+from the initial frame, matching the existing history warm-up behavior.
+Closed-loop replanning, filled histories, warm starts, early termination, and
+transition records are outside the supported path.
+
+Set protocol metadata `score="success"` for mean success or
+`score="distance"` for `1 - mean_final_distance / hypot(224, 224)`; distance
+is the default.
+
 Every LeWM parameter and persistent buffer may differ across Worlds, including
 the observation encoder, action encoder, projector, predictor, and prediction
 projector.
@@ -267,8 +271,7 @@ Backend support for individual operations determines performance on a
 particular accelerator.
 
 Model architecture, preprocessing, action spaces, and `PlanConfig` must match,
-and every model must already reside on the solver device. Non-TwoRooms worlds
-continue to use the synchronous flat Gym pool.
+and every model must already reside on the solver device.
 
 ::: stable_worldmodel.world.ManyWorlds
     options:

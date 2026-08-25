@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 from importlib.util import find_spec
 
+import gymnasium as gym
 import numpy as np
 import pytest
 import torch
@@ -83,7 +85,12 @@ def _protocol(*, score: str = 'distance') -> EvaluationProtocol:
     )
 
 
-def _world(direction: float) -> swm.World:
+def _world(
+    direction: float,
+    *,
+    process=None,
+    extra_wrappers=None,
+) -> swm.World:
     model = TinyTwoRoomsModel(direction).eval()
     solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
@@ -101,12 +108,14 @@ def _world(direction: float) -> swm.World:
             history_len=3,
             action_block=2,
         ),
+        process=process,
     )
     world = swm.World(
         'swm/TwoRoom-v1',
         num_envs=2,
         image_shape=(8, 8),
         max_episode_steps=4,
+        extra_wrappers=extra_wrappers,
     )
     world.set_policy(policy)
     return world
@@ -144,7 +153,6 @@ def test_jax_rollout_uses_torch_dlpack_and_preserves_task_state() -> None:
 def test_many_worlds_envx_returns_device_resident_population_scores() -> None:
     worlds = [_world(1.0), _world(-1.0)]
     many = swm.ManyWorlds(worlds=worlds)
-    assert many.simulator_backend == 'envx'
     assert many.bootstrap_simulator_count == many.num_tasks == 2
     assert many.simulator_count == many.population_size * many.num_tasks == 4
 
@@ -159,7 +167,6 @@ def test_many_worlds_envx_returns_device_resident_population_scores() -> None:
             eval_budget=4,
         )
 
-        assert result.simulator_backend == 'envx'
         assert result.planning_calls == 1
         assert result.planned_actions.shape == (1, 2, 2, 2, 4)
         assert result.environment_actions.shape == (2, 2, 4, 2)
@@ -202,39 +209,69 @@ def test_many_worlds_envx_supports_success_score() -> None:
     torch.testing.assert_close(scores, torch.tensor([0.5, 1.0]))
 
 
-@pytest.mark.parametrize('configured_score', ['distance', 'success'])
-def test_many_worlds_two_room_score_matches_gym_backend(
-    configured_score,
-) -> None:
-    protocol = _protocol(score=configured_score)
-    backend_results = {}
-    for backend in ('gym', 'envx'):
-        worlds = [_world(1.0), _world(-1.0)]
-        many = swm.ManyWorlds(worlds=worlds, simulator_backend=backend)
-        try:
-            backend_results[backend] = many.evaluate(
-                protocol,
-                solver=worlds[0].policy.solver,
-                # One complete action block keeps both paths open-loop and
-                # isolates simulator/score parity from replanning semantics.
-                eval_budget=2,
-            )
-        finally:
-            many.close()
+def test_many_worlds_preserves_the_fast_cem_callback_contract() -> None:
+    worlds = [_world(1.0), _world(-1.0)]
+    events = [[], []]
+    for index, world in enumerate(worlds):
+        world.policy.on_plan = events[index].append
+    many = swm.ManyWorlds(worlds=worlds)
+    try:
+        many.evaluate(
+            _protocol(), solver=worlds[0].policy.solver, eval_budget=2
+        )
 
-    gym_result = backend_results['gym']
-    envx_result = backend_results['envx']
-    assert gym_result.score_name == envx_result.score_name == configured_score
-    torch.testing.assert_close(
-        gym_result.task_final_distances,
-        envx_result.task_final_distances,
-        rtol=1e-6,
-        atol=2e-5,
-    )
-    torch.testing.assert_close(
-        gym_result.scores,
-        envx_result.scores,
-        rtol=1e-6,
-        atol=1e-7,
-    )
-    np.testing.assert_allclose(gym_result.fitness, envx_result.fitness)
+        for population_events in events:
+            assert len(population_events) == 1
+            solver_output = population_events[0]['solver_output']
+            assert solver_output['solve_time_seconds'] > 0
+            assert solver_output['population_backend'] == 'functional_vmap'
+    finally:
+        many.close()
+
+
+def test_many_worlds_rejects_numpy_action_postprocessing() -> None:
+    class NumpyActionProcess:
+        def transform(self, value):
+            return value
+
+        def inverse_transform(self, value):
+            return value.detach().cpu().numpy()
+
+    process = {'action': NumpyActionProcess()}
+    worlds = [_world(1.0, process=process), _world(-1.0, process=process)]
+    many = swm.ManyWorlds(worlds=worlds)
+    try:
+        with pytest.raises(TypeError, match='must return a torch.Tensor'):
+            many.evaluate(
+                _protocol(), solver=worlds[0].policy.solver, eval_budget=2
+            )
+    finally:
+        many.close()
+
+
+def test_many_worlds_rejects_custom_wrapper_stacks() -> None:
+    class UnsupportedWrapper(gym.Wrapper):
+        pass
+
+    worlds = [
+        _world(1.0, extra_wrappers=[UnsupportedWrapper]),
+        _world(-1.0, extra_wrappers=[UnsupportedWrapper]),
+    ]
+    try:
+        with pytest.raises(ValueError, match='custom wrapper'):
+            swm.ManyWorlds(worlds=worlds)
+    finally:
+        for world in worlds:
+            world.close()
+
+
+def test_many_worlds_requires_envx(monkeypatch) -> None:
+    module = importlib.import_module('stable_worldmodel.world.many_worlds')
+    monkeypatch.setattr(module, 'find_spec', lambda _name: None)
+    worlds = [_world(1.0), _world(-1.0)]
+    try:
+        with pytest.raises(ImportError, match='requires envX'):
+            swm.ManyWorlds(worlds=worlds)
+    finally:
+        for world in worlds:
+            world.close()

@@ -520,12 +520,15 @@ class FastCEMSolver(CEMSolver):
         init_action: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Solve one population using this solver's existing configuration."""
-        return self.solve_population_tensors(
+        started = time.perf_counter()
+        output = self.solve_population_tensors(
             models,
             self.prepare_population(info, models),
             noise=noise,
             init_action=init_action,
         )
+        output['solve_time_seconds'] = time.perf_counter() - started
+        return output
 
     @torch.inference_mode()
     def solve(

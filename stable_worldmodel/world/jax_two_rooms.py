@@ -53,8 +53,7 @@ class JaxTwoRoomsRollout:
         except ImportError as error:
             raise ImportError(
                 'envX ManyWorlds rollouts require Python 3.11 or 3.12 and '
-                'the manyworlds-jax extra: '
-                '`pip install "stable-worldmodel[manyworlds-jax]"`'
+                'the pinned envX revision documented in docs/api/world.md'
             ) from error
 
         self._jax = jax
@@ -221,7 +220,8 @@ class JaxTwoRoomsRollout:
         ):
             raise RuntimeError(
                 'Torch plans are on CUDA but JAX has no GPU backend; install '
-                "the manyworlds-jax CUDA extra matching PyTorch's CUDA major"
+                "the envX CUDA extra matching PyTorch's CUDA major as "
+                'documented in docs/api/world.md'
             )
 
         time_major = (

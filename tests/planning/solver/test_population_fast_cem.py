@@ -99,6 +99,7 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
 
     actual = population.solve_population(info, models, noise=noise)
     assert population.population_backend == 'functional_vmap'
+    assert actual['solve_time_seconds'] > 0
     expected = tuple(
         solver.solve_tensors(
             solver.prepare({key: value[index] for key, value in info.items()}),
