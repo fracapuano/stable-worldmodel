@@ -547,41 +547,12 @@ class World:
         """Run every task in an ``EvaluationProtocol`` exactly once."""
         from stable_worldmodel.evaluation import (
             EpisodeResult,
-            EvaluationProtocol,
             EvaluationResults,
             StepRecord,
         )
         from stable_worldmodel.evaluation.records import recordable
 
-        if not isinstance(protocol, EvaluationProtocol):
-            raise TypeError('protocol must be an EvaluationProtocol')
-        first_env = self.envs.envs[0]
-        spec = getattr(first_env, 'spec', None)
-        env_id = getattr(spec, 'id', None)
-        accepted_names = {
-            env_id,
-            getattr(first_env.unwrapped, 'env_name', None),
-        }
-        if protocol.environment not in accepted_names:
-            raise ValueError(
-                f'protocol environment {protocol.environment!r} does not '
-                f'match World environment {env_id!r}'
-            )
-        if len(protocol.tasks) != self.num_envs:
-            raise ValueError(
-                'protocol evaluation requires one World env per task: '
-                f'{len(protocol.tasks)} tasks != {self.num_envs} envs'
-            )
-        if eval_budget is None or eval_budget < 1:
-            raise ValueError('protocol evaluation requires eval_budget >= 1')
-
-        seeds = [task.environment_seed for task in protocol.tasks]
-        options = [self._task_reset_options(task) for task in protocol.tasks]
-        self.reset(seed=seeds, options=options)
-        self.infos['controller_seed'] = np.asarray(
-            protocol.controller_seeds, dtype=np.int64
-        )[:, None]
-        self.infos['task_key'] = [[key] for key in protocol.task_keys]
+        self._reset_from_protocol(protocol, eval_budget)
 
         def info_at(key: str, index: int, default: Any = None) -> Any:
             value = self.infos.get(key)
@@ -763,6 +734,39 @@ class World:
                 'eval_budget': eval_budget,
             },
         )
+
+    def _reset_from_protocol(self, protocol, eval_budget) -> None:
+        """Validate and reset the environment pool for one protocol."""
+        from stable_worldmodel.evaluation import EvaluationProtocol
+
+        if not isinstance(protocol, EvaluationProtocol):
+            raise TypeError('protocol must be an EvaluationProtocol')
+        first_env = self.envs.envs[0]
+        spec = getattr(first_env, 'spec', None)
+        env_id = getattr(spec, 'id', None)
+        accepted_names = {
+            env_id,
+            getattr(first_env.unwrapped, 'env_name', None),
+        }
+        if protocol.environment not in accepted_names:
+            raise ValueError(
+                f'protocol environment {protocol.environment!r} does not '
+                f'match World environment {env_id!r}'
+            )
+        if len(protocol.tasks) != self.num_envs:
+            raise ValueError(
+                'protocol evaluation requires one World env per task: '
+                f'{len(protocol.tasks)} tasks != {self.num_envs} envs'
+            )
+        if eval_budget is None or eval_budget < 1:
+            raise ValueError('protocol evaluation requires eval_budget >= 1')
+        seeds = [task.environment_seed for task in protocol.tasks]
+        options = [self._task_reset_options(task) for task in protocol.tasks]
+        self.reset(seed=seeds, options=options)
+        self.infos['controller_seed'] = np.asarray(
+            protocol.controller_seeds, dtype=np.int64
+        )[:, None]
+        self.infos['task_key'] = [[key] for key in protocol.task_keys]
 
     @staticmethod
     def _task_reset_options(task) -> dict[str, Any]:

@@ -12,7 +12,7 @@ import pytest
 import torch
 from torch import nn
 
-from stable_worldmodel.planning import ShootingCostEvaluator, GoalMSE
+from stable_worldmodel.planning import GoalMSE, ShootingCostEvaluator
 from stable_worldmodel.protocols import Dynamics
 from stable_worldmodel.wm.lewm.lewm import LeWM
 

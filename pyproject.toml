@@ -49,6 +49,9 @@ env = [
     "shapely",
     "ogbench",
     "minigrid",
+    # Gymnasium-Robotics 1.4.2 is incompatible with MuJoCo 3.12's enum
+    # equality semantics. Keep the last working release until upstream fixes it.
+    "mujoco<3.12",
     "gymnasium[all]",
     "gymnasium-robotics",
     "opencv-python-headless",
@@ -74,7 +77,10 @@ all = [
 
 [dependency-groups]
 dev = [
+  "envx @ git+https://github.com/fracapuano/envX.git@d26c817c1124229c819be574f137cd68bda4380a ; python_version >= '3.11' and python_version < '3.13'",
   "ipdb",
+  "mujoco<3.12; python_version >= '3.11' and python_version < '3.13'",
+  "mujoco-mjx<3.12; python_version >= '3.11' and python_version < '3.13'",
   "pre-commit",
   "pytest",
   "pytest-cov>=7.0.0",

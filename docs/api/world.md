@@ -160,6 +160,131 @@ Non-array values (strings, nested objects) stay as a Python list of length `num_
 
 ::: stable_worldmodel.world.World.num_envs
 
+## ManyWorlds
+
+`ManyWorlds` is the opinionated, envX-only population evaluator for
+`swm/TwoRoom-v1`. It composes weight-bound `World` instances and replaces their
+separate FastCEM calls with one population FastCEM graph. Every model retains
+its own CEM mean, variance, elite set, and selected plan, while task-specific
+CEM random numbers are shared across the population for paired comparisons.
+
+Install the pinned envX revision directly. ManyWorlds currently requires
+Python 3.11 or 3.12. For CPU:
+
+```bash
+pip install "envx @ git+https://github.com/fracapuano/envX.git@d26c817c1124229c819be574f137cd68bda4380a"
+```
+
+For an accelerator, install `envx[cuda12]` or `envx[cuda13]` from that same
+revision, matching PyTorch's CUDA major. Mixing CUDA majors can load
+incompatible cuDNN sublibraries in the shared process.
+
+Only the standard `World("swm/TwoRoom-v1", ...)` wrapper stack is accepted.
+Custom wrappers, other environments, modified action spaces, a missing envX
+installation, and action postprocessors that return NumPy arrays all raise.
+An action `inverse_transform`, when configured, must accept and return a
+same-device `torch.Tensor`.
+
+```python
+import stable_worldmodel as swm
+from stable_worldmodel.planning import (
+    FastCEMSolver,
+    GoalMSE,
+    ShootingCostEvaluator,
+)
+
+def make_world(model):
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(model, GoalMSE()),
+        device="cuda",
+        num_samples=100,
+        n_steps=15,
+        topk=10,
+    )
+    policy = swm.policy.WorldModelPolicy(
+        solver=solver,
+        config=plan_config,
+        transform={"pixels": image_transform, "goal": image_transform},
+        process={"action": action_scaler},
+    )
+    world = swm.World(
+        "swm/TwoRoom-v1",
+        num_envs=len(protocol.tasks),
+        image_shape=(224, 224),
+        max_episode_steps=50,
+    )
+    world.set_policy(policy)
+    return world
+
+worlds = [make_world(model) for model in models]
+many = swm.ManyWorlds.init(worlds=worlds)
+results = many.evaluate(protocol, solver=worlds[0].policy.solver)
+
+# Device-resident planner outputs:
+results.planned_actions.shape  # (planning_calls, models, tasks, horizon, blocked_action_dim)
+results.planner_costs.shape    # (planning_calls, models, tasks)
+results.environment_actions.shape  # (models, tasks, env_steps, action_dim)
+results.task_returns.shape     # (models, tasks)
+results.scores.shape           # (models,), device-resident TwoRoom score
+results.fitness.shape          # (models,), host view of score/mean return
+results.task_final_distances.shape  # (models, tasks), device-resident
+results.population_backend     # "functional_vmap"
+
+# Standard realized World results, one entry per model:
+results.evaluations[0].episodes
+```
+
+The first task-sized Gym pool supplies initial and goal observations. FastCEM
+then plans the complete `horizon * action_block` sequence once and envX
+executes all `population * tasks` plans in one state-only JAX rollout. Plans
+and final metrics cross the Torch/JAX boundary with DLPack and remain on the
+accelerator. The returned result is self-contained; the constituent Gym
+environments are not advanced to the envX terminal states.
+
+This evaluator is deliberately open-loop: `eval_budget` may not exceed
+`horizon * action_block`, and per-step records are not materialized. It plans
+from the initial frame, matching the existing history warm-up behavior.
+Closed-loop replanning, filled histories, warm starts, early termination, and
+transition records are outside the supported path.
+
+Set protocol metadata `score="success"` for mean success or
+`score="distance"` for `1 - mean_final_distance / hypot(224, 224)`; distance
+is the default.
+
+Every LeWM parameter and persistent buffer may differ across Worlds, including
+the observation encoder, action encoder, projector, predictor, and prediction
+projector.
+
+The population axis runs through the complete FastCEM path. Means, variances,
+sampled candidates, model costs, elite selection, and warm starts have leading
+shape `(models, tasks, ...)`; candidate scoring is one functional/vmapped model
+call over `(models, tasks, samples, ...)`, with no Python loop over models in a
+CEM refinement. The fixed number of refinements can be captured as one
+compiled graph. The evaluator never partitions the model population or the CEM
+sample batch. If CUDA rejects an oversized unsplit attention launch, the error
+reports the population, task and sample dimensions and suggests explicit
+population or sample limits; it never changes either value automatically.
+
+Population model evaluation uses PyTorch's `functional_call` and `vmap` so the
+same path supports arbitrary differences in model parameters and buffers.
+Backend support for individual operations determines performance on a
+particular accelerator.
+
+Model architecture, preprocessing, action spaces, and `PlanConfig` must match,
+and every model must already reside on the solver device.
+
+::: stable_worldmodel.world.ManyWorlds
+    options:
+        heading_level: 3
+        members:
+          - init
+          - population_size
+          - simulator_count
+          - bootstrap_simulator_count
+          - evaluate
+          - close
+        show_source: false
+
 ## EnvPool
 
 The underlying batched simulator. You rarely touch it directly — `World` builds one for you — but its action and observation spaces are what the policy sees.

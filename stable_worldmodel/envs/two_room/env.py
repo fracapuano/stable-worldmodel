@@ -82,6 +82,8 @@ class TwoRoomEnv(gym.Env):
         self.num_doors = 1
         self.door_positions = torch.zeros(self.MAX_DOOR, dtype=torch.float32)
         self.door_sizes = torch.zeros(self.MAX_DOOR, dtype=torch.float32)
+        self.agent_speed = 5.0
+        self.agent_radius = 7.0
         self.wall_pos = float(self.WALL_CENTER)
 
     # ---------------- Variation Space ----------------
@@ -321,6 +323,12 @@ class TwoRoomEnv(gym.Env):
         self.door_sizes = torch.as_tensor(
             door_size, dtype=torch.float32
         )  # half-extent
+        self.agent_speed = float(
+            self.variation_space['agent']['speed'].value.item()
+        )
+        self.agent_radius = float(
+            self.variation_space['agent']['radius'].value.item()
+        )
 
         # For policy / observation: wall position on relevant axis
         self.wall_pos = float(self.WALL_CENTER)
@@ -497,7 +505,7 @@ class TwoRoomEnv(gym.Env):
         """
         bs = float(self.BORDER_SIZE)
         door_margin = 1.75  # was 0.5 * 3.5 scale
-        agent_r = float(self.variation_space['agent']['radius'].value.item())
+        agent_r = self.agent_radius
 
         # border clamp first - account for agent radius
         lower = bs + agent_r
