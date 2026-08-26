@@ -83,7 +83,7 @@ def _protocol(*, score: str = 'distance') -> EvaluationProtocol:
     )
 
 
-def _world(direction: float) -> swm.World:
+def _world(direction: float, *, receding_horizon: int = 1) -> swm.World:
     model = TinyTwoRoomsModel(direction).eval()
     solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
@@ -97,7 +97,7 @@ def _world(direction: float) -> swm.World:
         solver=solver,
         config=swm.PlanConfig(
             horizon=2,
-            receding_horizon=1,
+            receding_horizon=receding_horizon,
             history_len=3,
             action_block=2,
         ),
@@ -200,6 +200,100 @@ def test_many_worlds_envx_supports_success_score() -> None:
     )
     assert name == 'success'
     torch.testing.assert_close(scores, torch.tensor([0.5, 1.0]))
+
+
+def test_many_worlds_envx_stops_metrics_at_first_terminal() -> None:
+    protocol = EvaluationProtocol(
+        split='fitness',
+        environment='swm/TwoRoom-v1',
+        metadata=(('score', 'distance'),),
+        tasks=(
+            EvaluationTask(
+                environment_seed=3,
+                controller_seed=11,
+                layout_seed=3,
+                start=(20.0, 49.0),
+                goal=(40.0, 49.0),
+                observation_noise_seed=0,
+                name='right',
+            ),
+            EvaluationTask(
+                environment_seed=5,
+                controller_seed=13,
+                layout_seed=5,
+                start=(40.0, 49.0),
+                goal=(20.0, 49.0),
+                observation_noise_seed=0,
+                name='left',
+            ),
+        ),
+    )
+    actions = torch.tensor(
+        [
+            [
+                [[1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0]],
+                [[-1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            ]
+        ]
+    )
+    starts = torch.tensor([task.start for task in protocol.tasks])
+    goals = torch.tensor([task.goal for task in protocol.tasks])
+    full_plan_endpoint = starts + 5.0 * actions[0].sum(dim=1)
+    assert torch.all(
+        torch.linalg.vector_norm(full_plan_endpoint - goals, dim=1) > 16.0
+    )
+
+    def evaluate(backend: str):
+        world = _world(1.0, receding_horizon=2)
+        many = swm.ManyWorlds(worlds=[world], simulator_backend=backend)
+        solver = world.policy.solver
+        planned = actions.reshape(1, 2, 2, 4)
+
+        def fixed_plan(_info, _models, *, noise=None, init_action=None):
+            del noise, init_action
+            return {
+                'actions': planned,
+                'costs': torch.zeros(1, 2),
+                'mean': [planned],
+                'var': [torch.ones_like(planned)],
+                'compiled': False,
+                'compile_error': None,
+                'population_backend': 'fixed-test',
+            }
+
+        solver.solve_population = fixed_plan
+        try:
+            return many.evaluate(protocol, solver=solver, eval_budget=4)
+        finally:
+            many.close()
+
+    gym_result = evaluate('gym')
+    envx_result = evaluate('envx')
+    torch.testing.assert_close(
+        envx_result.task_successes, gym_result.task_successes
+    )
+    torch.testing.assert_close(
+        envx_result.task_final_distances,
+        gym_result.task_final_distances,
+        rtol=0,
+        atol=1e-6,
+    )
+    assert envx_result.task_successes.all()
+    torch.testing.assert_close(
+        envx_result.task_final_distances, torch.full((1, 2), 15.0)
+    )
+
+    for gym_episode, envx_episode in zip(
+        gym_result.evaluations[0].episodes,
+        envx_result.evaluations[0].episodes,
+        strict=True,
+    ):
+        assert envx_episode.success == gym_episode.success
+        assert envx_episode.length == gym_episode.length == 1
+        assert envx_episode.episode_return == gym_episode.episode_return == 0.0
+        assert envx_episode.path_cost == gym_episode.path_cost == 5.0
+        assert envx_episode.control_cost == gym_episode.control_cost == 1.0
+        assert envx_episode.collisions == gym_episode.collisions == 0
 
 
 @pytest.mark.parametrize('configured_score', ['distance', 'success'])

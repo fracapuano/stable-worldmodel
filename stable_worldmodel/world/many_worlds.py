@@ -817,9 +817,10 @@ class ManyWorlds:
         )
         success_values = outcome.successes.detach().cpu().numpy().astype(bool)
         distance_values = outcome.final_distances.detach().cpu().numpy()
-        control_costs = actions.float().square().sum(dim=(2, 3)).cpu().numpy()
         returns = outcome.returns.detach().cpu().numpy()
+        lengths = outcome.lengths.detach().cpu().numpy()
         path_costs = outcome.path_costs.detach().cpu().numpy()
+        control_costs = outcome.control_costs.detach().cpu().numpy()
         collisions = outcome.collisions.detach().cpu().numpy()
 
         evaluations = tuple(
@@ -841,7 +842,7 @@ class ManyWorlds:
                         episode_return=float(
                             returns[population_index, task_index]
                         ),
-                        length=eval_budget,
+                        length=int(lengths[population_index, task_index]),
                         path_cost=float(
                             path_costs[population_index, task_index]
                         ),

@@ -22,7 +22,9 @@ class JaxTwoRoomsOutcome:
     successes: torch.Tensor
     final_distances: torch.Tensor
     returns: torch.Tensor
+    lengths: torch.Tensor
     path_costs: torch.Tensor
+    control_costs: torch.Tensor
     collisions: torch.Tensor
 
 
@@ -83,15 +85,34 @@ class JaxTwoRoomsRollout:
             previous = self._jnp.concatenate(
                 (initial_state.agent_position[None], positions[:-1]), axis=0
             )
-            return (
-                trajectory.observation[-1],
-                trajectory.info['success'][-1],
-                trajectory.info['distance_to_target'][-1],
-                trajectory.reward.sum(axis=0),
-                self._jnp.linalg.norm(positions - previous, axis=-1).sum(
-                    axis=0
+            # envX exposes every transition in the fixed-length scan, while
+            # Gym freezes an episode after its first terminal transition.
+            # Include that transition, then mask the remainder of the plan.
+            completed_before = self._jnp.concatenate(
+                (
+                    self._jnp.zeros_like(trajectory.done[:1]),
+                    self._jnp.cumsum(trajectory.done[:-1], axis=0),
                 ),
-                trajectory.info['collided'].sum(axis=0),
+                axis=0,
+            )
+            active = completed_before == 0
+            lengths = active.sum(axis=0)
+            final_index = lengths - 1
+            environment_index = self._jnp.arange(self.num_envs)
+            return (
+                trajectory.observation[final_index, environment_index],
+                (trajectory.info['success'] & active).any(axis=0),
+                trajectory.info['distance_to_target'][
+                    final_index, environment_index
+                ],
+                (trajectory.reward * active).sum(axis=0),
+                lengths,
+                (
+                    self._jnp.linalg.norm(positions - previous, axis=-1)
+                    * active
+                ).sum(axis=0),
+                (self._jnp.square(actions).sum(axis=-1) * active).sum(axis=0),
+                (trajectory.info['collided'] * active).sum(axis=0),
             )
 
         # The outer JIT lets XLA discard the unused trajectory instead of
@@ -244,8 +265,10 @@ class JaxTwoRoomsRollout:
             successes=to_torch(outputs[1]),
             final_distances=to_torch(outputs[2]),
             returns=to_torch(outputs[3]),
-            path_costs=to_torch(outputs[4]),
-            collisions=to_torch(outputs[5]),
+            lengths=to_torch(outputs[4]),
+            path_costs=to_torch(outputs[5]),
+            control_costs=to_torch(outputs[6]),
+            collisions=to_torch(outputs[7]),
         )
 
 
