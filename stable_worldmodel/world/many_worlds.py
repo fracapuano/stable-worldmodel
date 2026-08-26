@@ -169,6 +169,11 @@ class ManyWorlds:
         self.simulator_backend = self._resolve_simulator_backend(
             simulator_backend
         )
+        self._envx_episode_limit = (
+            self._common_episode_limit()
+            if self.simulator_backend == 'envx'
+            else None
+        )
         self.envs = (
             EnvPool.from_envs(
                 [env for world in self.worlds for env in world.envs.envs]
@@ -227,6 +232,25 @@ class ManyWorlds:
                 'swm/TwoRoom-v1'
             )
         return requested
+
+    def _common_episode_limit(self) -> int:
+        limits = {
+            getattr(getattr(env, 'spec', None), 'max_episode_steps', None)
+            for world in self.worlds
+            for env in world.envs.envs
+        }
+        if None in limits or len(limits) != 1:
+            raise ValueError(
+                'envX requires every World task to use the same positive '
+                'max_episode_steps'
+            )
+        limit = int(limits.pop())
+        if limit < 1:
+            raise ValueError(
+                'envX requires every World task to use the same positive '
+                'max_episode_steps'
+            )
+        return limit
 
     @staticmethod
     def _policy_for(world: World) -> WorldModelPolicy:
@@ -801,14 +825,17 @@ class ManyWorlds:
 
         from .jax_two_rooms import JaxTwoRoomsRollout
 
+        episode_limit = min(eval_budget, self._envx_episode_limit)
         if (
             self._jax_rollout is None
             or self._jax_rollout.eval_budget != eval_budget
+            or self._jax_rollout.max_episode_steps != episode_limit
         ):
             self._jax_rollout = JaxTwoRoomsRollout(
                 population_size=self.population_size,
                 num_tasks=self.num_tasks,
                 eval_budget=eval_budget,
+                max_episode_steps=episode_limit,
             )
         initial_state = self._jax_rollout.initial_state(self.worlds[0])
         outcome = self._jax_rollout(initial_state, actions)

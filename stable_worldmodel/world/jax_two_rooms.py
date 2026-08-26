@@ -42,6 +42,7 @@ class JaxTwoRoomsRollout:
         population_size: int,
         num_tasks: int,
         eval_budget: int,
+        max_episode_steps: int | None = None,
     ) -> None:
         # JAX otherwise reserves most of the accelerator on first use, which
         # is hostile to the Torch world models sharing the same device.
@@ -66,12 +67,19 @@ class JaxTwoRoomsRollout:
         self.num_tasks = int(num_tasks)
         self.num_envs = self.population_size * self.num_tasks
         self.eval_budget = int(eval_budget)
+        if max_episode_steps is None:
+            max_episode_steps = self.eval_budget
+        self.max_episode_steps = min(self.eval_budget, int(max_episode_steps))
+        if self.max_episode_steps < 1:
+            raise ValueError('max_episode_steps must be positive')
         self.env, params = envx.make(
             'two-rooms',
             num_envs=self.num_envs,
             observation_type='state',
         )
-        self.params = params.replace(max_steps_in_episode=self.eval_budget)
+        self.params = params.replace(
+            max_steps_in_episode=self.max_episode_steps
+        )
         key = jax.random.key(2)
 
         def score(initial_state, actions, params):

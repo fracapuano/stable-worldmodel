@@ -83,7 +83,12 @@ def _protocol(*, score: str = 'distance') -> EvaluationProtocol:
     )
 
 
-def _world(direction: float, *, receding_horizon: int = 1) -> swm.World:
+def _world(
+    direction: float,
+    *,
+    receding_horizon: int = 1,
+    max_episode_steps: int = 4,
+) -> swm.World:
     model = TinyTwoRoomsModel(direction).eval()
     solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
@@ -106,10 +111,45 @@ def _world(direction: float, *, receding_horizon: int = 1) -> swm.World:
         'swm/TwoRoom-v1',
         num_envs=2,
         image_shape=(8, 8),
-        max_episode_steps=4,
+        max_episode_steps=max_episode_steps,
     )
     world.set_policy(policy)
     return world
+
+
+def _evaluate_fixed_plan(
+    protocol: EvaluationProtocol,
+    actions: torch.Tensor,
+    backend: str,
+    *,
+    max_episode_steps: int = 4,
+):
+    world = _world(
+        1.0,
+        receding_horizon=2,
+        max_episode_steps=max_episode_steps,
+    )
+    many = swm.ManyWorlds(worlds=[world], simulator_backend=backend)
+    solver = world.policy.solver
+    planned = actions.reshape(1, len(protocol.tasks), 2, 4)
+
+    def fixed_plan(_info, _models, *, noise=None, init_action=None):
+        del noise, init_action
+        return {
+            'actions': planned,
+            'costs': torch.zeros(1, len(protocol.tasks)),
+            'mean': [planned],
+            'var': [torch.ones_like(planned)],
+            'compiled': False,
+            'compile_error': None,
+            'population_backend': 'fixed-test',
+        }
+
+    solver.solve_population = fixed_plan
+    try:
+        return many.evaluate(protocol, solver=solver, eval_budget=4)
+    finally:
+        many.close()
 
 
 def test_jax_rollout_uses_torch_dlpack_and_preserves_task_state() -> None:
@@ -243,32 +283,8 @@ def test_many_worlds_envx_stops_metrics_at_first_terminal() -> None:
         torch.linalg.vector_norm(full_plan_endpoint - goals, dim=1) > 16.0
     )
 
-    def evaluate(backend: str):
-        world = _world(1.0, receding_horizon=2)
-        many = swm.ManyWorlds(worlds=[world], simulator_backend=backend)
-        solver = world.policy.solver
-        planned = actions.reshape(1, 2, 2, 4)
-
-        def fixed_plan(_info, _models, *, noise=None, init_action=None):
-            del noise, init_action
-            return {
-                'actions': planned,
-                'costs': torch.zeros(1, 2),
-                'mean': [planned],
-                'var': [torch.ones_like(planned)],
-                'compiled': False,
-                'compile_error': None,
-                'population_backend': 'fixed-test',
-            }
-
-        solver.solve_population = fixed_plan
-        try:
-            return many.evaluate(protocol, solver=solver, eval_budget=4)
-        finally:
-            many.close()
-
-    gym_result = evaluate('gym')
-    envx_result = evaluate('envx')
+    gym_result = _evaluate_fixed_plan(protocol, actions, 'gym')
+    envx_result = _evaluate_fixed_plan(protocol, actions, 'envx')
     torch.testing.assert_close(
         envx_result.task_successes, gym_result.task_successes
     )
@@ -294,6 +310,102 @@ def test_many_worlds_envx_stops_metrics_at_first_terminal() -> None:
         assert envx_episode.path_cost == gym_episode.path_cost == 5.0
         assert envx_episode.control_cost == gym_episode.control_cost == 1.0
         assert envx_episode.collisions == gym_episode.collisions == 0
+
+
+def test_many_worlds_envx_honors_world_episode_limit() -> None:
+    protocol = _protocol()
+    actions = torch.zeros(1, 2, 4, 2)
+    gym_result = _evaluate_fixed_plan(
+        protocol, actions, 'gym', max_episode_steps=2
+    )
+    envx_result = _evaluate_fixed_plan(
+        protocol, actions, 'envx', max_episode_steps=2
+    )
+
+    torch.testing.assert_close(
+        envx_result.task_final_distances,
+        gym_result.task_final_distances,
+        rtol=0,
+        atol=1e-6,
+    )
+    for gym_episode, envx_episode in zip(
+        gym_result.evaluations[0].episodes,
+        envx_result.evaluations[0].episodes,
+        strict=True,
+    ):
+        assert envx_episode.length == gym_episode.length == 2
+        assert envx_episode.success == gym_episode.success is False
+        assert envx_episode.path_cost == gym_episode.path_cost == 0.0
+        assert envx_episode.control_cost == gym_episode.control_cost == 0.0
+
+
+def test_many_worlds_envx_requires_common_world_episode_limit() -> None:
+    worlds = [
+        _world(1.0, max_episode_steps=2),
+        _world(-1.0, max_episode_steps=3),
+    ]
+    try:
+        with pytest.raises(
+            ValueError, match='same positive max_episode_steps'
+        ):
+            swm.ManyWorlds(worlds=worlds, simulator_backend='envx')
+    finally:
+        for world in worlds:
+            world.close()
+
+
+def test_many_worlds_two_room_collision_counts_match() -> None:
+    protocol = EvaluationProtocol(
+        split='fitness',
+        environment='swm/TwoRoom-v1',
+        metadata=(('score', 'distance'),),
+        tasks=(
+            EvaluationTask(
+                environment_seed=3,
+                controller_seed=11,
+                layout_seed=3,
+                start=(90.0, 30.0),
+                goal=(20.0, 200.0),
+                observation_noise_seed=0,
+                name='low-side',
+            ),
+            EvaluationTask(
+                environment_seed=5,
+                controller_seed=13,
+                layout_seed=5,
+                start=(134.0, 30.0),
+                goal=(200.0, 200.0),
+                observation_noise_seed=0,
+                name='high-side',
+            ),
+        ),
+    )
+    actions = torch.tensor(
+        [
+            [
+                [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+                [[-1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0]],
+            ]
+        ]
+    )
+    gym_result = _evaluate_fixed_plan(protocol, actions, 'gym')
+    envx_result = _evaluate_fixed_plan(protocol, actions, 'envx')
+
+    torch.testing.assert_close(
+        envx_result.task_final_distances,
+        gym_result.task_final_distances,
+        rtol=0,
+        atol=1e-6,
+    )
+    for gym_episode, envx_episode in zip(
+        gym_result.evaluations[0].episodes,
+        envx_result.evaluations[0].episodes,
+        strict=True,
+    ):
+        assert envx_episode.collisions == gym_episode.collisions == 2
+        assert envx_episode.length == gym_episode.length == 4
+        assert envx_episode.path_cost == gym_episode.path_cost == 10.5
+        assert envx_episode.control_cost == gym_episode.control_cost == 4.0
 
 
 @pytest.mark.parametrize('configured_score', ['distance', 'success'])
