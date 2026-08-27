@@ -275,9 +275,7 @@ class TwoRoomEnv(gym.Env):
         speed = float(self.variation_space['agent']['speed'].value.item())
         pos_next = self.agent_position + action_t * speed
 
-        pos_new, collided = self._apply_collisions(
-            self.agent_position, pos_next, return_collision=True
-        )
+        pos_new = self._apply_collisions(self.agent_position, pos_next)
         self.agent_position = pos_new
 
         dist = float(torch.norm(self.agent_position - self.target_position))
@@ -288,7 +286,6 @@ class TwoRoomEnv(gym.Env):
         obs = self._get_obs()
         info = self._get_info()
         info['distance_to_target'] = dist
-        info['collision'] = bool(collided.item())
         return obs, reward, terminated, truncated, info
 
     def get_next_state(self, state, action):
@@ -383,7 +380,6 @@ class TwoRoomEnv(gym.Env):
             'state': self.agent_position.detach().cpu().numpy(),
             'goal_state': self.target_position.detach().cpu().numpy(),
             'goal': self._target_img.cpu().numpy().transpose(1, 2, 0),
-            'collision': False,
         }
 
     # ---------------- Rendering ----------------
@@ -512,13 +508,7 @@ class TwoRoomEnv(gym.Env):
 
     # ---------------- Collision ----------------
 
-    def _apply_collisions(
-        self,
-        pos1: torch.Tensor,
-        pos2: torch.Tensor,
-        *,
-        return_collision: bool = False,
-    ):
+    def _apply_collisions(self, pos1: torch.Tensor, pos2: torch.Tensor):
         """
         If attempting to cross central wall outside doors => clamp at wall edge with small pushback.
         Collision is triggered when agent radius touches the wall, not just the center.
@@ -533,7 +523,6 @@ class TwoRoomEnv(gym.Env):
         lower = bs + agent_r
         upper = self.IMG_SIZE - bs - agent_r
         pos2c = pos2.clamp(lower, upper)
-        collided_with_border = torch.any(pos2c != pos2, dim=-1)
 
         # central wall collision - account for agent radius
         half = self.wall_thickness // 2
@@ -564,14 +553,11 @@ class TwoRoomEnv(gym.Env):
         )
 
         result = pos2c.clone()
-        collided_with_divider = enters_wall & ~in_door
         result[..., wall_axis] = torch.where(
-            collided_with_divider,
+            enters_wall & ~in_door,
             clamped,
             pos2c[..., wall_axis],
         )
-        if return_collision:
-            return result, collided_with_border | collided_with_divider
         return result
 
     # ---------------- Constraint ----------------

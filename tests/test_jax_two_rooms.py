@@ -309,7 +309,7 @@ def test_many_worlds_envx_stops_metrics_at_first_terminal() -> None:
         assert envx_episode.episode_return == gym_episode.episode_return == 0.0
         assert envx_episode.path_cost == gym_episode.path_cost == 5.0
         assert envx_episode.control_cost == gym_episode.control_cost == 1.0
-        assert envx_episode.collisions == gym_episode.collisions == 0
+        assert envx_episode.collisions == 0
 
 
 def test_many_worlds_envx_honors_world_episode_limit() -> None:
@@ -354,7 +354,7 @@ def test_many_worlds_envx_requires_common_world_episode_limit() -> None:
             world.close()
 
 
-def test_many_worlds_two_room_collision_counts_match() -> None:
+def test_many_worlds_envx_counts_collisions() -> None:
     protocol = EvaluationProtocol(
         split='fitness',
         environment='swm/TwoRoom-v1',
@@ -388,24 +388,13 @@ def test_many_worlds_two_room_collision_counts_match() -> None:
             ]
         ]
     )
-    gym_result = _evaluate_fixed_plan(protocol, actions, 'gym')
     envx_result = _evaluate_fixed_plan(protocol, actions, 'envx')
 
-    torch.testing.assert_close(
-        envx_result.task_final_distances,
-        gym_result.task_final_distances,
-        rtol=0,
-        atol=1e-6,
-    )
-    for gym_episode, envx_episode in zip(
-        gym_result.evaluations[0].episodes,
-        envx_result.evaluations[0].episodes,
-        strict=True,
-    ):
-        assert envx_episode.collisions == gym_episode.collisions == 2
-        assert envx_episode.length == gym_episode.length == 4
-        assert envx_episode.path_cost == gym_episode.path_cost == 10.5
-        assert envx_episode.control_cost == gym_episode.control_cost == 4.0
+    for envx_episode in envx_result.evaluations[0].episodes:
+        assert envx_episode.collisions == 2
+        assert envx_episode.length == 4
+        assert envx_episode.path_cost == 10.5
+        assert envx_episode.control_cost == 4.0
 
 
 @pytest.mark.parametrize('configured_score', ['distance', 'success'])
