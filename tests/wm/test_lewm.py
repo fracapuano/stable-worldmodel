@@ -15,6 +15,7 @@ from torch import nn
 from stable_worldmodel.planning import GoalMSE, ShootingCostEvaluator
 from stable_worldmodel.protocols import Dynamics
 from stable_worldmodel.wm.lewm.lewm import LeWM
+from stable_worldmodel.wm.lewm.module import Embedder
 
 # CEM-like dimensions
 B, S, T, D, H, A = 2, 3, 2, 5, 4, 2
@@ -46,6 +47,15 @@ def test_lewm_satisfies_dynamics_protocol():
 def test_lewm_no_longer_exposes_get_cost():
     """Cost now lives in the ShootingCostEvaluator seam, not on the model."""
     assert not hasattr(_bare_model(), 'get_cost')
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_action_embedder_matches_parameter_dtype(dtype):
+    embedder = Embedder(input_dim=2, smoothed_dim=4, emb_dim=4).to(dtype=dtype)
+
+    output = embedder(torch.randn(2, 3, 2, dtype=torch.float32))
+
+    assert output.dtype == dtype
 
 
 def test_cost_evaluator_encodes_goal_once_as_3d():
