@@ -22,7 +22,9 @@ class JaxTwoRoomsOutcome:
     successes: torch.Tensor
     final_distances: torch.Tensor
     returns: torch.Tensor
+    lengths: torch.Tensor
     path_costs: torch.Tensor
+    control_costs: torch.Tensor
     collisions: torch.Tensor
 
 
@@ -40,6 +42,7 @@ class JaxTwoRoomsRollout:
         population_size: int,
         num_tasks: int,
         eval_budget: int,
+        max_episode_steps: int | None = None,
     ) -> None:
         # JAX otherwise reserves most of the accelerator on first use, which
         # is hostile to the Torch world models sharing the same device.
@@ -63,12 +66,19 @@ class JaxTwoRoomsRollout:
         self.num_tasks = int(num_tasks)
         self.num_envs = self.population_size * self.num_tasks
         self.eval_budget = int(eval_budget)
+        if max_episode_steps is None:
+            max_episode_steps = self.eval_budget
+        self.max_episode_steps = min(self.eval_budget, int(max_episode_steps))
+        if self.max_episode_steps < 1:
+            raise ValueError('max_episode_steps must be positive')
         self.env, params = envx.make(
             'two-rooms',
             num_envs=self.num_envs,
             observation_type='state',
         )
-        self.params = params.replace(max_steps_in_episode=self.eval_budget)
+        self.params = params.replace(
+            max_steps_in_episode=self.max_episode_steps
+        )
         key = jax.random.key(2)
 
         def score(initial_state, actions, params):
@@ -82,15 +92,34 @@ class JaxTwoRoomsRollout:
             previous = self._jnp.concatenate(
                 (initial_state.agent_position[None], positions[:-1]), axis=0
             )
-            return (
-                trajectory.observation[-1],
-                trajectory.info['success'][-1],
-                trajectory.info['distance_to_target'][-1],
-                trajectory.reward.sum(axis=0),
-                self._jnp.linalg.norm(positions - previous, axis=-1).sum(
-                    axis=0
+            # envX exposes every transition in the fixed-length scan. Include
+            # the first terminal transition, then exclude the rest of the plan
+            # from the effective episode and all of its reported statistics.
+            completed_before = self._jnp.concatenate(
+                (
+                    self._jnp.zeros_like(trajectory.done[:1]),
+                    self._jnp.cumsum(trajectory.done[:-1], axis=0),
                 ),
-                trajectory.info['collided'].sum(axis=0),
+                axis=0,
+            )
+            active = completed_before == 0
+            lengths = active.sum(axis=0)
+            final_index = lengths - 1
+            environment_index = self._jnp.arange(self.num_envs)
+            return (
+                trajectory.observation[final_index, environment_index],
+                (trajectory.info['success'] & active).any(axis=0),
+                trajectory.info['distance_to_target'][
+                    final_index, environment_index
+                ],
+                (trajectory.reward * active).sum(axis=0),
+                lengths,
+                (
+                    self._jnp.linalg.norm(positions - previous, axis=-1)
+                    * active
+                ).sum(axis=0),
+                (self._jnp.square(actions).sum(axis=-1) * active).sum(axis=0),
+                (trajectory.info['collided'] * active).sum(axis=0),
             )
 
         # The outer JIT lets XLA discard the unused trajectory instead of
@@ -244,8 +273,10 @@ class JaxTwoRoomsRollout:
             successes=to_torch(outputs[1]),
             final_distances=to_torch(outputs[2]),
             returns=to_torch(outputs[3]),
-            path_costs=to_torch(outputs[4]),
-            collisions=to_torch(outputs[5]),
+            lengths=to_torch(outputs[4]),
+            path_costs=to_torch(outputs[5]),
+            control_costs=to_torch(outputs[6]),
+            collisions=to_torch(outputs[7]),
         )
 
 

@@ -177,6 +177,7 @@ class ManyWorlds:
             model.eval()
         self._validate_world_shapes()
         self._validate_envx_worlds()
+        self._envx_episode_limit = self._common_episode_limit()
         if find_spec('envx') is None:
             raise ImportError(
                 'ManyWorlds requires envX. Install the pinned envX revision '
@@ -207,6 +208,25 @@ class ManyWorlds:
     ) -> Self:
         """Named constructor matching ``ManyWorlds.init(worlds=[...])``."""
         return cls(worlds=worlds, model_names=model_names)
+
+    def _common_episode_limit(self) -> int:
+        limits = {
+            getattr(getattr(env, 'spec', None), 'max_episode_steps', None)
+            for world in self.worlds
+            for env in world.envs.envs
+        }
+        if None in limits or len(limits) != 1:
+            raise ValueError(
+                'envX requires every World task to use the same positive '
+                'max_episode_steps'
+            )
+        limit = int(limits.pop())
+        if limit < 1:
+            raise ValueError(
+                'envX requires every World task to use the same positive '
+                'max_episode_steps'
+            )
+        return limit
 
     @staticmethod
     def _policy_for(world: World) -> WorldModelPolicy:
@@ -583,14 +603,17 @@ class ManyWorlds:
 
         from .jax_two_rooms import JaxTwoRoomsRollout
 
+        episode_limit = min(eval_budget, self._envx_episode_limit)
         if (
             self._jax_rollout is None
             or self._jax_rollout.eval_budget != eval_budget
+            or self._jax_rollout.max_episode_steps != episode_limit
         ):
             self._jax_rollout = JaxTwoRoomsRollout(
                 population_size=self.population_size,
                 num_tasks=self.num_tasks,
                 eval_budget=eval_budget,
+                max_episode_steps=episode_limit,
             )
         initial_state = self._jax_rollout.initial_state(self.worlds[0])
         outcome = self._jax_rollout(initial_state, actions)
@@ -599,9 +622,10 @@ class ManyWorlds:
         )
         success_values = outcome.successes.detach().cpu().numpy().astype(bool)
         distance_values = outcome.final_distances.detach().cpu().numpy()
-        control_costs = actions.float().square().sum(dim=(2, 3)).cpu().numpy()
         returns = outcome.returns.detach().cpu().numpy()
+        lengths = outcome.lengths.detach().cpu().numpy()
         path_costs = outcome.path_costs.detach().cpu().numpy()
+        control_costs = outcome.control_costs.detach().cpu().numpy()
         collisions = outcome.collisions.detach().cpu().numpy()
 
         evaluations = tuple(
@@ -623,7 +647,7 @@ class ManyWorlds:
                         episode_return=float(
                             returns[population_index, task_index]
                         ),
-                        length=eval_budget,
+                        length=int(lengths[population_index, task_index]),
                         path_cost=float(
                             path_costs[population_index, task_index]
                         ),
