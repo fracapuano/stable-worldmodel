@@ -88,6 +88,8 @@ def _protocol(*, score: str = 'distance') -> EvaluationProtocol:
 def _world(
     direction: float,
     *,
+    receding_horizon: int = 1,
+    max_episode_steps: int = 4,
     process=None,
     extra_wrappers=None,
 ) -> swm.World:
@@ -104,7 +106,7 @@ def _world(
         solver=solver,
         config=swm.PlanConfig(
             horizon=2,
-            receding_horizon=1,
+            receding_horizon=receding_horizon,
             history_len=3,
             action_block=2,
         ),
@@ -114,11 +116,46 @@ def _world(
         'swm/TwoRoom-v1',
         num_envs=2,
         image_shape=(8, 8),
-        max_episode_steps=4,
+        max_episode_steps=max_episode_steps,
         extra_wrappers=extra_wrappers,
     )
     world.set_policy(policy)
     return world
+
+
+def _evaluate_fixed_plan(
+    protocol: EvaluationProtocol,
+    actions: torch.Tensor,
+    *,
+    max_episode_steps: int = 4,
+):
+    world = _world(
+        1.0,
+        receding_horizon=2,
+        max_episode_steps=max_episode_steps,
+    )
+    many = swm.ManyWorlds(worlds=[world])
+    solver = world.policy.solver
+    planned = actions.reshape(1, len(protocol.tasks), 2, 4)
+
+    def fixed_plan(_info, _models, *, noise=None, init_action=None):
+        del noise, init_action
+        return {
+            'actions': planned,
+            'costs': torch.zeros(1, len(protocol.tasks)),
+            'mean': [planned],
+            'var': [torch.ones_like(planned)],
+            'compiled': False,
+            'compile_error': None,
+            'population_backend': 'fixed-test',
+            'solve_time_seconds': 0.0,
+        }
+
+    solver.solve_population = fixed_plan
+    try:
+        return many.evaluate(protocol, solver=solver, eval_budget=4)
+    finally:
+        many.close()
 
 
 def test_jax_rollout_uses_torch_dlpack_and_preserves_task_state() -> None:
@@ -207,6 +244,139 @@ def test_many_worlds_envx_supports_success_score() -> None:
     )
     assert name == 'success'
     torch.testing.assert_close(scores, torch.tensor([0.5, 1.0]))
+
+
+def test_many_worlds_envx_stops_metrics_at_first_terminal() -> None:
+    protocol = EvaluationProtocol(
+        split='fitness',
+        environment='swm/TwoRoom-v1',
+        metadata=(('score', 'distance'),),
+        tasks=(
+            EvaluationTask(
+                environment_seed=3,
+                controller_seed=11,
+                layout_seed=3,
+                start=(20.0, 49.0),
+                goal=(40.0, 49.0),
+                observation_noise_seed=0,
+                name='right',
+            ),
+            EvaluationTask(
+                environment_seed=5,
+                controller_seed=13,
+                layout_seed=5,
+                start=(40.0, 49.0),
+                goal=(20.0, 49.0),
+                observation_noise_seed=0,
+                name='left',
+            ),
+        ),
+    )
+    actions = torch.tensor(
+        [
+            [
+                [[1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0]],
+                [[-1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            ]
+        ]
+    )
+    starts = torch.tensor([task.start for task in protocol.tasks])
+    goals = torch.tensor([task.goal for task in protocol.tasks])
+    full_plan_endpoint = starts + 5.0 * actions[0].sum(dim=1)
+    assert torch.all(
+        torch.linalg.vector_norm(full_plan_endpoint - goals, dim=1) > 16.0
+    )
+
+    result = _evaluate_fixed_plan(protocol, actions)
+    assert result.task_successes.all()
+    torch.testing.assert_close(
+        result.task_final_distances, torch.full((1, 2), 15.0)
+    )
+    for episode in result.evaluations[0].episodes:
+        assert episode.success
+        assert episode.length == 1
+        assert episode.episode_return == 0.0
+        assert episode.path_cost == 5.0
+        assert episode.control_cost == 1.0
+        assert episode.collisions == 0
+
+
+def test_many_worlds_envx_honors_world_episode_limit() -> None:
+    protocol = _protocol()
+    actions = torch.zeros(1, 2, 4, 2)
+
+    result = _evaluate_fixed_plan(
+        protocol,
+        actions,
+        max_episode_steps=2,
+    )
+    assert not result.task_successes.any()
+    torch.testing.assert_close(
+        result.task_final_distances, torch.full((1, 2), 140.0)
+    )
+    for episode in result.evaluations[0].episodes:
+        assert episode.length == 2
+        assert not episode.success
+        assert episode.path_cost == 0.0
+        assert episode.control_cost == 0.0
+
+
+def test_many_worlds_envx_requires_common_world_episode_limit() -> None:
+    worlds = [
+        _world(1.0, max_episode_steps=2),
+        _world(-1.0, max_episode_steps=3),
+    ]
+    try:
+        with pytest.raises(
+            ValueError, match='same positive max_episode_steps'
+        ):
+            swm.ManyWorlds(worlds=worlds)
+    finally:
+        for world in worlds:
+            world.close()
+
+
+def test_many_worlds_envx_counts_collisions() -> None:
+    protocol = EvaluationProtocol(
+        split='fitness',
+        environment='swm/TwoRoom-v1',
+        metadata=(('score', 'distance'),),
+        tasks=(
+            EvaluationTask(
+                environment_seed=3,
+                controller_seed=11,
+                layout_seed=3,
+                start=(90.0, 30.0),
+                goal=(20.0, 200.0),
+                observation_noise_seed=0,
+                name='low-side',
+            ),
+            EvaluationTask(
+                environment_seed=5,
+                controller_seed=13,
+                layout_seed=5,
+                start=(134.0, 30.0),
+                goal=(200.0, 200.0),
+                observation_noise_seed=0,
+                name='high-side',
+            ),
+        ),
+    )
+    actions = torch.tensor(
+        [
+            [
+                [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+                [[-1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0]],
+            ]
+        ]
+    )
+
+    result = _evaluate_fixed_plan(protocol, actions)
+    for episode in result.evaluations[0].episodes:
+        assert episode.collisions == 2
+        assert episode.length == 4
+        assert episode.path_cost == 10.5
+        assert episode.control_cost == 4.0
 
 
 def test_many_worlds_preserves_the_fast_cem_callback_contract() -> None:
