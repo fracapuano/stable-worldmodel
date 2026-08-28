@@ -19,7 +19,7 @@ from stable_worldmodel.planning.tensor_cost import (
     _LeWMModelPopulationCost,
     _LeWMTerminalCost,
 )
-from stable_worldmodel.protocols import Costable
+from stable_worldmodel.protocols import Costable, PopulationModel
 
 from .callbacks import Callback
 from .cem import CEMSolver
@@ -104,6 +104,32 @@ class _PopulationCEMLoop(_CEMLoop):
         return self.eager(mean, std, noise, *prepared)
 
 
+class _MappedPopulationCEMLoop(_CEMLoop):
+    """Single-member CEM kernel mapped by an opaque population backend."""
+
+    def _step(self, mean, std, noise, *prepared):
+        candidates = torch.addcmul(mean[:, None], noise, std[:, None])
+        candidates = torch.cat((mean[:, None], candidates[:, 1:]), dim=1)
+        costs = self.cost(candidates, *prepared)
+        values, indices = costs.topk(self.topk, dim=1, largest=False)
+        indices = indices[:, :, None, None].expand(
+            -1, -1, candidates.size(2), candidates.size(3)
+        )
+        elite_std, elite_mean = torch.std_mean(
+            candidates.gather(1, indices), dim=1
+        )
+        return elite_mean, elite_std, values.mean(1)
+
+    def forward(self, info, mean, std, noise):
+        prepared = self.cost.prepare(
+            info,
+            device=mean.device,
+            dtype=mean.dtype,
+            action_dim=mean.size(-1),
+        )
+        return self.eager(mean, std, noise, *prepared)
+
+
 class FastCEMSolver(CEMSolver):
     """Drop-in CEM with an automatic device-resident fast path.
 
@@ -156,6 +182,9 @@ class FastCEMSolver(CEMSolver):
         self.compile_fallback = compile_fallback
         self._tensor_cost = self._adapt_cost(cost)
         self._loop = _CEMLoop(self._tensor_cost, n_steps, topk)
+        self._mapped_population_loop = _MappedPopulationCEMLoop(
+            self._tensor_cost, n_steps, topk
+        )
         self._population_loop: _PopulationCEMLoop | None = None
         self._population_models: tuple[nn.Module, ...] = ()
         self._compiled_loop = None
@@ -514,13 +543,69 @@ class FastCEMSolver(CEMSolver):
     def solve_population(
         self,
         info: dict[str, Any],
-        models: Sequence[nn.Module],
+        models: Sequence[nn.Module] | PopulationModel,
         *,
         noise: torch.Tensor | None = None,
         init_action: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Solve one population using this solver's existing configuration."""
         started = time.perf_counter()
+        if isinstance(models, PopulationModel):
+            population = models
+            if population.model is not self._tensor_cost.model:
+                raise ValueError(
+                    'population model must wrap the solver cost model'
+                )
+            model_info = {
+                key: value
+                for key, value in info.items()
+                if key
+                in {'pixels', 'goal', 'emb', 'goal_emb', 'action_history'}
+            }
+            if not model_info or any(
+                not torch.is_tensor(value) for value in model_info.values()
+            ):
+                raise TypeError(
+                    'population model inputs must be non-empty tensors'
+                )
+            tasks = next(iter(model_info.values())).size(0)
+            if any(value.size(0) != tasks for value in model_info.values()):
+                raise ValueError(
+                    'population model inputs must share a task axis'
+                )
+            if noise is None:
+                noise = self.sample_noise(tasks)
+            expected = (
+                self.n_steps,
+                tasks,
+                self.num_samples,
+                self.horizon,
+                self.action_dim,
+            )
+            if tuple(noise.shape) != expected:
+                raise ValueError(f'expected population noise shape {expected}')
+            mean, std = self.init_action_distrib(tasks, init_action)
+            mean = mean.to(device=self.device, dtype=self.dtype)
+            std = std.to(device=self.device, dtype=self.dtype)
+            mean, std, costs = population.forward(
+                model_info,
+                mean,
+                std,
+                noise,
+                module=self._mapped_population_loop,
+            )
+            output = {
+                'actions': mean,
+                'costs': costs,
+                'mean': [mean],
+                'var': [std],
+                'compiled': population.compiled,
+                'compile_error': None,
+                'population_backend': population.backend,
+            }
+            output['solve_time_seconds'] = time.perf_counter() - started
+            return output
+
         output = self.solve_population_tensors(
             models,
             self.prepare_population(info, models),

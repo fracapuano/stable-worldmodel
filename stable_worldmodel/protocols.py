@@ -1,4 +1,5 @@
 from typing import Protocol, runtime_checkable
+
 import numpy as np
 import torch
 
@@ -128,6 +129,24 @@ class Objective(Protocol):
         Returns:
             Per-candidate cost tensor of shape ``(B, S)``.
         """
+        ...
+
+
+@runtime_checkable
+class PopulationModel(Protocol):
+    """Opaque population capable of mapping a module over its members."""
+
+    model: torch.nn.Module
+    population_size: int
+    backend: str
+    compiled: bool
+
+    def forward(
+        self,
+        *args,
+        module: torch.nn.Module,
+        **kwargs,
+    ):  # pragma: no cover
         ...
 
 

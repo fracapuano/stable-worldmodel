@@ -9,6 +9,7 @@ import pytest
 import torch
 from gymnasium import spaces
 from torch import nn
+from torch.func import functional_call, stack_module_state, vmap
 
 from stable_worldmodel.planning import (
     FastCEMSolver,
@@ -63,6 +64,31 @@ class CountingEncoderModel(nn.Module):
         del kwargs
         self.rollout_calls += 1
         return emb[:, None, -1] + actions.sum(dim=(-1, -2))[..., None]
+
+
+class RepeatedPopulation:
+    backend = 'test-population-forward'
+    compiled = False
+
+    def __init__(self, model: nn.Module, size: int) -> None:
+        self.model = model
+        self.population_size = size
+
+    def forward(self, *args, module: nn.Module, **kwargs):
+        parameters, buffers = stack_module_state(
+            [deepcopy(module) for _ in range(self.population_size)]
+        )
+
+        def call(member_parameters, member_buffers):
+            return functional_call(
+                module,
+                (member_parameters, member_buffers),
+                args,
+                kwargs,
+                strict=True,
+            )
+
+        return vmap(call)(parameters, buffers)
 
 
 def test_population_fast_cem_matches_independent_fast_cem_solves():
@@ -120,6 +146,38 @@ def test_population_fast_cem_matches_independent_fast_cem_solves():
         rtol=3e-5,
         atol=3e-6,
     )
+
+
+def test_population_forward_maps_the_complete_cem_kernel():
+    model = _model()
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(model, GoalMSE()),
+        num_samples=8,
+        n_steps=2,
+        topk=2,
+        compile_kernel=False,
+    )
+    _configure(solver, tasks=2)
+    info = {
+        'emb': torch.randn(2, 1, 4),
+        'goal_emb': torch.randn(2, 1, 4),
+    }
+    noise = solver.sample_noise(2)
+
+    output = solver.solve_population(
+        info,
+        RepeatedPopulation(model, 3),
+        noise=noise,
+    )
+    expected = solver.solve_tensors(solver.prepare(info), noise=noise)
+
+    assert output['actions'].shape == (3, 2, 3, 2)
+    assert output['population_backend'] == 'test-population-forward'
+    for index in range(3):
+        torch.testing.assert_close(
+            output['actions'][index], expected['actions']
+        )
+        torch.testing.assert_close(output['costs'][index], expected['costs'])
 
 
 def test_population_models_keep_native_parameter_shapes():

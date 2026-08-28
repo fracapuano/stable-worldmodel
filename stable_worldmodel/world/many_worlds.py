@@ -22,6 +22,7 @@ from stable_worldmodel.evaluation import (
 )
 from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.policy import WorldModelPolicy
+from stable_worldmodel.protocols import PopulationModel
 from stable_worldmodel.wrapper import (
     AddPixelsWrapper,
     EnsureInfoKeysWrapper,
@@ -159,6 +160,7 @@ class ManyWorlds:
         worlds: Sequence[World],
         *,
         model_names: Sequence[str] | None = None,
+        population_size: int | None = None,
     ) -> None:
         worlds = tuple(worlds)
         if not worlds:
@@ -167,8 +169,19 @@ class ManyWorlds:
             raise TypeError('worlds must contain only World instances')
         if len({id(world) for world in worlds}) != len(worlds):
             raise ValueError('worlds must contain distinct World instances')
+        if population_size is not None:
+            if len(worlds) != 1:
+                raise ValueError(
+                    'population-forward evaluation requires exactly one World'
+                )
+            if population_size < 1:
+                raise ValueError('population_size must be positive')
 
         self.worlds = worlds
+        self._population_size = (
+            len(worlds) if population_size is None else int(population_size)
+        )
+        self._uses_population_model = population_size is not None
         self.policies = tuple(self._policy_for(world) for world in worlds)
         self.models = tuple(
             self._model_for(policy) for policy in self.policies
@@ -187,14 +200,23 @@ class ManyWorlds:
         self._jax_rollout = None
 
         if model_names is None:
-            model_names = tuple(
-                str(getattr(world, 'name', f'world-{index}'))
-                for index, world in enumerate(worlds)
+            model_names = (
+                tuple(
+                    f'candidate-{index}'
+                    for index in range(self.population_size)
+                )
+                if self._uses_population_model
+                else tuple(
+                    str(getattr(world, 'name', f'world-{index}'))
+                    for index, world in enumerate(worlds)
+                )
             )
         else:
             model_names = tuple(str(name) for name in model_names)
-        if len(model_names) != len(worlds):
-            raise ValueError('model_names must contain one name per World')
+        if len(model_names) != self.population_size:
+            raise ValueError(
+                'model_names must contain one name per population member'
+            )
         if len(set(model_names)) != len(model_names):
             raise ValueError('model_names must be unique')
         self.model_names = tuple(model_names)
@@ -208,6 +230,20 @@ class ManyWorlds:
     ) -> Self:
         """Named constructor matching ``ManyWorlds.init(worlds=[...])``."""
         return cls(worlds=worlds, model_names=model_names)
+
+    @classmethod
+    def from_population(
+        cls,
+        world: World,
+        *,
+        population_size: int,
+        model_names: Sequence[str] | None = None,
+    ) -> Self:
+        return cls(
+            worlds=(world,),
+            model_names=model_names,
+            population_size=population_size,
+        )
 
     def _common_episode_limit(self) -> int:
         limits = {
@@ -304,7 +340,7 @@ class ManyWorlds:
 
     @property
     def population_size(self) -> int:
-        return len(self.worlds)
+        return self._population_size
 
     @property
     def num_tasks(self) -> int:
@@ -390,11 +426,25 @@ class ManyWorlds:
                         f'all Worlds must use the same FastCEM {attribute}'
                     )
 
-    def _validate_population(self, solver: FastCEMSolver) -> None:
+    def _validate_population(
+        self,
+        solver: FastCEMSolver,
+        population: PopulationModel | None,
+    ) -> None:
         if not isinstance(solver, FastCEMSolver):
             raise TypeError('solver must be a FastCEMSolver')
         if getattr(solver._tensor_cost, 'model', None) is not self.models[0]:
             raise ValueError("solver must use the first World's FastCEM model")
+        if population is not None:
+            if population.population_size != self.population_size:
+                raise ValueError(
+                    'population model size does not match ManyWorlds'
+                )
+            if population.model is not self.models[0]:
+                raise ValueError(
+                    'population model must wrap the World policy model'
+                )
+            return
 
         base_state = self.models[0].state_dict()
         expected_device = torch.device(solver.device)
@@ -476,8 +526,23 @@ class ManyWorlds:
         output: dict[str, Any],
         *,
         selected_horizon: int,
+        shared_info: bool,
     ) -> None:
         """Preserve each policy's ordinary post-plan observer contract."""
+        if shared_info:
+            policy = self.policies[0]
+            if policy.on_plan is not None:
+                policy.on_plan(
+                    {
+                        'env_indices': tuple(range(self.num_tasks)),
+                        'controller_input': info,
+                        'solver_output': output,
+                        'selected_plan': output['actions'][
+                            :, :, :selected_horizon
+                        ],
+                    }
+                )
+            return
         for world_index, policy in enumerate(self.policies):
             controller_input = {
                 key: value[world_index] for key, value in info.items()
@@ -503,7 +568,11 @@ class ManyWorlds:
                 policy.on_plan(event)
 
     def _reset_envx(
-        self, protocol: EvaluationProtocol, eval_budget: int
+        self,
+        protocol: EvaluationProtocol,
+        eval_budget: int,
+        *,
+        expand_population: bool,
     ) -> dict[str, Any]:
         """Reset only the task-sized Gym pool used for initial/goal pixels."""
         first = self.worlds[0]
@@ -529,6 +598,8 @@ class ManyWorlds:
 
         # Pixel preprocessing is performed for T initial/goal frames, not P*T.
         task_info = self.policies[0]._prepare_info(first.infos)
+        if not expand_population:
+            return task_info
         population_info = {}
         for key, value in task_info.items():
             if torch.is_tensor(value) and value.size(0) == self.num_tasks:
@@ -570,6 +641,7 @@ class ManyWorlds:
         protocol: EvaluationProtocol,
         *,
         solver: FastCEMSolver,
+        population: PopulationModel | None,
         eval_budget: int,
         record: bool,
     ) -> ManyWorldsEvaluationResults:
@@ -584,20 +656,31 @@ class ManyWorlds:
                 f'{self.config.plan_len}'
             )
 
-        info = self._reset_envx(protocol, eval_budget)
+        info = self._reset_envx(
+            protocol,
+            eval_budget,
+            expand_population=population is None,
+        )
         seeds = info.get('controller_seed')
         noise = solver._batch_noise(
             self.num_tasks,
             0,
-            None if seeds is None else seeds[0],
+            None
+            if seeds is None
+            else (seeds[0] if population is None else seeds),
             np.zeros((self.num_tasks, 1), dtype=np.int64),
         )
-        output = solver.solve_population(info, self.models, noise=noise)
+        output = solver.solve_population(
+            info,
+            self.models if population is None else population,
+            noise=noise,
+        )
         planned = output['actions']
         self._notify_plans(
             info,
             output,
             selected_horizon=self.config.horizon,
+            shared_info=population is not None,
         )
         actions = self._environment_plan_tensor(planned, eval_budget)
 
@@ -632,8 +715,8 @@ class ManyWorlds:
             EvaluationResults(
                 backend=self.model_names[population_index],
                 backend_type=(
-                    f'{type(self.models[population_index]).__module__}.'
-                    f'{type(self.models[population_index]).__qualname__}'
+                    f'{type(self.models[0 if population is not None else population_index]).__module__}.'
+                    f'{type(self.models[0 if population is not None else population_index]).__qualname__}'
                 ),
                 protocol_digest=protocol.digest,
                 episodes=tuple(
@@ -697,6 +780,7 @@ class ManyWorlds:
         protocol: EvaluationProtocol,
         *,
         solver: FastCEMSolver,
+        population: PopulationModel | None = None,
         eval_budget: int | None = None,
         record: bool = False,
     ) -> ManyWorldsEvaluationResults:
@@ -712,16 +796,22 @@ class ManyWorlds:
             eval_budget = self._infer_eval_budget()
         if eval_budget < 1:
             raise ValueError('eval_budget must be positive')
+        if self._uses_population_model != (population is not None):
+            raise ValueError(
+                'population-forward ManyWorlds evaluation requires a '
+                'population model'
+            )
 
         solver.configure(
             action_space=self.worlds[0].envs.action_space,
             n_envs=self.num_tasks,
             config=self.config,
         )
-        self._validate_population(solver)
+        self._validate_population(solver, population)
         return self._evaluate_envx(
             protocol,
             solver=solver,
+            population=population,
             eval_budget=eval_budget,
             record=record,
         )

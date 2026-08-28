@@ -236,6 +236,56 @@ def test_many_worlds_envx_returns_device_resident_population_scores() -> None:
         many.close()
 
 
+def test_many_worlds_accepts_one_population_forward_world() -> None:
+    world = _world(1.0, receding_horizon=2)
+    solver = world.policy.solver
+
+    class Population:
+        model = solver.cost.model
+        population_size = 3
+        backend = 'fixed-test'
+        compiled = False
+
+        def forward(self, *args, module, **kwargs):
+            raise AssertionError(
+                'fixed solver should replace population forward'
+            )
+
+    population = Population()
+    many = swm.ManyWorlds.from_population(world, population_size=3)
+    planned = torch.zeros(3, 2, 2, 4)
+
+    def fixed_plan(info, actual, *, noise=None, init_action=None):
+        del noise, init_action
+        assert actual is population
+        assert info['pixels'].shape[0] == 2
+        return {
+            'actions': planned,
+            'costs': torch.zeros(3, 2),
+            'mean': [planned],
+            'var': [torch.ones_like(planned)],
+            'compiled': False,
+            'compile_error': None,
+            'population_backend': 'fixed-test',
+            'solve_time_seconds': 0.0,
+        }
+
+    solver.solve_population = fixed_plan
+    try:
+        result = many.evaluate(
+            _protocol(),
+            solver=solver,
+            population=population,
+            eval_budget=4,
+        )
+        assert many.bootstrap_simulator_count == 2
+        assert many.simulator_count == 6
+        assert result.planned_actions.shape == (1, 3, 2, 2, 4)
+        assert result.task_final_distances.shape == (3, 2)
+    finally:
+        many.close()
+
+
 def test_many_worlds_envx_supports_success_score() -> None:
     successes = torch.tensor([[True, False], [True, True]])
     distances = torch.zeros(2, 2)
