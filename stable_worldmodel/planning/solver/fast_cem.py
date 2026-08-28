@@ -599,9 +599,9 @@ class FastCEMSolver(CEMSolver):
                 'costs': costs,
                 'mean': [mean],
                 'var': [std],
-                'compiled': population.compiled,
+                'compiled': torch.device(self.device).type == 'cuda',
                 'compile_error': None,
-                'population_backend': population.backend,
+                'population_backend': 'population_forward',
             }
             output['solve_time_seconds'] = time.perf_counter() - started
             return output

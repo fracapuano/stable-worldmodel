@@ -243,8 +243,6 @@ def test_many_worlds_accepts_one_population_forward_world() -> None:
     class Population:
         model = solver.cost.model
         population_size = 3
-        backend = 'fixed-test'
-        compiled = False
 
         def forward(self, *args, module, **kwargs):
             raise AssertionError(

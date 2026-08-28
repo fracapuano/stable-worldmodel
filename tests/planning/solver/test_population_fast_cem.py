@@ -67,9 +67,6 @@ class CountingEncoderModel(nn.Module):
 
 
 class RepeatedPopulation:
-    backend = 'test-population-forward'
-    compiled = False
-
     def __init__(self, model: nn.Module, size: int) -> None:
         self.model = model
         self.population_size = size
@@ -172,7 +169,7 @@ def test_population_forward_maps_the_complete_cem_kernel():
     expected = solver.solve_tensors(solver.prepare(info), noise=noise)
 
     assert output['actions'].shape == (3, 2, 3, 2)
-    assert output['population_backend'] == 'test-population-forward'
+    assert output['population_backend'] == 'population_forward'
     for index in range(3):
         torch.testing.assert_close(
             output['actions'][index], expected['actions']
