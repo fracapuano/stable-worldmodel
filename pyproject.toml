@@ -21,7 +21,7 @@ dependencies = [
   "tabulate",
   "gymnasium",
   "einops",
-  "lancedb>=0.30.0",
+  "lancedb>=0.30.0,<0.38",
   "pylance>=4.0.0",
   "pyarrow",
   "pillow",
