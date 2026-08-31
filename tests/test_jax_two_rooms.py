@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import math
+from copy import deepcopy
 from importlib.util import find_spec
 
 import gymnasium as gym
@@ -11,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 from torch import nn
+from torch.func import functional_call, stack_module_state, vmap
 
 import stable_worldmodel as swm
 from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationTask
@@ -243,32 +245,27 @@ def test_many_worlds_accepts_one_population_forward_world() -> None:
     class Population:
         model = solver.cost.model
         population_size = 3
+        backend = 'test-functional-vmap'
+        compiled = False
 
         def forward(self, *args, module, **kwargs):
-            raise AssertionError(
-                'fixed solver should replace population forward'
+            parameters, buffers = stack_module_state(
+                [deepcopy(module) for _ in range(self.population_size)]
             )
+
+            def call(member_parameters, member_buffers):
+                return functional_call(
+                    module,
+                    (member_parameters, member_buffers),
+                    args,
+                    kwargs,
+                    strict=True,
+                )
+
+            return vmap(call)(parameters, buffers)
 
     population = Population()
     many = swm.ManyWorlds.from_population(world, population_size=3)
-    planned = torch.zeros(3, 2, 2, 4)
-
-    def fixed_plan(info, actual, *, noise=None, init_action=None):
-        del noise, init_action
-        assert actual is population
-        assert info['pixels'].shape[0] == 2
-        return {
-            'actions': planned,
-            'costs': torch.zeros(3, 2),
-            'mean': [planned],
-            'var': [torch.ones_like(planned)],
-            'compiled': False,
-            'compile_error': None,
-            'population_backend': 'fixed-test',
-            'solve_time_seconds': 0.0,
-        }
-
-    solver.solve_population = fixed_plan
     try:
         result = many.evaluate(
             _protocol(),
@@ -280,6 +277,8 @@ def test_many_worlds_accepts_one_population_forward_world() -> None:
         assert many.simulator_count == 6
         assert result.planned_actions.shape == (1, 3, 2, 2, 4)
         assert result.task_final_distances.shape == (3, 2)
+        assert result.population_backend == 'test-functional-vmap'
+        assert result.compiled is False
     finally:
         many.close()
 

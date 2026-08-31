@@ -552,10 +552,17 @@ class FastCEMSolver(CEMSolver):
         started = time.perf_counter()
         if isinstance(models, PopulationModel):
             population = models
+            if not isinstance(self._tensor_cost, _LeWMTerminalCost):
+                raise TypeError(
+                    'population-forward models require a compatible LeWM '
+                    'terminal cost'
+                )
             if population.model is not self._tensor_cost.model:
                 raise ValueError(
                     'population model must wrap the solver cost model'
                 )
+            if population.population_size < 1:
+                raise ValueError('population model cannot be empty')
             model_info = {
                 key: value
                 for key, value in info.items()
@@ -594,14 +601,35 @@ class FastCEMSolver(CEMSolver):
                 noise,
                 module=self._mapped_population_loop,
             )
+            expected_actions = (
+                population.population_size,
+                tasks,
+                self.horizon,
+                self.action_dim,
+            )
+            if (
+                tuple(mean.shape) != expected_actions
+                or tuple(std.shape) != expected_actions
+            ):
+                raise ValueError(
+                    'population model returned action distributions with '
+                    f'shapes {tuple(mean.shape)} and {tuple(std.shape)}; '
+                    f'expected {expected_actions}'
+                )
+            expected_costs = (population.population_size, tasks)
+            if tuple(costs.shape) != expected_costs:
+                raise ValueError(
+                    'population model returned costs with shape '
+                    f'{tuple(costs.shape)}; expected {expected_costs}'
+                )
             output = {
                 'actions': mean,
                 'costs': costs,
                 'mean': [mean],
                 'var': [std],
-                'compiled': torch.device(self.device).type == 'cuda',
+                'compiled': bool(population.compiled),
                 'compile_error': None,
-                'population_backend': 'population_forward',
+                'population_backend': str(population.backend),
             }
             output['solve_time_seconds'] = time.perf_counter() - started
             return output

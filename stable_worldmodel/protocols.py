@@ -138,6 +138,8 @@ class PopulationModel(Protocol):
 
     model: torch.nn.Module
     population_size: int
+    backend: str
+    compiled: bool
 
     def forward(
         self,

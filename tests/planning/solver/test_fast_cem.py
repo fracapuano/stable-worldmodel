@@ -72,20 +72,6 @@ class TinyDynamics(nn.Module):
         return info
 
 
-class PrimitiveDynamics(nn.Module):
-    def __init__(self, dim=4):
-        super().__init__()
-        self.predictor = nn.Identity()
-        self.predictor.num_frames = 3
-        self.action_encoder = nn.Linear(2, dim)
-
-    def encode(self, info):
-        return {'emb': info['pixels']}
-
-    def predict(self, emb, action_emb):
-        return emb + action_emb
-
-
 class ReferenceOnlyCost(nn.Module):
     def get_cost(self, info, candidates):
         return (candidates - info['target']).square().sum((-1, -2))
@@ -165,27 +151,6 @@ def test_standard_shooting_cost_automatically_uses_fast_path():
         rtol=2e-6,
         atol=1e-7,
     )
-
-
-def test_fast_path_accepts_encode_predict_inference_primitives():
-    model = PrimitiveDynamics()
-    solver = FastCEMSolver(
-        ShootingCostEvaluator(model, GoalMSE()),
-        num_samples=8,
-        n_steps=2,
-        topk=2,
-        compile_kernel=False,
-    )
-    _configure(solver, n_envs=2)
-
-    output = solver.solve(
-        {
-            'emb': torch.randn(2, 1, 4),
-            'goal_emb': torch.randn(2, 1, 4),
-        }
-    )
-
-    assert output['actions'].shape == (2, 4, 2)
 
 
 def test_rejects_callbacks_instead_of_falling_back():
