@@ -1,0 +1,501 @@
+{
+  "environment": "pusht",
+  "gpu_uuid": "GPU-c9884aab-1475-d7df-b301-fe4f4d2f3c97",
+  "started_unix": 1792683477.6774528,
+  "status": "passed",
+  "protocol_digest": "9bc9ce0a02bb24f13d6019403318549e747d1f1e1f0036037c4f3432b277d2f4",
+  "provenance": {
+    "fixture_note": "First two ordered source tasks; full goal snapshots and reference actions transported through reset options. State, goal and controls unchanged.",
+    "score": "distance",
+    "source_envx_suite_digest": "705b04ddc488fed01c73bb28fbc2562e9ca89cf53dfcebcae04d40a5374421ee",
+    "source_protocol_digest": "4ae0b6b8a1dee6a37cd637f877ede8b0ff7bc831293f4217984e015e33e5d9de",
+    "source_task_keys": [
+      "d10a9a3604812cf9e61888912eecb23fb7dff825f3f0931978151d449f468887",
+      "bd61a411cd05f8f31bc0f97d7b9d44a2533830921ba3dc1c05dd02e0a41ee5bb"
+    ]
+  },
+  "planner": {
+    "task_steps": 25,
+    "image_size": 224,
+    "horizon": 5,
+    "receding_horizon": 5,
+    "history_len": 3,
+    "action_block": 5,
+    "cem_num_samples": 64,
+    "cem_var_scale": 1.0,
+    "cem_steps": 3,
+    "cem_topk": 8,
+    "cem_seed": 42,
+    "action_normalization": {
+      "reacher": {
+        "mean": [
+          3.572766954027693e-05,
+          -0.0005056222431816063
+        ],
+        "std": [
+          0.5774140806940213,
+          0.5771826793365372
+        ]
+      },
+      "pusht": {
+        "mean": [
+          -0.007812564379916172,
+          0.006860687229453032
+        ],
+        "std": [
+          0.20846744284501714,
+          0.20674862637362224
+        ]
+      },
+      "cube": {
+        "mean": [
+          0.0108846967805138,
+          -0.0031414329928013945,
+          0.0026465825646189004,
+          0.0004239286647865428,
+          0.15925256653030173
+        ],
+        "std": [
+          0.2894198325506555,
+          0.39371697495490987,
+          0.6431365217957304,
+          0.3928016202283424,
+          0.2503073640045173
+        ]
+      }
+    }
+  },
+  "versions": {
+    "torch": "2.7.1+cu126",
+    "jax": "0.10.2",
+    "jaxlib": "0.10.2",
+    "mujoco": "3.11.0",
+    "mujoco-mjx": "3.11.0",
+    "warp-lang": "1.14.0",
+    "transformers": "4.57.1"
+  },
+  "jax_devices": [
+    "cuda:0"
+  ],
+  "gpu_name": "NVIDIA A40",
+  "weights_sha256": "48938400ae3464c9680731287f583a9cb516f55a8ec64ea13a91be47fb15b607",
+  "reset_fidelity": true,
+  "start_goal_images_differ": true,
+  "reset_cold": [
+    {
+      "phase": "reset",
+      "seconds": 1.5882190910051577
+    }
+  ],
+  "witnesses": [
+    {
+      "success": [
+        [
+          true,
+          true
+        ]
+      ],
+      "distance": [
+        [
+          15.579607009887695,
+          19.698211669921875
+        ]
+      ],
+      "length": [
+        [
+          12,
+          9
+        ]
+      ]
+    },
+    {
+      "success": [
+        [
+          true,
+          true
+        ]
+      ],
+      "distance": [
+        [
+          15.579607009887695,
+          19.698211669921875
+        ]
+      ],
+      "length": [
+        [
+          12,
+          9
+        ]
+      ]
+    },
+    {
+      "success": [
+        [
+          true,
+          true
+        ]
+      ],
+      "distance": [
+        [
+          15.579607009887695,
+          19.698211669921875
+        ]
+      ],
+      "length": [
+        [
+          12,
+          9
+        ]
+      ]
+    }
+  ],
+  "witness_physics_timings": [
+    {
+      "phase": "rollout",
+      "seconds": 1.1824356470024213
+    },
+    {
+      "phase": "rollout",
+      "seconds": 0.029022812988841906
+    },
+    {
+      "phase": "rollout",
+      "seconds": 0.028567105997353792
+    },
+    {
+      "phase": "rollout",
+      "seconds": 1.2017235750099644
+    }
+  ],
+  "independent_plans": true,
+  "world_runs": [
+    {
+      "temperature": "cold_planner",
+      "phases": [
+        {
+          "phase": "reset",
+          "seconds": 0.004923326006974094
+        },
+        {
+          "phase": "solve",
+          "seconds": 26.043974254993373
+        },
+        {
+          "phase": "rollout",
+          "seconds": 0.03313778499432374
+        }
+      ],
+      "result": {
+        "backend": "",
+        "protocol_digest": "9bc9ce0a02bb24f13d6019403318549e747d1f1e1f0036037c4f3432b277d2f4",
+        "episodes": [
+          {
+            "task_key": "6e9f7e4e61b54de03a27a05f36e6868e38dd716c499ef330e12d14d6b5a34e66",
+            "environment_seed": 1991558882,
+            "controller_seed": 2045061826,
+            "success": false,
+            "episode_return": -3339.15576171875,
+            "length": 25,
+            "path_cost": 1855.517822265625,
+            "control_cost": 0.7598423957824707,
+            "collisions": 0,
+            "constraint_violations": 0,
+            "steps": []
+          },
+          {
+            "task_key": "f25dda26f18370d536b87209e7fa9427b07acb388c45e46be5c6d86157cc879e",
+            "environment_seed": 1971179449,
+            "controller_seed": 1508426462,
+            "success": false,
+            "episode_return": -3109.34521484375,
+            "length": 25,
+            "path_cost": 1731.3111572265625,
+            "control_cost": 1.056264877319336,
+            "collisions": 0,
+            "constraint_violations": 0,
+            "steps": []
+          }
+        ],
+        "model_queries": [],
+        "metadata": {
+          "split": "smoke",
+          "environment": "swm/PushT-v1",
+          "eval_budget": 25,
+          "simulator_backend": "envx",
+          "planning_calls": 1,
+          "final_distances": [
+            135.43252563476562,
+            166.708984375
+          ],
+          "mean_final_distance": 151.0707550048828
+        },
+        "backend_type": "stable_worldmodel.wm.lewm.lewm.LeWM",
+        "success_rate": 0.0
+      }
+    },
+    {
+      "temperature": "warm",
+      "phases": [
+        {
+          "phase": "reset",
+          "seconds": 0.0049082979967352
+        },
+        {
+          "phase": "solve",
+          "seconds": 0.039906972990138456
+        },
+        {
+          "phase": "rollout",
+          "seconds": 0.028928006009664387
+        }
+      ],
+      "result": {
+        "backend": "",
+        "protocol_digest": "9bc9ce0a02bb24f13d6019403318549e747d1f1e1f0036037c4f3432b277d2f4",
+        "episodes": [
+          {
+            "task_key": "6e9f7e4e61b54de03a27a05f36e6868e38dd716c499ef330e12d14d6b5a34e66",
+            "environment_seed": 1991558882,
+            "controller_seed": 2045061826,
+            "success": false,
+            "episode_return": -3339.15576171875,
+            "length": 25,
+            "path_cost": 1855.517822265625,
+            "control_cost": 0.7598423957824707,
+            "collisions": 0,
+            "constraint_violations": 0,
+            "steps": []
+          },
+          {
+            "task_key": "f25dda26f18370d536b87209e7fa9427b07acb388c45e46be5c6d86157cc879e",
+            "environment_seed": 1971179449,
+            "controller_seed": 1508426462,
+            "success": false,
+            "episode_return": -3109.34521484375,
+            "length": 25,
+            "path_cost": 1731.3111572265625,
+            "control_cost": 1.056264877319336,
+            "collisions": 0,
+            "constraint_violations": 0,
+            "steps": []
+          }
+        ],
+        "model_queries": [],
+        "metadata": {
+          "split": "smoke",
+          "environment": "swm/PushT-v1",
+          "eval_budget": 25,
+          "simulator_backend": "envx",
+          "planning_calls": 1,
+          "final_distances": [
+            135.43252563476562,
+            166.708984375
+          ],
+          "mean_final_distance": 151.0707550048828
+        },
+        "backend_type": "stable_worldmodel.wm.lewm.lewm.LeWM",
+        "success_rate": 0.0
+      }
+    },
+    {
+      "temperature": "warm",
+      "phases": [
+        {
+          "phase": "reset",
+          "seconds": 0.003707412994117476
+        },
+        {
+          "phase": "solve",
+          "seconds": 0.038025002999347635
+        },
+        {
+          "phase": "rollout",
+          "seconds": 0.028702476003672928
+        }
+      ],
+      "result": {
+        "backend": "",
+        "protocol_digest": "9bc9ce0a02bb24f13d6019403318549e747d1f1e1f0036037c4f3432b277d2f4",
+        "episodes": [
+          {
+            "task_key": "6e9f7e4e61b54de03a27a05f36e6868e38dd716c499ef330e12d14d6b5a34e66",
+            "environment_seed": 1991558882,
+            "controller_seed": 2045061826,
+            "success": false,
+            "episode_return": -3339.15576171875,
+            "length": 25,
+            "path_cost": 1855.517822265625,
+            "control_cost": 0.7598423957824707,
+            "collisions": 0,
+            "constraint_violations": 0,
+            "steps": []
+          },
+          {
+            "task_key": "f25dda26f18370d536b87209e7fa9427b07acb388c45e46be5c6d86157cc879e",
+            "environment_seed": 1971179449,
+            "controller_seed": 1508426462,
+            "success": false,
+            "episode_return": -3109.34521484375,
+            "length": 25,
+            "path_cost": 1731.3111572265625,
+            "control_cost": 1.056264877319336,
+            "collisions": 0,
+            "constraint_violations": 0,
+            "steps": []
+          }
+        ],
+        "model_queries": [],
+        "metadata": {
+          "split": "smoke",
+          "environment": "swm/PushT-v1",
+          "eval_budget": 25,
+          "simulator_backend": "envx",
+          "planning_calls": 1,
+          "final_distances": [
+            135.43252563476562,
+            166.708984375
+          ],
+          "mean_final_distance": 151.0707550048828
+        },
+        "backend_type": "stable_worldmodel.wm.lewm.lewm.LeWM",
+        "success_rate": 0.0
+      }
+    }
+  ],
+  "population_runs": [
+    {
+      "temperature": "cold_population",
+      "phases": [
+        {
+          "phase": "reset",
+          "seconds": 0.003731900011189282
+        },
+        {
+          "phase": "solve_population",
+          "seconds": 84.85813453799346
+        },
+        {
+          "phase": "rollout",
+          "seconds": 0.03233891099807806
+        }
+      ],
+      "success": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "distances": [
+        [
+          135.43252563476562,
+          166.708984375
+        ],
+        [
+          135.43252563476562,
+          166.708984375
+        ]
+      ],
+      "scores": [
+        -151.0707550048828,
+        -151.0707550048828
+      ],
+      "compiled": true,
+      "compile_error": null,
+      "population_backend": "functional_vmap"
+    },
+    {
+      "temperature": "warm",
+      "phases": [
+        {
+          "phase": "reset",
+          "seconds": 0.00512780700228177
+        },
+        {
+          "phase": "solve_population",
+          "seconds": 0.11414323200006038
+        },
+        {
+          "phase": "rollout",
+          "seconds": 0.02869286401255522
+        }
+      ],
+      "success": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "distances": [
+        [
+          135.43252563476562,
+          166.708984375
+        ],
+        [
+          135.43252563476562,
+          166.708984375
+        ]
+      ],
+      "scores": [
+        -151.0707550048828,
+        -151.0707550048828
+      ],
+      "compiled": true,
+      "compile_error": null,
+      "population_backend": "functional_vmap"
+    },
+    {
+      "temperature": "warm",
+      "phases": [
+        {
+          "phase": "reset",
+          "seconds": 0.0037947099917801097
+        },
+        {
+          "phase": "solve_population",
+          "seconds": 0.11214401799952611
+        },
+        {
+          "phase": "rollout",
+          "seconds": 0.028382614007568918
+        }
+      ],
+      "success": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "distances": [
+        [
+          135.43252563476562,
+          166.708984375
+        ],
+        [
+          135.43252563476562,
+          166.708984375
+        ]
+      ],
+      "scores": [
+        -151.0707550048828,
+        -151.0707550048828
+      ],
+      "compiled": true,
+      "compile_error": null,
+      "population_backend": "functional_vmap"
+    }
+  ],
+  "finished_unix": 1792683600.4753296,
+  "limitation": "Two source tasks and population 2; no full-suite or training throughput claim. GPU results use tolerances, not bitwise equality."
+}

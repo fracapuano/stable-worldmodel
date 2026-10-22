@@ -1,0 +1,464 @@
+"""Frozen-task contracts and the public World/ManyWorlds envX boundary."""
+
+from __future__ import annotations
+
+import os
+from copy import deepcopy
+from importlib.util import find_spec
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from torch import nn
+
+import stable_worldmodel as swm
+from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationTask
+from stable_worldmodel.planning import (
+    FastCEMSolver,
+    GoalMSE,
+    ShootingCostEvaluator,
+)
+from stable_worldmodel.world.envx import ENVIRONMENTS, _Engine, task_inputs
+
+HAS_ENVX = find_spec('envx') is not None
+DEVICE = os.environ.get('SWM_ENVX_TEST_DEVICE', 'cpu')
+integration = pytest.mark.skipif(
+    not HAS_ENVX, reason='optional envX dependency'
+)
+
+
+def protocol(name='pusht', count=2):
+    if name == 'cube':
+        return EvaluationProtocol.read(
+            Path(__file__).parent / 'data/envx/cube.json'
+        )
+    tasks = []
+    for i in range(count):
+        if name == 'pusht':
+            start = (100.0 + i * 20, 100, 250, 250, 0, 0, 0)
+            goal = (160.0 + i * 20, 100, 250, 250, 0, 0, 0)
+            options = (('goal_state', goal), ('variation', []))
+        else:
+            start, goal = (0.2 + i * 0.1, -0.3), (0.6, -0.7)
+            options = (
+                (
+                    'reacher_task',
+                    {
+                        'start_qpos': start,
+                        'start_qvel': [0.3, -0.2],
+                        'goal_qpos': goal,
+                        'goal_qvel': [-0.1, 0.1],
+                    },
+                ),
+            )
+        tasks.append(
+            EvaluationTask(i, i + 11, i, start, goal, i, options=options)
+        )
+    environment = next(k for k, v in ENVIRONMENTS.items() if v == name)
+    return EvaluationProtocol('test', environment, tuple(tasks))
+
+
+def world_for(protocol, *, pixels=False, cap=7, **kwargs):
+    return swm.World(
+        protocol.environment,
+        len(protocol.tasks),
+        image_shape=(16, 16) if pixels else None,
+        add_pixels=pixels,
+        execution_backend='envx',
+        device=DEVICE,
+        max_episode_steps=cap,
+        **kwargs,
+    )
+
+
+def test_contract_uses_existing_full_reacher_state_without_mutation():
+    task = protocol('reacher').tasks[0]
+    options = swm.World._task_reset_options(task)
+    original = deepcopy(options)
+    start, goal, contract = task_inputs('reacher', options)
+    np.testing.assert_array_equal(
+        start['qvel'], np.asarray([0.3, -0.2], np.float32)
+    )
+    np.testing.assert_array_equal(
+        goal['qpos'], np.asarray(task.goal, np.float32)
+    )
+    assert contract['repeat'] == 2
+    assert options['reacher_task'] == original['reacher_task']
+    options['reacher_task']['start_qpos'] = [1, 2]
+    with pytest.raises(ValueError, match='disagrees'):
+        task_inputs('reacher', options)
+
+
+def test_missing_full_state_is_an_error_instead_of_random_reset():
+    with pytest.raises(ValueError, match='qvel'):
+        task_inputs('reacher', {'state': [0, 0], 'target_state': [1, 1]})
+    with pytest.raises(ValueError, match='qpos'):
+        task_inputs('cube', {'state': [0, 0, 0], 'target_state': [1, 1, 1]})
+
+
+@integration
+def test_contract_metrics_and_wrapped_angle():
+    import jax.numpy as jnp
+
+    for name, states, goals, expected in (
+        (
+            'cube',
+            [[0, 0, 0], [0.041, 0, 0]],
+            [[0.04, 0, 0], [0, 0, 0]],
+            [True, False],
+        ),
+        ('reacher', [[0, 0], [0.051, 0]], [[0.049, 0], [0, 0]], [True, False]),
+        (
+            'pusht',
+            [[0, 0, 0, 0, 0.01, 10, 0], [20, 0, 0, 0, 0, 0, 0]],
+            [[0, 0, 0, 0, 2 * np.pi - 0.01, 0, 0], [0, 0, 0, 0, 0, 0, 0]],
+            [True, False],
+        ),
+    ):
+        engine = _Engine.__new__(_Engine)
+        engine.name = name
+        engine.adapter = SimpleNamespace(vector=lambda value: value)
+        _, distances, success = engine._metrics(
+            jnp.asarray(states),
+            jnp.asarray(goals),
+            {
+                'threshold': 0.04 if name == 'cube' else 0.05,
+                'position_threshold': 20,
+                'angle_threshold': np.pi / 9,
+            },
+        )
+        np.testing.assert_array_equal(success, expected)
+        if name == 'pusht':
+            # Fitness keeps the declared raw state7 L2 distance, including
+            # velocity and raw angle, even when angular success wraps.
+            np.testing.assert_allclose(
+                distances[0],
+                np.linalg.norm(np.asarray(states[0]) - goals[0]),
+                rtol=1e-6,
+            )
+
+
+@integration
+def test_first_success_inside_repeated_control_freezes_outcome():
+    import jax.numpy as jnp
+
+    engine = _Engine.__new__(_Engine)
+    engine.name = 'reacher'
+    engine.adapter = SimpleNamespace(
+        restore=lambda inputs: jnp.zeros((1, 2)),
+        vector=lambda state: state,
+        advance=lambda state, action, contract: state + action,
+    )
+    result, _ = engine._run(
+        {'goal': jnp.asarray([[0.1, 0.0]])},
+        {'repeat': jnp.asarray([2]), 'threshold': jnp.asarray([0.05])},
+        jnp.asarray([[[0.1, 0], [1, 0], [-1, 0]]]),
+        jnp.asarray([3]),
+    )
+    states, success, distances, _, lengths, paths, controls, _ = result
+    np.testing.assert_allclose(states, [[0.1, 0]])
+    np.testing.assert_array_equal(success, [True])
+    np.testing.assert_array_equal(lengths, [1])
+    np.testing.assert_array_equal(distances, [0])
+    np.testing.assert_allclose(paths, [0.1])
+    np.testing.assert_allclose(controls, [0.01])
+
+
+@integration
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_reset_fidelity_population_order_independence_and_budget(name):
+    if name != 'pusht' and DEVICE == 'cpu':
+        pytest.skip('MJX integration runs on CUDA')
+    p = protocol(name)
+    world = world_for(p, physics_batch_size=2)
+    try:
+        world._reset_from_protocol(p, 5)
+        pool = world.envs
+        state = pool._state
+        if name == 'cube':
+            np.testing.assert_array_equal(
+                np.asarray(state.qpos),
+                np.asarray(
+                    [dict(t.options)['cube_qpos'] for t in p.tasks], np.float32
+                ),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(state.qvel),
+                np.asarray(
+                    [dict(t.options)['cube_qvel'] for t in p.tasks], np.float32
+                ),
+            )
+        elif name == 'reacher':
+            np.testing.assert_array_equal(
+                np.asarray(state.qpos),
+                np.asarray([t.start for t in p.tasks], np.float32),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(state.qvel),
+                np.asarray([[0.3, -0.2]] * 2, np.float32),
+            )
+        else:
+            torch.testing.assert_close(
+                world.infos['state'][:, 0].cpu(),
+                torch.tensor([t.start for t in p.tasks]),
+            )
+        plans = torch.zeros(
+            3, 2, 5, world.envs.single_action_space.shape[0], device=DEVICE
+        )
+        plans[0, :, :, 0] = 0.3
+        plans[1, :, :, 0] = -0.3
+        plans[2, :, :, 1] = 0.2
+        combined = pool.rollout(plans)
+        assert not torch.allclose(
+            combined.final_observations[0], combined.final_observations[1]
+        )
+        for i in range(3):
+            single = pool.rollout(plans[i : i + 1])
+            torch.testing.assert_close(
+                combined.final_observations[i],
+                single.final_observations[0],
+                rtol=2e-4,
+                atol=2e-4,
+            )
+        from dataclasses import replace
+
+        reversed_protocol = replace(p, tasks=tuple(reversed(p.tasks)))
+        world._reset_from_protocol(reversed_protocol, 5)
+        reordered = pool.rollout(plans.flip(1))
+        torch.testing.assert_close(
+            combined.final_distances,
+            reordered.final_distances.flip(1),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        world._reset_from_protocol(p, 5)
+        limited = pool.rollout(plans, max_steps=2)
+        assert torch.all(limited.lengths <= 2)
+        assert (
+            combined.final_distances.device.type == torch.device(DEVICE).type
+        )
+        assert world.infos['task_key'] == [[k] for k in p.task_keys]
+    finally:
+        world.close()
+        world.close()
+    assert world.infos == {}
+    assert world.envs._state is None
+    assert not world.envs._engines
+    with pytest.raises(RuntimeError, match='closed'):
+        world._reset_from_protocol(p, 5)
+
+
+@integration
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_goal_pixels_are_rendered_from_restored_goal_state(name):
+    if name != 'pusht' and DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
+    p = protocol(name)
+    world = world_for(p, pixels=True)
+    try:
+        world._reset_from_protocol(p, 3)
+        pixels, goal = world.infos['pixels'], world.infos['goal']
+        assert pixels.shape == goal.shape == (2, 1, 16, 16, 3)
+        assert not torch.equal(pixels, goal)
+        pool = world.envs
+        renderer = pool._engine(2, render=True)
+        expected = torch.from_dlpack(
+            renderer.render(renderer.restore(pool._inputs(which=1)))
+        )
+        torch.testing.assert_close(
+            goal[:, 0].float(),
+            expected.float(),
+            rtol=0,
+            atol=0 if name == 'pusht' else 2,
+        )
+    finally:
+        world.close()
+
+
+class TinyModel(nn.Module):
+    def __init__(self, direction=1.0):
+        super().__init__()
+        self.direction = nn.Parameter(
+            torch.tensor(direction), requires_grad=False
+        )
+
+    def encode(self, value):
+        key = 'pixels' if 'pixels' in value else 'state'
+        pixels = value[key].float()
+        return {'emb': pixels.flatten(2).mean(-1, keepdim=True)}
+
+    def rollout_from_embeddings(
+        self,
+        emb,
+        action_sequence,
+        action_history=None,
+        history_size=None,
+        *,
+        terminal_only=False,
+    ):
+        delta = action_sequence.sum(-1, keepdim=True)
+        future = emb[:, None, -1:] + self.direction * delta.cumsum(2)
+        if terminal_only:
+            return future[:, :, -1]
+        return torch.cat(
+            (emb[:, None].expand(-1, action_sequence.size(1), -1, -1), future),
+            dim=2,
+        )
+
+
+def attach_policy(world, *, horizon=4, receding=4, direction=1.0):
+    model = TinyModel(direction).to(DEVICE)
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(model, GoalMSE()),
+        batch_size=world.num_envs,
+        num_samples=4,
+        n_steps=1,
+        topk=2,
+        device=DEVICE,
+        compile_kernel=False,
+    )
+    world.set_policy(
+        swm.policy.WorldModelPolicy(
+            solver=solver,
+            config=swm.PlanConfig(horizon=horizon, receding_horizon=receding),
+        )
+    )
+    return solver
+
+
+@integration
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_public_world_and_manyworlds_evaluation(name):
+    if name != 'pusht' and DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
+    p = protocol(name)
+    worlds = [world_for(p, pixels=True), world_for(p, pixels=True)]
+    solvers = [
+        attach_policy(w, direction=float(1 - i * 2))
+        for i, w in enumerate(worlds)
+    ]
+    many = swm.ManyWorlds(worlds)
+    try:
+        events = []
+        worlds[0].policy.on_plan = events.append
+        result = worlds[0].evaluate(protocol=p, eval_budget=4)
+        assert result.task_keys == p.task_keys
+        assert result.metadata['planning_calls'] == len(events) == 1
+        assert all(1 <= row.length <= 4 for row in result.episodes)
+        population = many.evaluate(p, solver=solvers[0], eval_budget=4)
+        assert population.task_final_distances.shape == (2, 2)
+        torch.testing.assert_close(
+            population.scores, -population.task_final_distances.mean(1)
+        )
+        assert all(
+            value.task_keys == p.task_keys for value in population.evaluations
+        )
+    finally:
+        many.close()
+
+
+@integration
+def test_world_mpc_and_records_support_other_budgets():
+    p = protocol()
+    world = world_for(p, pixels=True)
+    attach_policy(world, horizon=2, receding=1)
+    try:
+        result = world.evaluate(protocol=p, eval_budget=3, record=True)
+        assert len(result.model_queries) >= 1
+        assert all(len(row.steps) == row.length for row in result.episodes)
+        assert all(row.length <= 3 for row in result.episodes)
+    finally:
+        world.close()
+
+
+@integration
+def test_population_model_and_success_scoring():
+    from dataclasses import replace
+
+    from torch.func import functional_call, stack_module_state, vmap
+
+    p = replace(protocol(), metadata=(('score', 'success'),))
+    world = world_for(p, pixels=True)
+    solver = attach_policy(world)
+
+    class Population:
+        model = solver.cost.model
+        population_size = 3
+        backend = 'test-functional-vmap'
+        compiled = False
+
+        def forward(self, *args, module, **kwargs):
+            parameters, buffers = stack_module_state(
+                [deepcopy(module) for _ in range(self.population_size)]
+            )
+
+            def call(parameters, buffers):
+                return functional_call(
+                    module, (parameters, buffers), args, kwargs, strict=True
+                )
+
+            return vmap(call)(parameters, buffers)
+
+    many = swm.ManyWorlds.from_population(world, population_size=3)
+    try:
+        result = many.evaluate(
+            p, solver=solver, population=Population(), eval_budget=4
+        )
+        assert result.task_final_distances.shape == (3, 2)
+        assert result.population_backend == 'test-functional-vmap'
+        torch.testing.assert_close(
+            result.scores, result.task_successes.float().mean(1)
+        )
+    finally:
+        many.close()
+
+
+@integration
+def test_pusht_complete_velocity_and_integer_state_restore():
+    from dataclasses import replace
+
+    p = protocol(count=1)
+    task = p.tasks[0]
+    options = dict(task.options)
+    options['simulator_state'] = {
+        'start': {
+            'qpos': task.start,
+            'qvel': [2, -3, 0.4],
+            'last_action': [120, 130],
+            'n_contacts': 3,
+            'time': 7,
+        }
+    }
+    p = replace(p, tasks=(replace(task, options=tuple(options.items())),))
+    world = world_for(p)
+    try:
+        world._reset_from_protocol(p, 4)
+        state = world.envs._state
+        np.testing.assert_allclose(np.asarray(state.block_vel), [[2, -3]])
+        np.testing.assert_allclose(np.asarray(state.block_angular_vel), [0.4])
+        np.testing.assert_allclose(np.asarray(state.last_action), [[120, 130]])
+        assert np.asarray(state.time).dtype == np.int32
+        assert np.asarray(state.n_contacts).dtype == np.int32
+        np.testing.assert_array_equal(state.time, [7])
+    finally:
+        world.close()
+
+
+@integration
+def test_mixed_physics_intervals_are_rejected():
+    from dataclasses import replace
+
+    p = protocol()
+    changed = replace(
+        p.tasks[1],
+        options=(*p.tasks[1].options, ('task_contract', {'repeat': 2})),
+    )
+    p = replace(p, tasks=(p.tasks[0], changed))
+    world = world_for(p)
+    try:
+        with pytest.raises(ValueError, match='share one physics repeat'):
+            world._reset_from_protocol(p, 4)
+    finally:
+        world.close()

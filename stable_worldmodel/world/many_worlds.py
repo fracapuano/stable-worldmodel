@@ -141,7 +141,7 @@ class ManyWorldsEvaluationResults:
 
 
 class ManyWorlds:
-    """Evaluate weight-bound TwoRoom Worlds in one envX population run.
+    """Evaluate weight-bound Worlds in one envX population run.
 
     Each input ``World`` must already have a ``WorldModelPolicy`` backed by a
     compatible ``FastCEMSolver``. This preserves the invariant that one World
@@ -246,6 +246,13 @@ class ManyWorlds:
         )
 
     def _common_episode_limit(self) -> int:
+        if self.worlds[0].execution_backend == 'envx':
+            limits = {world.envs.max_episode_steps for world in self.worlds}
+            if len(limits) != 1:
+                raise ValueError(
+                    'envX requires the same positive max_episode_steps'
+                )
+            return limits.pop()
         limits = {
             getattr(getattr(env, 'spec', None), 'max_episode_steps', None)
             for world in self.worlds
@@ -290,6 +297,33 @@ class ManyWorlds:
 
     def _validate_envx_worlds(self) -> None:
         """Reject every simulator configuration outside the tested envX path."""
+        if len({world.execution_backend for world in self.worlds}) != 1:
+            raise ValueError('ManyWorlds cannot mix World execution backends')
+        if self.worlds[0].execution_backend == 'envx':
+            first = self.worlds[0]
+            from .envx import ENVIRONMENTS
+
+            for world in self.worlds:
+                if (
+                    world.execution_backend != 'envx'
+                    or world.env_name != first.env_name
+                    or world.env_name not in ENVIRONMENTS
+                    or world.envs.device != first.envs.device
+                    or world.envs.image_shape != first.envs.image_shape
+                    or not _equivalent(
+                        world.envs.envx_options, first.envs.envx_options
+                    )
+                    or not _equivalent(
+                        world.envs.image_transform, first.envs.image_transform
+                    )
+                    or not _equivalent(
+                        world.envs.goal_transform, first.envs.goal_transform
+                    )
+                ):
+                    raise ValueError(
+                        'envX Worlds must share environment, device, rendering and simulator options'
+                    )
+            return
         for world_index, world in enumerate(self.worlds):
             for task_index, wrapped in enumerate(world.envs.envs):
                 env_id = getattr(getattr(wrapped, 'spec', None), 'id', None)
@@ -364,6 +398,7 @@ class ManyWorlds:
         """Close every owned World; safe when the Worlds are already closed."""
         for world in self.worlds:
             world.close()
+        self._jax_rollout = None
 
     def _validate_world_shapes(self) -> None:
         first_world = self.worlds[0]
@@ -470,6 +505,8 @@ class ManyWorlds:
                     )
 
     def _infer_eval_budget(self) -> int:
+        if self.worlds[0].execution_backend == 'envx':
+            return self._envx_episode_limit
         budgets = []
         for world in self.worlds:
             env = world.envs.envs[0]
@@ -500,6 +537,10 @@ class ManyWorlds:
             raw_dim,
         )[:, :, :eval_budget]
         actions = actions.detach().float()
+        if self.worlds[0].execution_backend == 'envx':
+            from .envx import decode_actions
+
+            return decode_actions(self.policies[0], actions)
         process = self.policies[0].process
         if 'action' in process:
             transformed = process['action'].inverse_transform(
@@ -578,6 +619,15 @@ class ManyWorlds:
         first = self.worlds[0]
         first._reset_from_protocol(protocol, eval_budget)
         for world in self.worlds[1:]:
+            if first.execution_backend == 'envx':
+                if (
+                    world.env_name != protocol.environment
+                    or world.num_envs != len(protocol.tasks)
+                ):
+                    raise ValueError(
+                        'protocol environment or task count differs from World'
+                    )
+                continue
             env = world.envs.envs[0]
             spec = getattr(env, 'spec', None)
             accepted_names = {
@@ -684,25 +734,21 @@ class ManyWorlds:
         )
         actions = self._environment_plan_tensor(planned, eval_budget)
 
-        from .jax_two_rooms import JaxTwoRoomsRollout
-
-        episode_limit = min(eval_budget, self._envx_episode_limit)
-        if (
-            self._jax_rollout is None
-            or self._jax_rollout.eval_budget != eval_budget
-            or self._jax_rollout.max_episode_steps != episode_limit
-        ):
-            self._jax_rollout = JaxTwoRoomsRollout(
-                population_size=self.population_size,
-                num_tasks=self.num_tasks,
-                eval_budget=eval_budget,
-                max_episode_steps=episode_limit,
+        if self.worlds[0].execution_backend == 'envx':
+            outcome = self.worlds[0].envs.rollout(actions)
+            score_name = str(dict(protocol.metadata).get('score', 'distance'))
+            if score_name == 'distance':
+                scores = -outcome.final_distances.float().mean(dim=1)
+            elif score_name == 'success':
+                scores = outcome.successes.float().mean(dim=1)
+            else:
+                raise ValueError(
+                    "protocol score must be 'distance' or 'success'"
+                )
+        else:
+            outcome, score_name, scores = self._rollout_two_rooms(
+                protocol, actions, eval_budget
             )
-        initial_state = self._jax_rollout.initial_state(self.worlds[0])
-        outcome = self._jax_rollout(initial_state, actions)
-        score_name, scores = self._score_two_rooms(
-            protocol, outcome.successes, outcome.final_distances
-        )
         success_values = outcome.successes.detach().cpu().numpy().astype(bool)
         distance_values = outcome.final_distances.detach().cpu().numpy()
         returns = outcome.returns.detach().cpu().numpy()
@@ -773,6 +819,28 @@ class ManyWorlds:
             scores=scores,
             score_name=score_name,
         )
+
+    def _rollout_two_rooms(self, protocol, actions, eval_budget):
+        from .jax_two_rooms import JaxTwoRoomsRollout
+
+        episode_limit = min(eval_budget, self._envx_episode_limit)
+        if (
+            self._jax_rollout is None
+            or self._jax_rollout.eval_budget != eval_budget
+            or self._jax_rollout.max_episode_steps != episode_limit
+        ):
+            self._jax_rollout = JaxTwoRoomsRollout(
+                population_size=self.population_size,
+                num_tasks=self.num_tasks,
+                eval_budget=eval_budget,
+                max_episode_steps=episode_limit,
+            )
+        initial_state = self._jax_rollout.initial_state(self.worlds[0])
+        outcome = self._jax_rollout(initial_state, actions)
+        score_name, scores = self._score_two_rooms(
+            protocol, outcome.successes, outcome.final_distances
+        )
+        return outcome, score_name, scores
 
     @torch.inference_mode()
     def evaluate(

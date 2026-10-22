@@ -1,0 +1,56 @@
+{
+  "pusht": {
+    "status": "passed",
+    "witness_successes_each_repeat": [
+      2,
+      2,
+      2
+    ],
+    "tasks": 2,
+    "population": 2,
+    "released_world_successes": 0,
+    "released_population_successes": 0,
+    "cold_reset_seconds": 1.5882190910051577,
+    "cold_witness_physics_seconds": 1.1824356470024213,
+    "cold_world_planning_seconds": 26.043974254993373,
+    "cold_population_planning_seconds": 84.85813453799346,
+    "warm_population_planning_seconds": 0.11357992300327169,
+    "warm_population_physics_seconds": 0.028335857001366094
+  },
+  "reacher": {
+    "status": "passed",
+    "witness_successes_each_repeat": [
+      2,
+      2,
+      2
+    ],
+    "tasks": 2,
+    "population": 2,
+    "released_world_successes": 0,
+    "released_population_successes": 0,
+    "cold_reset_seconds": 11.703875110004446,
+    "cold_witness_physics_seconds": 1.6225200799963204,
+    "cold_world_planning_seconds": 21.75144942899351,
+    "cold_population_planning_seconds": 82.7834253100009,
+    "warm_population_planning_seconds": 0.11447654949733987,
+    "warm_population_physics_seconds": 0.03629702699981863
+  },
+  "cube": {
+    "status": "passed",
+    "witness_successes_each_repeat": [
+      2,
+      2,
+      2
+    ],
+    "tasks": 2,
+    "population": 2,
+    "released_world_successes": 1,
+    "released_population_successes": 2,
+    "cold_reset_seconds": 196.5104200529895,
+    "cold_witness_physics_seconds": 8.106917793993489,
+    "cold_world_planning_seconds": 21.5146790509898,
+    "cold_population_planning_seconds": 83.83363473400823,
+    "warm_population_planning_seconds": 0.11427483199804556,
+    "warm_population_physics_seconds": 0.842967567492451
+  }
+}

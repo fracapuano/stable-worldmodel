@@ -106,8 +106,16 @@ class World:
             ``pixels`` observation; goal images are resized too. Set False
             for envs without pixels (e.g. audio): ``image_shape`` may then
             be omitted and the raw observation is lifted into info as-is.
+        execution_backend: ``'gym'`` (default) or ``'envx'`` for frozen
+            PushT, Reacher and single-Cube tasks. See docs/api/envx.md.
+        device: Torch/JAX execution device for envX; defaults to cuda:0.
+        physics_batch_size: Maximum population members per envX physics
+            batch. Every batch executes all tasks together on the device.
+        envx_options: Static options forwarded to the pinned envX factory.
         **kwargs: Forwarded to ``gym.make`` (e.g. ``render_mode``).
     """
+
+    execution_backend = 'gym'
 
     def __init__(
         self,
@@ -122,6 +130,10 @@ class World:
         goal_transform: Callable | None = None,
         image_resample: str | int | None = None,
         add_pixels: bool = True,
+        execution_backend: str = 'gym',
+        device: str | torch.device = 'cuda:0',
+        physics_batch_size: int = 16,
+        envx_options: dict | None = None,
         **kwargs: Any,
     ):
         if add_pixels and image_shape is None:
@@ -147,7 +159,38 @@ class World:
             add_pixels=add_pixels,
             **kwargs,
         )
-        self.envs = EnvPool([env_fn] * num_envs)
+        self.env_name = env_name
+        self.execution_backend = execution_backend
+        if execution_backend == 'envx':
+            from .envx import EnvXPool
+
+            if (
+                pre_wrappers
+                or extra_wrappers
+                or kwargs
+                or image_resample
+                or not goal_conditioned
+            ):
+                raise ValueError(
+                    'envX uses envx_options and task reset options; Gym '
+                    'wrappers, kwargs, image_resample and unconditioned '
+                    'goals are unsupported'
+                )
+            self.envs = EnvXPool(
+                env_name,
+                num_envs,
+                image_shape=image_shape if add_pixels else None,
+                max_episode_steps=max_episode_steps,
+                device=device,
+                image_transform=image_transform,
+                goal_transform=goal_transform,
+                physics_batch_size=physics_batch_size,
+                envx_options=envx_options,
+            )
+        elif execution_backend == 'gym':
+            self.envs = EnvPool([env_fn] * num_envs)
+        else:
+            raise ValueError("execution_backend must be 'gym' or 'envx'")
         self.policy: Policy | None = None
         self.infos: dict = {}
         self.rewards: np.ndarray | None = None
@@ -163,6 +206,12 @@ class World:
     def close(self) -> None:
         """Close all envs and release their resources."""
         self.envs.close()
+        if self.execution_backend == 'envx':
+            self.infos = {}
+            self.actions = self.rewards = None
+            self.terminateds = self.truncateds = None
+            if self.policy is not None and hasattr(self.policy, 'reset_state'):
+                self.policy.reset_state()
 
     def set_policy(self, policy: Policy) -> None:
         """Attach a policy and configure it for this world's envs.
@@ -451,7 +500,11 @@ class World:
 
         for t in range(max_steps if max_steps is not None else 2**63):
             actions = self._get_actions()
-            self.actions = np.asarray(actions).copy()
+            self.actions = (
+                actions.detach().clone()
+                if torch.is_tensor(actions)
+                else np.asarray(actions).copy()
+            )
 
             mask = alive if not alive.all() else None
             _, self.rewards, self.terminateds, self.truncateds, self.infos = (
@@ -498,6 +551,11 @@ class World:
                 return
 
     def _get_actions(self) -> np.ndarray:
+        if self.execution_backend == 'envx':
+            from stable_worldmodel.policy import WorldModelPolicy
+
+            if isinstance(self.policy, WorldModelPolicy):
+                return self.policy.get_action(self.infos, return_tensor=True)
         return self.policy.get_action(self.infos)
 
     def _evaluate(self, episodes, seed, options, video, mode) -> dict:
@@ -552,6 +610,14 @@ class World:
         )
         from stable_worldmodel.evaluation.records import recordable
 
+        if self.execution_backend == 'envx':
+            from .envx_evaluation import evaluate_world
+
+            result = evaluate_world(
+                self, protocol, eval_budget, video, record, backend
+            )
+            if result is not None:
+                return result
         self._reset_from_protocol(protocol, eval_budget)
 
         def info_at(key: str, index: int, default: Any = None) -> Any:
@@ -648,7 +714,10 @@ class World:
             active = np.asarray(mask, dtype=bool)
             for i in np.where(active)[0]:
                 current_state = state_at(i)
-                action = np.asarray(world.actions[i]).copy()
+                action = world.actions[i]
+                if torch.is_tensor(action):
+                    action = action.detach().cpu().numpy()
+                action = np.asarray(action).copy()
                 reward = float(world.rewards[i])
                 returns[i] += reward
                 lengths[i] += 1
@@ -741,13 +810,17 @@ class World:
 
         if not isinstance(protocol, EvaluationProtocol):
             raise TypeError('protocol must be an EvaluationProtocol')
-        first_env = self.envs.envs[0]
-        spec = getattr(first_env, 'spec', None)
-        env_id = getattr(spec, 'id', None)
-        accepted_names = {
-            env_id,
-            getattr(first_env.unwrapped, 'env_name', None),
-        }
+        if self.execution_backend == 'envx':
+            env_id = self.env_name
+            accepted_names = {env_id}
+        else:
+            first_env = self.envs.envs[0]
+            spec = getattr(first_env, 'spec', None)
+            env_id = getattr(spec, 'id', None)
+            accepted_names = {
+                env_id,
+                getattr(first_env.unwrapped, 'env_name', None),
+            }
         if protocol.environment not in accepted_names:
             raise ValueError(
                 f'protocol environment {protocol.environment!r} does not '

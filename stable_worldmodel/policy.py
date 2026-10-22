@@ -135,29 +135,34 @@ class BasePolicy:
             is_numpy = isinstance(v, (np.ndarray | np.generic))
 
             if hasattr(self, 'process') and k in self.process:
-                if not is_numpy:
-                    raise ValueError(
-                        f"Expected numpy array for key '{k}' in process, got {type(v)}"
+                if (
+                    torch.is_tensor(v)
+                    and getattr(
+                        getattr(self, 'env', None), 'execution_backend', None
                     )
+                    == 'envx'
+                ):
+                    from stable_worldmodel.world.envx import apply_scaler
 
-                # flatten extra dimensions if needed
-                shape = v.shape
-                if len(shape) > 2:
-                    v = v.reshape(-1, *shape[2:])
-
-                # process and reshape back
-                v = self.process[k].transform(v)
-                v = v.reshape(shape)
+                    v = apply_scaler(self.process[k], v)
+                elif not is_numpy:
+                    raise ValueError(
+                        f'Expected numpy array for key {k!r} in process, got {type(v)}'
+                    )
+                if is_numpy:
+                    shape = v.shape
+                    if len(shape) > 2:
+                        v = v.reshape(-1, *shape[2:])
+                    v = self.process[k].transform(v).reshape(shape)
 
             # collapse env and time dimensions for transform (e, t, ...) -> (e * t, ...)
             # then restore after transform
             if hasattr(self, 'transform') and k in self.transform:
                 shape = None
-                if is_numpy or torch.is_tensor(v):
-                    if v.ndim > 2:
-                        shape = v.shape
-                        v = v.reshape(-1, *shape[2:])
-                if k.startswith('pixels') or k.startswith('goal'):
+                if (is_numpy or torch.is_tensor(v)) and v.ndim > 2:
+                    shape = v.shape
+                    v = v.reshape(-1, *shape[2:])
+                if k.startswith(('pixels', 'goal')):
                     # permute channel first for transform
                     if is_numpy:
                         v = np.transpose(v, (0, 3, 1, 2))
@@ -250,7 +255,6 @@ class ExpertPolicy(BasePolicy):
             The expert action, or None if not available.
         """
         # Implement expert policy logic here
-        pass
 
 
 class FeedForwardPolicy(BasePolicy):
@@ -424,7 +428,9 @@ class WorldModelPolicy(BasePolicy):
             'Solver must implement the Solver protocol'
         )
 
-    def get_action(self, info_dict: dict, **kwargs: Any) -> np.ndarray:
+    def get_action(
+        self, info_dict: dict, *, return_tensor: bool = False, **kwargs: Any
+    ) -> np.ndarray | torch.Tensor:
         """Get action via planning with the world model.
 
         Args:
@@ -510,7 +516,15 @@ class WorldModelPolicy(BasePolicy):
                 else None
             )
 
-            outputs = self.solver(sliced, init_action=sliced_init)
+            solver_options = {}
+            if return_tensor:
+                from stable_worldmodel.planning import FastCEMSolver
+
+                if isinstance(self.solver, FastCEMSolver):
+                    solver_options['return_tensors'] = True
+            outputs = self.solver(
+                sliced, init_action=sliced_init, **solver_options
+            )
 
             actions = outputs['actions']
             keep_horizon = self.cfg.receding_horizon
@@ -530,7 +544,11 @@ class WorldModelPolicy(BasePolicy):
             if self.cfg.warm_start and rest.shape[1] > 0:
                 if self._next_init is None:
                     self._next_init = torch.zeros(
-                        n_envs, rest.shape[1], rest.shape[2], dtype=rest.dtype
+                        n_envs,
+                        rest.shape[1],
+                        rest.shape[2],
+                        dtype=rest.dtype,
+                        device=rest.device,
                     )
                 self._next_init[idx_tensor] = rest
             elif not self.cfg.warm_start:
@@ -550,6 +568,7 @@ class WorldModelPolicy(BasePolicy):
             (n_envs, *single_shape),
             fill_value=0 if is_discrete else float('nan'),
             dtype=torch.long if is_discrete else torch.float32,
+            device=self.solver.device if return_tensor else 'cpu',
         )
 
         for i in range(n_envs):
@@ -557,6 +576,10 @@ class WorldModelPolicy(BasePolicy):
                 action[i] = self._action_buffer[i].popleft()
 
         action = action.reshape(*self.env.action_space.shape)
+        if return_tensor:
+            from stable_worldmodel.world.envx import decode_actions
+
+            return decode_actions(self, action)
         action = action.numpy()
 
         if 'action' in self.process:
