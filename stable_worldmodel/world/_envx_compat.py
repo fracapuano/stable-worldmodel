@@ -11,6 +11,27 @@ import jax
 import jax.numpy as jnp
 
 
+def retain_state(current, following, active):
+    # MJX-Warp contact/solver scratch buffers in _impl are shared by the
+    # whole batch. They are recomputed by physics, not frozen per world.
+    implementation = getattr(following, '_impl', None)
+    if implementation is not None:
+        current = current.replace(_impl=None)
+        following = following.replace(_impl=None)
+    selected = jax.tree.map(
+        lambda new, old: jnp.where(
+            active.reshape((-1,) + (1,) * (new.ndim - 1)), new, old
+        ),
+        following,
+        current,
+    )
+    return (
+        selected.replace(_impl=implementation)
+        if implementation is not None
+        else selected
+    )
+
+
 def make_env(name, **kwargs):
     import envx
 

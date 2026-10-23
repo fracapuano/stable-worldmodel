@@ -574,11 +574,17 @@ class WorldModelPolicy(BasePolicy):
         single_shape = self.env.single_action_space.shape
         is_discrete = 'Discrete' in type(self.env.single_action_space).__name__
 
+        action_device = 'cpu'
+        if return_tensor:
+            action_device = next(
+                (buffer[0].device for buffer in self._action_buffer if buffer),
+                'cpu',
+            )
         action = torch.full(
             (n_envs, *single_shape),
             fill_value=0 if is_discrete else float('nan'),
             dtype=torch.long if is_discrete else torch.float32,
-            device=self.solver.device if return_tensor else 'cpu',
+            device=action_device,
         )
 
         for i in range(n_envs):

@@ -177,6 +177,8 @@ class _Engine:
         import jax
         import jax.numpy as jnp
 
+        from ._envx_compat import retain_state
+
         state = (
             self.adapter.restore(inputs)
             if initial_state is None
@@ -226,9 +228,9 @@ class _Engine:
                 values = jnp.where(live[:, None], next_values, values)
                 distance = jnp.where(live, next_distance, distance)
                 success |= live & hit
-                # Batched physics may continue for completed rows; every
-                # reported outcome freezes at the first successful substep.
-                current = next_state
+                # Retain the full terminal simulator state so rendering and
+                # subsequent masked steps agree with the reported outcome.
+                current = retain_state(current, next_state, live)
                 return current, values, distance, success, path
 
             state, values, distance, success, path = jax.lax.fori_loop(
@@ -294,6 +296,12 @@ class EnvXPool:
         physics_batch_size=16,
         envx_options=None,
     ):
+        self.device = torch.device(device)
+        if self.device.type not in ('cuda', 'cpu'):
+            raise ValueError('envX supports CPU or CUDA devices')
+        if self.device.type == 'cuda' and self.device.index is None:
+            # Resolve before envX/JAX initialize their CUDA backends.
+            self.device = torch.device('cuda', torch.cuda.current_device())
         os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
         from .jax_two_rooms import JaxTwoRoomsRollout
 
@@ -316,9 +324,6 @@ class EnvXPool:
             )
         self.env_name, self.name = env_name, ENVIRONMENTS[env_name]
         self.num_envs, self.max_episode_steps = num_envs, max_episode_steps
-        self.device = torch.device(device)
-        if self.device.type not in ('cuda', 'cpu'):
-            raise ValueError('envX supports CPU or CUDA devices')
         self.jax_device = jax.local_devices(
             backend='gpu' if self.device.type == 'cuda' else 'cpu'
         )[self.device.index or 0]
@@ -540,7 +545,11 @@ class EnvXPool:
         self._infos.update(
             state=vector[:, None],
             distance_to_target=distance[:, None],
-            action=actions[:, None],
+            action=torch.where(
+                torch.as_tensor(active, device=self.device)[:, None, None],
+                actions[:, None],
+                torch.as_tensor(self._infos['action'], device=self.device),
+            ),
             step_idx=self._steps[:, None].copy(),
         )
         if self.image_shape:
@@ -555,7 +564,9 @@ class EnvXPool:
         truncated = (
             (self._steps >= self.max_episode_steps) & active & ~terminated
         )
-        self._infos['terminated'] = terminated.copy()
+        self._infos['terminated'] = np.where(
+            active, terminated, self._infos['terminated']
+        )
         return None, rewards.cpu().numpy(), terminated, truncated, self._infos
 
     def rollout(self, actions, *, max_steps=None, limits=None):

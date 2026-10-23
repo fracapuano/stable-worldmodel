@@ -151,7 +151,7 @@ def test_first_success_inside_repeated_control_freezes_outcome():
         vector=lambda state: state,
         advance=lambda state, action, contract: state + action,
     )
-    result, _ = engine._run(
+    result, simulator_state = engine._run(
         {'goal': jnp.asarray([[0.1, 0.0]])},
         {'repeat': jnp.asarray([2]), 'threshold': jnp.asarray([0.05])},
         jnp.asarray([[[0.1, 0], [1, 0], [-1, 0]]]),
@@ -159,11 +159,123 @@ def test_first_success_inside_repeated_control_freezes_outcome():
     )
     states, success, distances, _, lengths, paths, controls, _ = result
     np.testing.assert_allclose(states, [[0.1, 0]])
+    np.testing.assert_allclose(simulator_state, states)
     np.testing.assert_array_equal(success, [True])
     np.testing.assert_array_equal(lengths, [1])
     np.testing.assert_array_equal(distances, [0])
     np.testing.assert_allclose(paths, [0.1])
     np.testing.assert_allclose(controls, [0.01])
+
+
+@integration
+def test_completed_task_retains_terminal_infos_while_other_task_runs():
+    p = protocol()
+    world = world_for(p, pixels=True, cap=5)
+    try:
+        world._reset_from_protocol(p, 5)
+        active = np.ones(2, bool)
+        terminal = None
+        for _ in range(5):
+            _, rewards, done, truncated, infos = world.envs.step(
+                torch.tensor([[0.5, 0], [0, 0]], device=DEVICE), mask=active
+            )
+            if not active[0]:
+                assert rewards[0] == 0
+                assert not done[0] and not truncated[0]
+            if done[0] and terminal is None:
+                terminal = {
+                    key: value[0].clone()
+                    if torch.is_tensor(value)
+                    else value[0].copy()
+                    for key, value in infos.items()
+                }
+            active &= ~(done | truncated)
+        assert terminal is not None
+        assert infos['terminated'][0]
+        assert infos['step_idx'][0, 0] < infos['step_idx'][1, 0] == 5
+        for key, value in terminal.items():
+            if torch.is_tensor(value):
+                torch.testing.assert_close(infos[key][0], value)
+            else:
+                np.testing.assert_array_equal(infos[key][0], value)
+    finally:
+        world.close()
+
+
+@integration
+def test_reacher_success_on_first_repeat_retains_physics_and_pixels():
+    if DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
+    from dataclasses import replace
+
+    import jax
+    import jax.numpy as jnp
+
+    p = protocol('reacher', count=1)
+    task = p.tasks[0]
+    payload = dict(task.options)['reacher_task']
+    payload.update(start_qpos=[0, 0], start_qvel=[1, 1])
+    task = replace(task, start=(0, 0))
+    p = replace(p, tasks=(task,))
+    world = world_for(p, pixels=True)
+    try:
+        world._reset_from_protocol(p, 2)
+        pool = world.envs
+        engine = pool._engine(1)
+        first = jax.jit(engine.adapter.advance)(
+            pool._state,
+            jax.device_put(jnp.zeros((1, 2)), pool.jax_device),
+            pool._contract,
+        )
+        goal = tuple(np.asarray(first.qpos)[0].tolist())
+        payload.update(
+            goal_qpos=goal, goal_qvel=np.asarray(first.qvel)[0].tolist()
+        )
+        task = replace(
+            task,
+            goal=goal,
+            options=(
+                ('reacher_task', payload),
+                ('task_contract', {'threshold': 0.001}),
+            ),
+        )
+        world._reset_from_protocol(replace(p, tasks=(task,)), 2)
+        _, _, done, _, infos = pool.step(torch.zeros((1, 2), device=DEVICE))
+        assert done.all()
+        np.testing.assert_allclose(np.asarray(pool._state.qpos), [goal])
+        np.testing.assert_allclose(
+            np.asarray(pool._state.qvel), np.asarray(first.qvel), rtol=1e-5
+        )
+        torch.testing.assert_close(infos['pixels'], infos['goal'])
+        assert infos['distance_to_target'].item() < 0.001
+    finally:
+        world.close()
+
+
+@integration
+def test_implicit_cuda_uses_current_torch_device():
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip('requires two CUDA devices')
+    import jax
+
+    jax.local_devices(backend='gpu')
+    previous = torch.cuda.current_device()
+    world = None
+    try:
+        torch.cuda.set_device(1)
+        p = protocol(count=1)
+        world = swm.World(p.environment, 1, add_pixels=False, device='cuda')
+        world._reset_from_protocol(p, 2)
+        assert world.envs.device == torch.device('cuda:1')
+        assert world.envs.jax_device == jax.local_devices(backend='gpu')[1]
+        plans = torch.zeros((1, 1, 2, 2), device='cuda:1')
+        outcome = world.envs.rollout(plans)
+        assert outcome.final_observations.device == plans.device
+        assert outcome.final_distances.device == plans.device
+    finally:
+        if world is not None:
+            world.close()
+        torch.cuda.set_device(previous)
 
 
 @integration
@@ -364,6 +476,35 @@ def attach_policy(
         )
     )
     return solver
+
+
+@integration
+def test_classic_cem_uses_world_step_loop(monkeypatch):
+    from stable_worldmodel.planning import CEMSolver
+
+    class Cost:
+        def get_cost(self, info, actions):
+            return actions.square().sum((-1, -2))
+
+    p = protocol()
+    world = world_for(p)
+    solver = CEMSolver(Cost(), num_samples=4, n_steps=1, topk=2, device=DEVICE)
+    world.set_policy(
+        swm.policy.WorldModelPolicy(
+            solver, swm.PlanConfig(horizon=2, receding_horizon=2)
+        )
+    )
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('complete-plan execution requires FastCEM')
+
+    monkeypatch.setattr(world.policy, '_get_action_plan', unexpected)
+    try:
+        result = world.evaluate(protocol=p, eval_budget=2)
+        assert result.task_keys == p.task_keys
+        assert all(row.length == 2 for row in result.episodes)
+    finally:
+        world.close()
 
 
 @pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])

@@ -7,13 +7,19 @@ import torch
 
 from stable_worldmodel.evaluation import EvaluationResults
 from stable_worldmodel.evaluation.records import episodes_from_rollout
+from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.policy import WorldModelPolicy
 
 
 @torch.inference_mode()
 def evaluate_world(world, protocol, budget, video, record, backend):
     policy = world.policy
-    if not isinstance(policy, WorldModelPolicy) or video or record:
+    if (
+        not isinstance(policy, WorldModelPolicy)
+        or not isinstance(policy.solver, FastCEMSolver)
+        or video
+        or record
+    ):
         return None
     if budget is None or budget < 1:
         raise ValueError('protocol evaluation requires eval_budget >= 1')

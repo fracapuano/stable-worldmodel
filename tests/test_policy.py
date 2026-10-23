@@ -421,6 +421,22 @@ def test_worldmodel_policy_init():
     assert policy.transform == {}
 
 
+def test_tensor_actions_do_not_require_a_solver_device_attribute():
+    solver = MockSolver()
+    policy = WorldModelPolicy(
+        solver, PlanConfig(horizon=2, receding_horizon=2)
+    )
+    env = MagicMock()
+    env.num_envs = 2
+    env.action_space = gym_spaces.Box(-1, 1, (2, 2))
+    env.single_action_space = gym_spaces.Box(-1, 1, (2,))
+    policy.set_env(env)
+    actions = policy.get_action(
+        {'state': np.zeros((2, 1, 1))}, return_tensor=True
+    )
+    torch.testing.assert_close(actions, torch.zeros(2, 2))
+
+
 def test_complete_plan_preserves_controls_scaling_and_callback():
     class FixedSolver(MockSolver):
         def solve(self, info_dict, init_action=None):
