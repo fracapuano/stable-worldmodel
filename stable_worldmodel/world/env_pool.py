@@ -22,6 +22,37 @@ import torch
 from gymnasium.vector.utils import batch_space
 
 
+class _DeferredEnvPool:
+    """Expose control spaces without constructing a second simulator pool.
+
+    Frozen protocol evaluation can select envX before any Gym environment is
+    created. Ordinary resets, collection and evaluation still construct the
+    original Gym pool on first use.
+    """
+
+    execution_backend = 'gym'
+
+    def __init__(self, env_fns, single_action_space):
+        self.num_envs = len(env_fns)
+        self.single_action_space = single_action_space
+        self.action_space = batch_space(single_action_space, self.num_envs)
+        self._env_fns = env_fns
+        self._pool = None
+        self._closed = False
+
+    def __getattr__(self, name):
+        if self._closed:
+            raise RuntimeError('World is closed')
+        if self._pool is None:
+            self._pool = EnvPool(self._env_fns)
+        return getattr(self._pool, name)
+
+    def close(self):
+        if self._pool is not None:
+            self._pool.close()
+        self._closed = True
+
+
 class EnvPool:
     """Batched env runner with selective stepping.
 

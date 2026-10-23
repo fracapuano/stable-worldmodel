@@ -293,7 +293,16 @@ class EnvXPool:
         from .jax_two_rooms import JaxTwoRoomsRollout
 
         JaxTwoRoomsRollout._validate_cuda_packages()
-        import jax
+        try:
+            import envx
+            import jax
+        except ImportError as error:
+            raise ImportError(
+                'Frozen envX evaluation requires Python 3.11 or 3.12 and '
+                'the pinned dependencies in stable-worldmodel[envx]; see '
+                'docs/api/envx.md'
+            ) from error
+        del envx
 
         if env_name not in ENVIRONMENTS:
             raise ValueError(f'envX World does not support {env_name!r}')

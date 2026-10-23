@@ -12,7 +12,6 @@ world = swm.World(
     protocol.environment,
     num_envs=len(protocol.tasks),
     image_shape=(224, 224),
-    execution_backend='envx',
     device='cuda:0',
     max_episode_steps=25,
 )
@@ -24,8 +23,13 @@ finally:
 ```
 
 Supported IDs are `swm/PushT-v1`, `swm/ReacherDMControl-v0`, and
-`swm/OGBCube-v0` (single Cube). The default backend remains Gym. TwoRoom's
-existing Gym reset and envX population execution are unchanged.
+`swm/OGBCube-v0` (single Cube). `World.evaluate(protocol=...)` and
+`ManyWorlds` select envX internally for these frozen task evaluations; no
+backend argument is needed. Construction and policy attachment do not
+create a Gym simulator or initialize JAX. Ordinary episodic/dataset
+evaluation, explicit resets and collection retain the existing Gym task
+behavior. TwoRoom's existing Gym reset and envX population execution are
+unchanged. Unsupported frozen-task options raise; there is no CPU fallback.
 
 For populations use the same public constructors as TwoRoom:
 
@@ -86,7 +90,7 @@ velocity. Missing T velocity means zero, matching the existing state7 reset.
 Optional `time`, `last_action`, and `n_contacts` restore the remaining envX
 state fields. Geometry stays the pinned environment geometry.
 
-These explicit task contracts apply to this opt-in frozen-task backend:
+These task-suite defaults apply only to frozen protocol evaluations:
 
 | Environment | Distance / fitness | Success | Control |
 | --- | --- | --- | --- |
@@ -185,7 +189,8 @@ control would remove most of this compatibility module. Arbitrary Gym
 wrappers, nonempty Gym variation settings, observation noise, independent
 layout RNG, and a generic random/episodic envX task generator are not
 implemented. Unsupported requests raise instead of changing execution.
-Use the existing Gym backend for those default environment workflows.
+Ordinary episodic/dataset evaluation and collection keep their existing
+environment workflows without changing simulator settings in application code.
 Collision/constraint counters are not instrumented for these three envX
 contracts (the legacy result fields are zero).
 
@@ -196,7 +201,7 @@ independent plans, ordering, limits, first success, scores, MPC and cleanup.
 `tests/test_jax_two_rooms.py` retains the TwoRoom regression suite.
 
 `scripts/examples/envx_smoke.py` runs the released checkpoints with the
-frozen planner settings in `tests/data/envx/planner.json`, replays known
+frozen planner settings in `tests/data/envx_tasks/planner.json`, replays known
 witnesses three times, and runs three ordinary and population evaluations.
 The fixtures preserve the first two ordered source tasks' physical states,
 goals and witness controls; complete Cube goal snapshots are transported

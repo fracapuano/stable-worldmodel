@@ -188,6 +188,8 @@ class ManyWorlds:
         )
         for model in self.models:
             model.eval()
+        for world in worlds:
+            world._use_protocol_pool()
         self._validate_world_shapes()
         self._validate_envx_worlds()
         self._envx_episode_limit = self._common_episode_limit()

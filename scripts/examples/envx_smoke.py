@@ -88,10 +88,10 @@ def main():
         device = 'cuda:0'
         root = Path(__file__).resolve().parents[2]
         protocol = EvaluationProtocol.read(
-            root / 'tests/data/envx' / (args.environment + '.json')
+            root / 'tests/data/envx_tasks' / (args.environment + '.json')
         )
         settings = json.loads(
-            (root / 'tests/data/envx/planner.json').read_text()
+            (root / 'tests/data/envx_tasks/planner.json').read_text()
         )
         normalization = settings['action_normalization'][args.environment]
         save(
@@ -165,7 +165,6 @@ def main():
                 len(protocol.tasks),
                 image_shape=(settings['image_size'],) * 2,
                 max_episode_steps=settings['task_steps'],
-                execution_backend='envx',
                 device=device,
             )
             bound = model if member == 0 else copy.deepcopy(model)
@@ -201,6 +200,9 @@ def main():
             worlds.append(world)
 
         world = worlds[0]
+        # Instrument the internally selected pool before its first reset.
+        for member in worlds:
+            member._use_protocol_pool()
         phases = []
 
         def timed(obj, method):

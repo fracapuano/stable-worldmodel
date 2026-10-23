@@ -1,9 +1,34 @@
 # envX integration evidence — 22 October 2026
 
-All implementation changes are in stable-worldmodel, based on `328528c`.
-`source.json` records the final source hashes. No evolving-wm or envX source
+All implementation changes are in stable-worldmodel. The implementation was
+validated on `328528c`, then rebased onto fork main `c1f63de` (identical trees).
+`source.json` records the 22 October implementation hashes. No evolving-wm or envX source
 was modified. Remote work used isolated `/tmp/capuano-swm-envx-20261022` on
 FLAIR node 1; existing training runtimes were not changed.
+
+## Public API revision — 23 October
+
+Frozen protocol evaluation now selects envX internally, without an
+`execution_backend` constructor argument. Gym creation is deferred for these
+three environments so attaching a policy does not construct an unused CPU
+simulator. Ordinary episodic/dataset evaluation and collection keep the
+existing default tasks, including when called after a frozen evaluation.
+Both owned pools are closed idempotently.
+
+`final-api/` records checks of this revision:
+
+- Full local suite: 1,244 passed, 36 skipped, 1 xpassed. One DataLoader stress
+  check failed because the sandbox denied `torch_shm_manager`; that same
+  check passed with access to local shared memory (`local-stress.log`).
+- CPU envX checks: 17 passed, 6 skipped, including routing back to ordinary
+  task evaluation and a 25-control blocked plan with one planning call.
+- Ruff/pre-commit, wheel/sdist build and strict documentation build passed.
+- Frozen fixtures are under `tests/data/envx_tasks/`. The rename prevents
+  pytest from mistaking a fixture directory for the optional `envx` package.
+  Frozen task JSON contents and planner settings are unchanged.
+- The GPU evidence below covers the earlier implementation. Final-revision
+  GPU reruns are pending authorization to copy source to the existing FLAIR
+  runtime; these checks must not be described as final-revision GPU evidence.
 
 ## Checks
 
@@ -63,7 +88,7 @@ Checkpoint SHA256s are recorded in each JSON:
 - Reacher release `62adae4b71dc474ddf8f794c476ebfe737a743ca`.
 - Cube release `b0747c5002e86d2ce8f3cd8178004b97524c587d`.
 
-Frozen fixture provenance is in each protocol under `tests/data/envx/`.
+Frozen fixture provenance is in each protocol under `tests/data/envx_tasks/`.
 The source branches inspected were PushT `717d778`, Reacher `5b8b74e`, and
 Cube `13d0eeb`. Start/goal states and witness actions were preserved. Full
 Cube goal snapshots and witness controls were transported into existing task

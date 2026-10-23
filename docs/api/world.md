@@ -307,6 +307,7 @@ The underlying batched simulator. You rarely touch it directly — `World` build
 
 ## envX frozen tasks
 
-PushT, Reacher and single Cube support `execution_backend='envx'` on the same
-`World` and `ManyWorlds` interfaces. See [envX execution](envx.md) for complete
-state reset options, task contracts, GPU setup and validation evidence.
+Frozen PushT, Reacher and single-Cube protocols use envX internally through
+the same `World.evaluate(protocol=...)` and `ManyWorlds` interfaces. Ordinary
+environment runs keep their existing task behavior. See [envX execution](envx.md)
+for complete state reset options, task contracts, GPU setup and validation evidence.

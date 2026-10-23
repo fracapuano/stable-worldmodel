@@ -8,6 +8,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
 
+import gymnasium as gym
 import numpy as np
 import pytest
 import torch
@@ -32,7 +33,7 @@ integration = pytest.mark.skipif(
 def protocol(name='pusht', count=2):
     if name == 'cube':
         return EvaluationProtocol.read(
-            Path(__file__).parent / 'data/envx/cube.json'
+            Path(__file__).parent / 'data/envx_tasks/cube.json'
         )
     tasks = []
     for i in range(count):
@@ -66,7 +67,6 @@ def world_for(protocol, *, pixels=False, cap=7, **kwargs):
         len(protocol.tasks),
         image_shape=(16, 16) if pixels else None,
         add_pixels=pixels,
-        execution_backend='envx',
         device=DEVICE,
         max_episode_steps=cap,
         **kwargs,
@@ -308,7 +308,9 @@ class TinyModel(nn.Module):
         )
 
 
-def attach_policy(world, *, horizon=4, receding=4, direction=1.0):
+def attach_policy(
+    world, *, horizon=4, receding=4, action_block=1, direction=1.0
+):
     model = TinyModel(direction).to(DEVICE)
     solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
@@ -322,10 +324,133 @@ def attach_policy(world, *, horizon=4, receding=4, direction=1.0):
     world.set_policy(
         swm.policy.WorldModelPolicy(
             solver=solver,
-            config=swm.PlanConfig(horizon=horizon, receding_horizon=receding),
+            config=swm.PlanConfig(
+                horizon=horizon,
+                receding_horizon=receding,
+                action_block=action_block,
+            ),
         )
     )
     return solver
+
+
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_policy_attachment_does_not_construct_either_simulator(
+    name, monkeypatch
+):
+    def unexpected(*args, **kwargs):
+        raise AssertionError('policy attachment must only need control spaces')
+
+    monkeypatch.setattr('stable_worldmodel.world.world._make_env', unexpected)
+    monkeypatch.setattr('stable_worldmodel.world.envx.EnvXPool', unexpected)
+    world = world_for(protocol(name))
+    try:
+        attach_policy(world)
+        assert world.num_envs == 2
+        assert world.policy.env.single_action_space.shape == (
+            5 if name == 'cube' else 2,
+        )
+    finally:
+        world.close()
+
+
+class DefaultTaskEnv(gym.Env):
+    """Distinguish the ordinary environment task from frozen task execution."""
+
+    action_space = gym.spaces.Box(-1, 1, (2,), np.float32)
+    observation_space = gym.spaces.Box(-1, 1, (2,), np.float32)
+
+    def __init__(self):
+        self.options = []
+        self.closed = False
+
+    def reset(self, *, seed=None, options=None):
+        self.options.append(options)
+        return np.zeros(2, np.float32), {'terminated': False}
+
+    def step(self, action):
+        return np.zeros(2, np.float32), 0.0, False, True, {'terminated': False}
+
+    def close(self):
+        self.closed = True
+
+
+def test_ordinary_evaluation_keeps_environment_defaults(monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError('ordinary evaluation must not require envX')
+
+    envs = [DefaultTaskEnv(), DefaultTaskEnv()]
+    pending = iter(envs)
+    monkeypatch.setattr(
+        'stable_worldmodel.world.world._make_env',
+        lambda *a, **kw: next(pending),
+    )
+    monkeypatch.setattr('stable_worldmodel.world.envx.EnvXPool', unexpected)
+    world = world_for(protocol())
+    world.set_policy(swm.policy.RandomPolicy(seed=0))
+    try:
+        result = world.evaluate(
+            episodes=2, options={'ordinary_task': 'original'}
+        )
+        assert result['success_rate'] == 0
+        assert all(
+            row['ordinary_task'] == 'original'
+            for e in envs
+            for row in e.options
+        )
+    finally:
+        world.close()
+    assert all(e.closed for e in envs)
+
+
+@integration
+def test_world_returns_to_ordinary_task_after_protocol(monkeypatch):
+    envs = [DefaultTaskEnv(), DefaultTaskEnv()]
+    pending = iter(envs)
+    monkeypatch.setattr(
+        'stable_worldmodel.world.world._make_env',
+        lambda *a, **kw: next(pending),
+    )
+    world = world_for(protocol())
+    world.set_policy(swm.policy.RandomPolicy(seed=0))
+    try:
+        frozen = world.evaluate(protocol=protocol(), eval_budget=2)
+        assert frozen.task_keys == protocol().task_keys
+        assert all(not e.options for e in envs)
+        ordinary = world.evaluate(
+            episodes=2, options={'ordinary_task': 'original'}
+        )
+        assert ordinary['success_rate'] == 0
+        assert world.policy.env is world.envs
+    finally:
+        world.close()
+        world.close()
+    assert all(e.closed for e in envs)
+
+
+@integration
+def test_blocked_plan_executes_25_controls_in_one_planning_call():
+    p = protocol()
+    worlds = [world_for(p, pixels=True, cap=25) for _ in range(2)]
+    solvers = [
+        attach_policy(w, horizon=5, receding=5, action_block=5) for w in worlds
+    ]
+    try:
+        result = worlds[0].evaluate(protocol=p, eval_budget=25)
+        assert result.metadata['planning_calls'] == 1
+        assert all(row.length <= 25 for row in result.episodes)
+        many = swm.ManyWorlds(worlds)
+        result = many.evaluate(p, solver=solvers[0], eval_budget=25)
+        assert result.planning_calls == 1
+        assert result.environment_actions.shape == (2, 2, 25, 2)
+        assert all(
+            row.length <= 25
+            for ev in result.evaluations
+            for row in ev.episodes
+        )
+    finally:
+        for world in worlds:
+            world.close()
 
 
 @integration

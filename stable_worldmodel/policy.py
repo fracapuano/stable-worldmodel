@@ -46,7 +46,8 @@ class PlanConfig:
             that yields ``history_len`` strided frames with a full action
             block between each consecutive pair. Set higher to retain
             more raw history than you sample.
-        action_block: Number of times each action is repeated (frameskip).
+        action_block: Number of individual environment controls packed into
+            each model step. This is separate from simulator physics repeats.
         warm_start: Whether to use the previous plan to initialize the next one.
     """
 

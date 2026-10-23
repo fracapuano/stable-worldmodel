@@ -1,0 +1,8 @@
+.....ss.ss.......ss....                                                  [100%]
+=============================== warnings summary ===============================
+stable_worldmodel/envs/__init__.py:215
+  /Users/fracapuano/Desktop/evolving-wm/stable-worldmodel/stable_worldmodel/envs/__init__.py:215: UserWarning: ale-py not found; ALE/* envs are unavailable. Install with: pip install 'stable-worldmodel[env]' or pip install ale-py.
+    from stable_worldmodel.envs import ale  # noqa: F401
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+17 passed, 6 skipped, 1 warning in 19.92s
