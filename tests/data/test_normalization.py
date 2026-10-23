@@ -11,7 +11,31 @@ from stable_worldmodel.data.normalization import (
     PercentileScaler,
     ZScoreScaler,
     get_scaler,
+    transform_tensor,
 )
+
+
+def test_fitted_standard_scaler_preserves_tensor_shape_and_device():
+    sklearn = pytest.importorskip('sklearn.preprocessing')
+    values = np.arange(24, dtype=np.float32).reshape(2, 4, 3)
+    scaler = sklearn.StandardScaler().fit(values.reshape(-1, 3))
+    tensor = torch.from_numpy(values)
+    transformed = transform_tensor(scaler, tensor)
+    expected = scaler.transform(values.reshape(-1, 3)).reshape(values.shape)
+    torch.testing.assert_close(transformed, torch.from_numpy(expected))
+    torch.testing.assert_close(
+        transform_tensor(scaler, transformed, inverse=True), tensor
+    )
+    assert transformed.device == tensor.device
+
+
+def test_tensor_scaling_rejects_numpy_results():
+    class HostScaler:
+        def transform(self, values):
+            return np.asarray(values)
+
+    with pytest.raises(TypeError, match='torch.Tensor'):
+        transform_tensor(HostScaler(), torch.zeros(2, 3))
 
 
 # ─── IdentityScaler ───────────────────────────────────────────────────────────

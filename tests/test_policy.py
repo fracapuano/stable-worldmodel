@@ -206,13 +206,21 @@ def test_prepare_info_with_process_3d():
     assert result['state'].shape == (2, 2, 3)
 
 
-def test_prepare_info_process_non_numpy_raises():
-    """Test _prepare_info raises ValueError for non-numpy in process."""
+def test_prepare_info_process_invalid_input_raises():
     policy = BasePolicy()
     policy.process = {'state': MockTransformable()}
-    info = {'state': torch.tensor([1.0, 2.0])}  # Tensor instead of numpy
+    info = {'state': [1.0, 2.0]}
     with pytest.raises(ValueError, match='Expected numpy array'):
         policy._prepare_info(info)
+
+
+def test_prepare_info_scales_tensors_without_a_simulator():
+    policy = BasePolicy()
+    policy.process = {'state': MockTransformable(scale=2.0)}
+    value = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+    result = policy._prepare_info({'state': value})['state']
+    torch.testing.assert_close(result, value * 2)
+    assert result.device == value.device
 
 
 def test_prepare_info_with_block_aggregated_key():
@@ -411,6 +419,35 @@ def test_worldmodel_policy_init():
     assert policy.cfg is config
     assert policy.process == {}
     assert policy.transform == {}
+
+
+def test_complete_plan_preserves_controls_scaling_and_callback():
+    class FixedSolver(MockSolver):
+        def solve(self, info_dict, init_action=None):
+            super().solve(info_dict, init_action)
+            return {'actions': torch.arange(32).float().reshape(2, 4, 4)}
+
+    solver = FixedSolver()
+    config = PlanConfig(horizon=4, receding_horizon=3, action_block=2)
+    events = []
+    callback = events.append
+    policy = WorldModelPolicy(
+        solver,
+        config,
+        process={'action': MockTransformable(scale=2.0)},
+        on_plan=callback,
+    )
+    env = MagicMock()
+    env.num_envs = 2
+    env.action_space = gym_spaces.Box(-1, 1, (2, 2))
+    env.single_action_space = gym_spaces.Box(-1, 1, (2,))
+    policy.set_env(env)
+    plan = policy._get_action_plan({'state': np.zeros((2, 1, 1))}, budget=5)
+    expected = torch.arange(32).float().reshape(2, 8, 2)[:, :5] / 2
+    torch.testing.assert_close(plan, expected)
+    assert solver.call_count == len(events) == 1
+    assert policy.on_plan is callback
+    assert events[0]['selected_plan'].shape == (2, 3, 4)
 
 
 def test_worldmodel_policy_flatten_receding_horizon():

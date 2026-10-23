@@ -16,11 +16,11 @@ from typing_extensions import Self
 
 from stable_worldmodel.envs.two_room.env import TwoRoomEnv
 from stable_worldmodel.evaluation import (
-    EpisodeResult,
     EvaluationProtocol,
     EvaluationResults,
 )
 from stable_worldmodel.planning import FastCEMSolver
+from stable_worldmodel.evaluation.records import episodes_from_rollout
 from stable_worldmodel.policy import WorldModelPolicy
 from stable_worldmodel.protocols import PopulationModel
 from stable_worldmodel.wrapper import (
@@ -303,13 +303,10 @@ class ManyWorlds:
             raise ValueError('ManyWorlds cannot mix World execution backends')
         if self.worlds[0].execution_backend == 'envx':
             first = self.worlds[0]
-            from .envx import ENVIRONMENTS
 
             for world in self.worlds:
                 if (
-                    world.execution_backend != 'envx'
-                    or world.env_name != first.env_name
-                    or world.env_name not in ENVIRONMENTS
+                    world.env_name != first.env_name
                     or world.envs.device != first.envs.device
                     or world.envs.image_shape != first.envs.image_shape
                     or not _equivalent(
@@ -540,9 +537,7 @@ class ManyWorlds:
         )[:, :, :eval_budget]
         actions = actions.detach().float()
         if self.worlds[0].execution_backend == 'envx':
-            from .envx import decode_actions
-
-            return decode_actions(self.policies[0], actions)
+            return self.policies[0]._decode_actions(actions)
         process = self.policies[0].process
         if 'action' in process:
             transformed = process['action'].inverse_transform(
@@ -751,13 +746,8 @@ class ManyWorlds:
             outcome, score_name, scores = self._rollout_two_rooms(
                 protocol, actions, eval_budget
             )
-        success_values = outcome.successes.detach().cpu().numpy().astype(bool)
+        episodes = episodes_from_rollout(protocol, outcome)
         distance_values = outcome.final_distances.detach().cpu().numpy()
-        returns = outcome.returns.detach().cpu().numpy()
-        lengths = outcome.lengths.detach().cpu().numpy()
-        path_costs = outcome.path_costs.detach().cpu().numpy()
-        control_costs = outcome.control_costs.detach().cpu().numpy()
-        collisions = outcome.collisions.detach().cpu().numpy()
 
         evaluations = tuple(
             EvaluationResults(
@@ -767,31 +757,7 @@ class ManyWorlds:
                     f'{type(self.models[0 if population is not None else population_index]).__qualname__}'
                 ),
                 protocol_digest=protocol.digest,
-                episodes=tuple(
-                    EpisodeResult(
-                        task_key=task.key,
-                        environment_seed=task.environment_seed,
-                        controller_seed=task.controller_seed,
-                        success=bool(
-                            success_values[population_index, task_index]
-                        ),
-                        episode_return=float(
-                            returns[population_index, task_index]
-                        ),
-                        length=int(lengths[population_index, task_index]),
-                        path_cost=float(
-                            path_costs[population_index, task_index]
-                        ),
-                        control_cost=float(
-                            control_costs[population_index, task_index]
-                        ),
-                        collisions=int(
-                            collisions[population_index, task_index]
-                        ),
-                        constraint_violations=0,
-                    )
-                    for task_index, task in enumerate(protocol.tasks)
-                ),
+                episodes=episodes[population_index],
                 model_queries=(),
                 metadata={
                     'split': protocol.split,

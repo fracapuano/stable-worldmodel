@@ -44,7 +44,7 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
     - name: Dependencies
-      run: uv sync --all-extras --no-extra envx-cuda12 --no-extra envx-cuda13
+      run: uv sync --all-extras
     - name: Tests
       run: uv run --group dev pytest
     - name: Build

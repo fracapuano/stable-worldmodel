@@ -17,6 +17,11 @@ ENVIRONMENTS = {
 }
 
 
+def action_space_for(env_name):
+    width = 5 if ENVIRONMENTS[env_name] == 'cube' else 2
+    return gym.spaces.Box(-1, 1, (width,), np.float32)
+
+
 def _vector(value, width, name):
     array = np.asarray(value, np.float32)
     if array.shape != (width,) or not np.isfinite(array).all():
@@ -348,8 +353,7 @@ class EnvXPool:
         self.rows = None
         self._reset_inputs = {}
         self._contract = None
-        width = 5 if self.name == 'cube' else 2
-        self.single_action_space = gym.spaces.Box(-1, 1, (width,), np.float32)
+        self.single_action_space = action_space_for(env_name)
         self.action_space = batch_space(self.single_action_space, num_envs)
         self.seeds = np.zeros(num_envs, np.int64)
 
@@ -648,31 +652,3 @@ class EnvXPool:
             self._contract = None
             self._renderer = self.rows = self._state = self._infos = None
             self._closed = True
-
-
-def decode_actions(policy, actions):
-    """Decode controls on-device using the policy's existing scaler."""
-    actions = actions.detach().float()
-    scaler = getattr(policy, 'process', {}).get('action')
-    if scaler is not None:
-        actions = apply_scaler(scaler, actions, inverse=True)
-    return actions
-
-
-def apply_scaler(scaler, value, *, inverse=False):
-    if hasattr(scaler, 'mean_') and hasattr(scaler, 'scale_'):
-        # sklearn's affine scaler exposes frozen host statistics. Move these
-        # small constants, never the plans, onto the selected Torch device.
-        mean = scaler.mean_ if getattr(scaler, 'with_mean', True) else 0.0
-        scale = scaler.scale_ if getattr(scaler, 'with_std', True) else 1.0
-        mean = torch.as_tensor(mean, device=value.device, dtype=value.dtype)
-        scale = torch.as_tensor(scale, device=value.device, dtype=value.dtype)
-        return value * scale + mean if inverse else (value - mean) / scale
-    method = scaler.inverse_transform if inverse else scaler.transform
-    shape = value.shape
-    decoded = method(value.reshape(-1, shape[-1]))
-    if not torch.is_tensor(decoded) or decoded.device != value.device:
-        raise TypeError(
-            'envX action scaler must preserve Torch tensors and their device'
-        )
-    return decoded.reshape(shape)

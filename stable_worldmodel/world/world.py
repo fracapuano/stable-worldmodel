@@ -48,7 +48,7 @@ import torch
 
 from stable_worldmodel.plot import save_panel_videos, save_video
 from stable_worldmodel.policy import Policy
-from stable_worldmodel.world.env_pool import EnvPool, _DeferredEnvPool
+from stable_worldmodel.world.env_pool import EnvPool
 from stable_worldmodel.wrapper import MegaWrapper
 
 RESET_MODES = ('auto', 'wait')
@@ -159,7 +159,7 @@ class World:
         self._closed = False
         self._protocol_envs = None
         self._envx_config = None
-        from .envx import ENVIRONMENTS
+        from .envx import ENVIRONMENTS, action_space_for
 
         if env_name in ENVIRONMENTS:
             self._envx_unsupported = bool(
@@ -183,10 +183,9 @@ class World:
             if self._envx_unsupported:
                 self.envs = EnvPool([env_fn] * num_envs)
             else:
-                width = 5 if ENVIRONMENTS[env_name] == 'cube' else 2
-                self.envs = _DeferredEnvPool(
+                self.envs = EnvPool(
                     [env_fn] * num_envs,
-                    gym.spaces.Box(-1, 1, (width,), np.float32),
+                    single_action_space=action_space_for(env_name),
                 )
         else:
             self.envs = EnvPool([env_fn] * num_envs)

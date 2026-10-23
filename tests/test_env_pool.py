@@ -76,6 +76,35 @@ def test_spaces():
     pool.close()
 
 
+def test_deferred_construction_preserves_action_rng():
+    from copy import deepcopy
+
+    created = []
+
+    def make_env():
+        created.append(True)
+        return CounterEnv()
+
+    pool = EnvPool(
+        [make_env, make_env],
+        single_action_space=gym.spaces.Box(-1, 1, (2,), np.float32),
+    )
+    pool.action_space.seed(7)
+    reference = deepcopy(pool.action_space)
+    np.testing.assert_array_equal(
+        pool.action_space.sample(), reference.sample()
+    )
+    assert not created
+    try:
+        pool.reset(seed=11)
+        assert len(created) == 2
+        np.testing.assert_array_equal(
+            pool.action_space.sample(), reference.sample()
+        )
+    finally:
+        pool.close()
+
+
 def test_variation_space_none():
     pool = _make_pool(2)
     assert pool.variation_space is None

@@ -37,6 +37,24 @@ def _as_like(a, b, x):
     return a, b
 
 
+def transform_tensor(scaler, value: torch.Tensor, *, inverse=False):
+    """Apply a fitted scaler without moving the tensor off its device."""
+    if hasattr(scaler, 'mean_') and hasattr(scaler, 'scale_'):
+        # sklearn's StandardScaler stores NumPy statistics. Transfer the
+        # constants rather than the observation or action batch.
+        mean = scaler.mean_ if getattr(scaler, 'with_mean', True) else 0.0
+        scale = scaler.scale_ if getattr(scaler, 'with_std', True) else 1.0
+        mean, scale = _as_like(mean, scale, value)
+        return value * scale + mean if inverse else (value - mean) / scale
+    method = scaler.inverse_transform if inverse else scaler.transform
+    result = method(value.reshape(-1, value.shape[-1]))
+    if not torch.is_tensor(result) or result.device != value.device:
+        raise TypeError(
+            'scaler must preserve torch.Tensor values and their device'
+        )
+    return result.reshape(value.shape)
+
+
 def _to_numpy_2d(X):
     """Detach, NaN-filter (per-row), and reshape to ``(N, D)``."""
     arr = (
