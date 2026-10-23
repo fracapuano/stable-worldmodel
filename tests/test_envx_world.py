@@ -168,6 +168,38 @@ def test_first_success_inside_repeated_control_freezes_outcome():
 
 @integration
 @pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_frozen_reference_plans_succeed(name):
+    if name != 'pusht' and DEVICE == 'cpu':
+        pytest.skip('MJX integration runs on CUDA')
+    p = EvaluationProtocol.read(
+        Path(__file__).parent / 'data/envx_tasks' / (name + '.json')
+    )
+    references = [dict(task.options)['reference_actions'] for task in p.tasks]
+    lengths = [len(actions) for actions in references]
+    budget = max(lengths)
+    world = world_for(p, cap=budget)
+    try:
+        world._reset_from_protocol(p, budget)
+        plans = torch.zeros(
+            1,
+            len(p.tasks),
+            budget,
+            world.envs.single_action_space.shape[0],
+            device=DEVICE,
+        )
+        for i, actions in enumerate(references):
+            plans[0, i, : len(actions)] = torch.tensor(actions, device=DEVICE)
+        for _ in range(3):
+            outcome = world.envs.rollout(
+                plans, limits=np.asarray([lengths], np.int32)
+            )
+            assert outcome.successes.all().item()
+    finally:
+        world.close()
+
+
+@integration
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
 def test_reset_fidelity_population_order_independence_and_budget(name):
     if name != 'pusht' and DEVICE == 'cpu':
         pytest.skip('MJX integration runs on CUDA')

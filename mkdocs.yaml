@@ -39,7 +39,6 @@ nav:
       - tutorial/new_env.md
   - API:
       - api/world.md
-      - api/envx.md
       - api/policy.md
       - api/buffer.md
       - api/solver.md

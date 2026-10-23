@@ -2,7 +2,7 @@
 
 Missing upstream APIs: batched restore/observe/close for MJX environments,
 and an unclipped relative PushT step. Keep all private envX access here.
-Physics is always envX's implementation. See docs/api/envx.md.
+Physics is always envX's implementation.
 """
 
 from __future__ import annotations

@@ -299,8 +299,7 @@ class EnvXPool:
         except ImportError as error:
             raise ImportError(
                 'Frozen envX evaluation requires Python 3.11 or 3.12 and '
-                'the pinned dependencies in stable-worldmodel[envx]; see '
-                'docs/api/envx.md'
+                'the pinned dependencies in stable-worldmodel[envx]'
             ) from error
         del envx
 

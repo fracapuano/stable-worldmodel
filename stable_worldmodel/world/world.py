@@ -107,7 +107,7 @@ class World:
             for envs without pixels (e.g. audio): ``image_shape`` may then
             be omitted and the raw observation is lifted into info as-is.
         device: Torch/JAX device for frozen envX protocol evaluation;
-            defaults to cuda:0. See docs/api/envx.md.
+            defaults to cuda:0.
         physics_batch_size: Maximum population members per envX physics
             batch. Every batch executes all tasks together on the device.
         envx_options: Static options forwarded to the pinned envX factory.
@@ -324,7 +324,9 @@ class World:
                 ``value`` names a key in the sliced dataset state and the
                 per-env value is deep-copied in.
             protocol: Immutable ``EvaluationProtocol`` whose ordered tasks
-                define resets and controller RNG streams.
+                define resets and controller RNG streams. Frozen PushT,
+                Reacher and Cube tasks use envX. Reset options carry complete
+                start/goal states and optional ``task_contract`` settings.
             record: Include full transitions and planning queries in
                 protocol-driven results.
             backend: Condition label stored in protocol-driven results.
