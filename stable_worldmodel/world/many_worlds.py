@@ -147,7 +147,8 @@ class ManyWorlds:
     compatible ``FastCEMSolver``. This preserves the invariant that one World
     owns one concrete model instance and weight set. ``evaluate`` replaces the
     individual solver calls with one population FastCEM graph and executes the
-    complete plans in one open-loop envX rollout.
+    complete plans in one open-loop envX rollout. All population members and
+    tasks execute together; device allocation failures propagate to the caller.
 
     Every LeWM parameter and persistent buffer may differ across Worlds. The
     model architecture, policy preprocessing, action space, and MPC

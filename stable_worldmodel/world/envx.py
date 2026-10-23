@@ -293,7 +293,6 @@ class EnvXPool:
         device,
         image_transform=None,
         goal_transform=None,
-        physics_batch_size=16,
         envx_options=None,
     ):
         self.device = torch.device(device)
@@ -318,9 +317,9 @@ class EnvXPool:
 
         if env_name not in ENVIRONMENTS:
             raise ValueError(f'envX World does not support {env_name!r}')
-        if min(num_envs, max_episode_steps, physics_batch_size) < 1:
+        if min(num_envs, max_episode_steps) < 1:
             raise ValueError(
-                'environment, episode and physics batch sizes must be positive'
+                'environment count and episode limit must be positive'
             )
         self.env_name, self.name = env_name, ENVIRONMENTS[env_name]
         self.num_envs, self.max_episode_steps = num_envs, max_episode_steps
@@ -332,7 +331,6 @@ class EnvXPool:
             image_transform,
             goal_transform,
         )
-        self.physics_batch_size = int(physics_batch_size)
         self.envx_options = dict(envx_options or {})
         managed = {
             'num_envs',
@@ -606,51 +604,31 @@ class EnvXPool:
         limits = jnp.minimum(jax.device_put(limits, self.jax_device), limit)
         if limits.shape != (population, tasks):
             raise ValueError('plan limits must have shape (population, tasks)')
-        result = []
-        for begin in range(0, population, self.physics_batch_size):
-            plans = (
-                actions[begin : begin + self.physics_batch_size]
-                .detach()
-                .float()
-                .contiguous()
-            )
-            # A contiguous Torch view can still begin at an unaligned storage
-            # offset (e.g. one five-dimensional Cube plan). XLA assumes aligned
-            # input buffers; materialize only such views on the same device.
-            alignment = 256 if self.device.type == 'cuda' else 64
-            if plans.data_ptr() % alignment:
-                plans = plans.clone()
-            count = plans.shape[0]
-            engine = self._engine(count * tasks)
-            contract = {
-                key: jnp.tile(value, count)
-                for key, value in self._contract.items()
-            }
-            values, _ = engine.run(
-                self._inputs(repeat=count),
-                contract,
-                jax.dlpack.from_dlpack(plans).reshape(
-                    count * tasks, horizon, -1
-                ),
-                limits[begin : begin + count].reshape(-1),
-            )
-            result.append(
-                tuple(
-                    torch.from_dlpack(v).reshape(count, tasks, *v.shape[1:])
-                    for v in values
-                )
-            )
-        if len(result) == 1:
-            return EnvXOutcome(*result[0])
-        combined = tuple(
-            torch.cat(values, dim=0) for values in zip(*result, strict=True)
+        plans = actions.detach().float().contiguous()
+        # A contiguous Torch view can still begin at an unaligned storage
+        # offset. XLA assumes aligned buffers; copy only such views.
+        alignment = 256 if self.device.type == 'cuda' else 64
+        if plans.data_ptr() % alignment:
+            plans = plans.clone()
+        engine = self._engine(population * tasks)
+        contract = {
+            key: jnp.tile(value, population)
+            for key, value in self._contract.items()
+        }
+        values, _ = engine.run(
+            self._inputs(repeat=population),
+            contract,
+            jax.dlpack.from_dlpack(plans).reshape(
+                population * tasks, horizon, -1
+            ),
+            limits.reshape(-1),
         )
-        if self.device.type == 'cuda':
-            # cat reads storage owned by JAX. Its CUDA work must finish before
-            # the chunk tensors (and their DLPack owners) leave this scope;
-            # Torch's caching allocator does not own these external buffers.
-            torch.cuda.current_stream(self.device).synchronize()
-        return EnvXOutcome(*combined)
+        return EnvXOutcome(
+            *(
+                torch.from_dlpack(v).reshape(population, tasks, *v.shape[1:])
+                for v in values
+            )
+        )
 
     def close(self):
         if not self._closed:

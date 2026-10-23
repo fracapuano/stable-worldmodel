@@ -108,8 +108,6 @@ class World:
             be omitted and the raw observation is lifted into info as-is.
         device: Torch/JAX device for frozen envX protocol evaluation;
             defaults to cuda:0.
-        physics_batch_size: Maximum population members per envX physics
-            batch. Every batch executes all tasks together on the device.
         envx_options: Static options forwarded to the pinned envX factory.
         **kwargs: Forwarded to ``gym.make`` (e.g. ``render_mode``).
     """
@@ -128,7 +126,6 @@ class World:
         image_resample: str | int | None = None,
         add_pixels: bool = True,
         device: str | torch.device = 'cuda:0',
-        physics_batch_size: int = 16,
         envx_options: dict | None = None,
         **kwargs: Any,
     ):
@@ -177,7 +174,6 @@ class World:
                 'device': device,
                 'image_transform': image_transform,
                 'goal_transform': goal_transform,
-                'physics_batch_size': physics_batch_size,
                 'envx_options': envx_options,
             }
             if self._envx_unsupported:

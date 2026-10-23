@@ -316,7 +316,7 @@ def test_reset_fidelity_population_order_independence_and_budget(name):
     if name != 'pusht' and DEVICE == 'cpu':
         pytest.skip('MJX integration runs on CUDA')
     p = protocol(name)
-    world = world_for(p, physics_batch_size=2)
+    world = world_for(p)
     try:
         world._reset_from_protocol(p, 5)
         pool = world.envs
@@ -417,6 +417,31 @@ def test_goal_pixels_are_rendered_from_restored_goal_state(name):
             rtol=0,
             atol=0 if name == 'pusht' else 2,
         )
+    finally:
+        world.close()
+
+
+@integration
+def test_full_population_allocation_failure_propagates_without_retry(
+    monkeypatch,
+):
+    p = protocol()
+    world = world_for(p)
+    try:
+        world._reset_from_protocol(p, 2)
+        counts = []
+        failure = RuntimeError('simulator device allocation failed')
+
+        def allocate(count):
+            counts.append(count)
+            raise failure
+
+        monkeypatch.setattr(world.envs, '_engine', allocate)
+        plans = torch.zeros(17, 2, 2, 2, device=DEVICE)
+        with pytest.raises(RuntimeError) as caught:
+            world.envs.rollout(plans)
+        assert caught.value is failure
+        assert counts == [34]
     finally:
         world.close()
 
