@@ -289,7 +289,7 @@ class World:
     ) -> dict:
         """Run the attached policy and return aggregated metrics.
 
-        Two modes of operation:
+        Three modes of operation:
 
         * **Episodic (default)**: set ``episodes`` to the number of
           episodes to roll out. Terminated envs are auto-reset until the
@@ -301,6 +301,12 @@ class World:
           ``start_steps[i]`` and targets the state at
           ``start_steps[i] + goal_offset``. Run length is capped at
           ``eval_budget`` steps. Requires ``num_envs == len(episodes_idx)``.
+
+        * **Frozen protocol**: pass ``protocol`` and ``eval_budget`` with one
+          env per task. PushT, Reacher and Cube use envX internally and render
+          start/goal observations from restored states. With a WorldModelPolicy,
+          ``horizon=5``, ``receding_horizon=5``, ``action_block=5`` and budget
+          25 execute one complete plan. Outcomes freeze at first success.
 
         Args:
             episodes: Total episodes to roll out (episodic mode).
@@ -315,7 +321,7 @@ class World:
             episodes_idx: Dataset episode indices, one per env.
             start_steps: Starting step within each dataset episode.
             goal_offset: Offset from each start step that defines the goal.
-            eval_budget: Max env steps per episode in dataset mode.
+            eval_budget: Max controls per task in dataset or protocol mode.
             callables: Per-env setup calls applied on the unwrapped env
                 after reset. Each spec is
                 ``{'method': name, 'args': {arg_name: {'value': ...,
@@ -333,6 +339,7 @@ class World:
         Returns:
             A dict with ``'success_rate'`` (percent), ``'episode_successes'``
             (per-episode bool/uint array), and ``'seeds'`` used for reset.
+            Protocol mode returns ``EvaluationResults`` in task order.
         """
         if protocol is not None:
             if dataset is not None or episodes is not None:

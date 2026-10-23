@@ -15,7 +15,22 @@ def _canonical_json(value: Any) -> str:
 
 @dataclass(frozen=True)
 class EvaluationTask:
-    """One fully specified environment/controller evaluation task."""
+    """One fully specified environment/controller evaluation task.
+
+    ``start`` and ``goal`` supply task coordinates. ``options`` carries the
+    environment's existing reset arguments, including complete simulator state:
+    Reacher uses ``reacher_task`` with ``start_qpos``, ``start_qvel``,
+    ``goal_qpos`` and ``goal_qvel``;
+    Cube uses ``cube_qpos``, ``cube_qvel``, ``cube_goal_qpos`` and
+    ``cube_goal_qvel``. PushT coordinates are state7; moving-block snapshots
+    additionally use ``simulator_state`` start/goal ``qpos`` and ``qvel``.
+    ``simulator_state`` can also carry supported extra simulator fields.
+
+    Frozen envX evaluations accept ``task_contract`` reset options to override
+    ``repeat``, ``threshold``, PushT's ``position_threshold``/
+    ``angle_threshold`` and its ``relative``/``action_scale``/``clip_target``
+    controls. These options apply to the frozen task evaluation only.
+    """
 
     environment_seed: int
     controller_seed: int

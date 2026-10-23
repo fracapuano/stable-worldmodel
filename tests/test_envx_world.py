@@ -461,8 +461,11 @@ def test_world_returns_to_ordinary_task_after_protocol(monkeypatch):
 
 
 @integration
-def test_blocked_plan_executes_25_controls_in_one_planning_call():
-    p = protocol()
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_blocked_plan_executes_25_controls_in_one_planning_call(name):
+    if name != 'pusht' and DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
+    p = protocol(name)
     worlds = [world_for(p, pixels=True, cap=25) for _ in range(2)]
     solvers = [
         attach_policy(w, horizon=5, receding=5, action_block=5) for w in worlds
@@ -474,7 +477,12 @@ def test_blocked_plan_executes_25_controls_in_one_planning_call():
         many = swm.ManyWorlds(worlds)
         result = many.evaluate(p, solver=solvers[0], eval_budget=25)
         assert result.planning_calls == 1
-        assert result.environment_actions.shape == (2, 2, 25, 2)
+        assert result.environment_actions.shape == (
+            2,
+            2,
+            25,
+            5 if name == 'cube' else 2,
+        )
         assert all(
             row.length <= 25
             for ev in result.evaluations
@@ -517,8 +525,11 @@ def test_public_world_and_manyworlds_evaluation(name):
 
 
 @integration
-def test_world_mpc_and_records_support_other_budgets():
-    p = protocol()
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_world_mpc_and_records_support_other_budgets(name):
+    if name != 'pusht' and DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
+    p = protocol(name)
     world = world_for(p, pixels=True)
     attach_policy(world, horizon=2, receding=1)
     try:
@@ -531,14 +542,17 @@ def test_world_mpc_and_records_support_other_budgets():
 
 
 @integration
-def test_population_model_and_success_scoring():
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_population_model_and_success_scoring(name):
+    if name != 'pusht' and DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
     from dataclasses import replace
 
     from torch.func import functional_call, stack_module_state, vmap
 
-    p = replace(protocol(), metadata=(('score', 'success'),))
-    world = world_for(p, pixels=True)
-    solver = attach_policy(world)
+    p = replace(protocol(name), metadata=(('score', 'success'),))
+    world = world_for(p, pixels=True, cap=25)
+    solver = attach_policy(world, horizon=5, receding=5, action_block=5)
 
     class Population:
         model = solver.cost.model
@@ -561,8 +575,9 @@ def test_population_model_and_success_scoring():
     many = swm.ManyWorlds.from_population(world, population_size=3)
     try:
         result = many.evaluate(
-            p, solver=solver, population=Population(), eval_budget=4
+            p, solver=solver, population=Population(), eval_budget=25
         )
+        assert result.planning_calls == 1
         assert result.task_final_distances.shape == (3, 2)
         assert result.population_backend == 'test-functional-vmap'
         torch.testing.assert_close(
