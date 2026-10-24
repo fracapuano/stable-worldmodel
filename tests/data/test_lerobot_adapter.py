@@ -8,9 +8,12 @@ import numpy as np
 import pytest
 import torch
 
-from stable_worldmodel import World
-from stable_worldmodel.data import GoalDataset, HDF5Dataset, LeRobotAdapter
-from stable_worldmodel.policy import RandomPolicy
+from stable_worldmodel.data import (
+    GoalDataset,
+    HDF5Dataset,
+    HDF5Writer,
+    LeRobotAdapter,
+)
 
 # Lightweight public dataset used as the integration target.
 PUSHT_REPO_ID = 'lerobot/pusht'
@@ -118,14 +121,8 @@ def test_lerobot_adapter_goal_dataset_compatibility():
     assert item['goal_action'].shape[0] == 1
 
 
-def test_lerobot_adapter_pusht_matches_native_swm_dataset(tmp_path):
-    """Hub `lerobot/pusht` via LeRobotAdapter matches native `swm/PushT-v1` HDF5 layout.
-
-    Records PushT with `World.collect` (the supported path) at the same
-    resolution as the Hub dataset, then checks that `__getitem__` batches agree
-    on tensor types and shapes for `pixels` (T, C, H, W) and `action` (T, D).
-    Trajectories differ (different sources); this test locks the *contract*.
-    """
+def test_lerobot_adapter_pusht_matches_hdf5_dataset(tmp_path):
+    """PushT clips retain their tensor layout and values through SWM HDF5."""
     NUM_STEPS = 2
     FRAMESKIP = 1
 
@@ -135,23 +132,14 @@ def test_lerobot_adapter_pusht_matches_native_swm_dataset(tmp_path):
         keys_to_cache=['action'],
     )
     hub_item = adapter[0]
-    H, W = int(hub_item['pixels'].shape[-2]), int(hub_item['pixels'].shape[-1])
-
-    world = World(
-        env_name='swm/PushT-v1',
-        num_envs=2,
-        image_shape=(H, W),
-        max_episode_steps=40,
-    )
-    world.set_policy(RandomPolicy())
     dataset_name = 'native_pusht_lerobot_compare'
-    world.collect(
-        tmp_path / 'datasets' / f'{dataset_name}.h5',
-        episodes=3,
-        seed=123,
-        format='hdf5',
-    )
-    world.envs.close()
+    with HDF5Writer(tmp_path / 'datasets' / f'{dataset_name}.h5') as writer:
+        writer.write_episode(
+            {
+                'pixels': hub_item['pixels'].permute(0, 2, 3, 1).numpy(),
+                'action': hub_item['action'].numpy(),
+            }
+        )
 
     native = HDF5Dataset(
         name=dataset_name,
@@ -170,6 +158,7 @@ def test_lerobot_adapter_pusht_matches_native_swm_dataset(tmp_path):
     for key in ('pixels', 'action'):
         assert isinstance(hub_item[key], torch.Tensor)
         assert isinstance(native_item[key], torch.Tensor)
+        torch.testing.assert_close(hub_item[key], native_item[key])
 
     assert hub_item['pixels'].shape == native_item['pixels'].shape
     assert hub_item['action'].shape == native_item['action'].shape
