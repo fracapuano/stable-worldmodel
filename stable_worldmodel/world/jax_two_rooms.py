@@ -29,6 +29,7 @@ class JaxTwoRoomsOutcome:
     path_costs: torch.Tensor
     control_costs: torch.Tensor
     collisions: torch.Tensor
+    final_rewards: torch.Tensor
 
 
 class TwoRoomTaskPool(EnvPool):
@@ -188,6 +189,7 @@ class JaxTwoRoomsRollout:
                 ).sum(axis=0),
                 (self._jnp.square(actions).sum(axis=-1) * active).sum(axis=0),
                 (trajectory.info['collided'] * active).sum(axis=0),
+                trajectory.reward[final_index, environment_index],
             )
 
         # The outer JIT lets XLA discard the unused trajectory instead of
@@ -345,6 +347,7 @@ class JaxTwoRoomsRollout:
             path_costs=to_torch(outputs[5]),
             control_costs=to_torch(outputs[6]),
             collisions=to_torch(outputs[7]),
+            final_rewards=to_torch(outputs[8]),
         )
 
     def close(self):

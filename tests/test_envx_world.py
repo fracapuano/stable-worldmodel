@@ -164,7 +164,9 @@ def test_first_success_inside_repeated_control_freezes_outcome():
         jnp.asarray([[[0.1, 0], [1, 0], [-1, 0]]]),
         jnp.asarray([3]),
     )
-    states, success, distances, _, lengths, paths, controls, _ = result
+    states, success, distances, _, lengths, paths, controls, _, rewards = (
+        result
+    )
     np.testing.assert_allclose(states, [[0.1, 0]])
     np.testing.assert_allclose(simulator_state, states)
     np.testing.assert_array_equal(success, [True])
@@ -172,6 +174,7 @@ def test_first_success_inside_repeated_control_freezes_outcome():
     np.testing.assert_array_equal(distances, [0])
     np.testing.assert_allclose(paths, [0.1])
     np.testing.assert_allclose(controls, [0.01])
+    np.testing.assert_allclose(rewards, [1])
 
 
 @integration
@@ -260,7 +263,8 @@ def test_reacher_success_on_first_repeat_retains_physics_and_pixels():
 
 
 @integration
-def test_implicit_cuda_uses_current_torch_device():
+@pytest.mark.parametrize('device', [None, 'cuda'])
+def test_implicit_cuda_uses_current_torch_device(device):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip('requires two CUDA devices')
     import jax
@@ -271,7 +275,7 @@ def test_implicit_cuda_uses_current_torch_device():
     try:
         torch.cuda.set_device(1)
         p = protocol(count=1)
-        world = swm.World(p.environment, 1, add_pixels=False, device='cuda')
+        world = swm.World(p.environment, 1, add_pixels=False, device=device)
         world._reset_from_protocol(p, 2)
         assert world.envs.device == torch.device('cuda:1')
         assert world.envs.jax_device == jax.local_devices(backend='gpu')[1]
@@ -509,6 +513,30 @@ def attach_policy(
         )
     )
     return solver
+
+
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_omitted_world_device_follows_cpu_planner_without_cuda(name):
+    p = protocol(name)
+    world = swm.World(p.environment, len(p.tasks), add_pixels=False)
+    try:
+        attach_policy(world, device='cpu')
+        assert world.envs.device == torch.device('cpu')
+    finally:
+        world.close()
+
+
+def test_explicit_world_device_is_not_overridden_by_policy():
+    world = swm.World('swm/PushT-v1', 1, add_pixels=False, device='cpu')
+    policy = SimpleNamespace(
+        solver=SimpleNamespace(device=torch.device('cuda:1')),
+        set_env=lambda env: None,
+    )
+    try:
+        world.set_policy(policy)
+        assert world.envs.device == torch.device('cpu')
+    finally:
+        world.close()
 
 
 @integration
@@ -787,6 +815,92 @@ def test_two_room_world_uses_the_plan_cuda_device():
         if world is not None:
             world.close()
         torch.cuda.set_device(previous)
+
+
+@integration
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube', 'two-room'])
+def test_omitted_world_device_follows_planner_for_world_and_population(name):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip('requires two CUDA devices')
+    previous = torch.cuda.current_device()
+    worlds = []
+    try:
+        torch.cuda.set_device(0)
+        p = protocol(name)
+        for _ in range(2):
+            world = swm.World(
+                p.environment,
+                len(p.tasks),
+                image_shape=(16, 16),
+                max_episode_steps=2,
+            )
+            worlds.append(world)
+            attach_policy(world, horizon=2, receding=2, device='cuda:1')
+        result = worlds[0].evaluate(protocol=p, eval_budget=2)
+        assert result.metadata['simulator_backend'] == 'envx'
+        assert worlds[0].actions.device == torch.device('cuda:1')
+        assert worlds[0].infos['state'].device == torch.device('cuda:1')
+        many = swm.ManyWorlds(worlds)
+        result = many.evaluate(
+            p, solver=worlds[0].policy.solver, eval_budget=2
+        )
+        assert result.task_final_distances.device == torch.device('cuda:1')
+        assert result.scores.device == torch.device('cuda:1')
+    finally:
+        for world in worlds:
+            world.close()
+        torch.cuda.set_device(previous)
+
+
+@integration
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube', 'two-room'])
+def test_complete_plan_preserves_last_transition_fields(name, monkeypatch):
+    if name in ('reacher', 'cube') and DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
+    p = protocol(name)
+    world = world_for(p, pixels=True, cap=4)
+    solver = attach_policy(world)
+    plan = torch.zeros(
+        len(p.tasks), 4, world.envs.single_action_space.shape[0], device=DEVICE
+    )
+    plan[:, :, 0] = torch.tensor([0.1, 0.2, 0.3, 0.4], device=DEVICE)
+    if name == 'pusht':
+        plan[0, :, 0] = 0.5
+        plan[1] = 0
+
+    def fixed_plan(info, init_action=None, **kwargs):
+        return {'actions': plan}
+
+    monkeypatch.setattr(solver, 'solve', fixed_plan)
+    try:
+        fast = world.evaluate(protocol=p, eval_budget=4)
+        rewards, actions = world.rewards.copy(), world.actions.clone()
+        terminal_actions = world.infos['action'].clone()
+        assert actions.shape == (len(p.tasks), plan.shape[-1])
+        if name == 'two-room':
+            torch.testing.assert_close(actions, plan[:, -1])
+            np.testing.assert_array_equal(rewards, np.zeros(len(p.tasks)))
+            return
+        recorded = world.evaluate(protocol=p, eval_budget=4, record=True)
+        np.testing.assert_allclose(
+            rewards, world.rewards, rtol=2e-4, atol=2e-4
+        )
+        torch.testing.assert_close(actions, world.actions, equal_nan=True)
+        torch.testing.assert_close(terminal_actions, world.infos['action'])
+        assert [row.length for row in fast.episodes] == [
+            row.length for row in recorded.episodes
+        ]
+        np.testing.assert_allclose(
+            [row.episode_return for row in fast.episodes],
+            [row.episode_return for row in recorded.episodes],
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        if name == 'pusht':
+            assert fast.episodes[0].success and fast.episodes[0].length < 4
+            assert recorded.episodes[1].length == 4
+    finally:
+        world.close()
 
 
 @integration

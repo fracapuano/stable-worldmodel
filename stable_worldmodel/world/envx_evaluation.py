@@ -47,16 +47,20 @@ def evaluate_world(world, protocol, budget, video, record, backend):
     distances = outcome.final_distances[0].cpu().numpy()
     world.terminateds = successes.copy()
     world.truncateds = ~successes
-    world.rewards = np.asarray(
-        [episode.episode_return for episode in episodes], np.float32
+    task_index = torch.arange(world.num_envs, device=actions.device)
+    final_actions = actions[task_index, outcome.lengths[0].long() - 1]
+    active = outcome.lengths[0] == outcome.lengths[0].max()
+    world.rewards = (
+        torch.where(active, outcome.final_rewards[0], 0).cpu().numpy()
     )
-    world.actions = actions
+    world.actions = torch.where(active[:, None], final_actions, float('nan'))
     state = outcome.final_observations[0, :, None]
     world.infos.update(
         state=state[..., :2] if two_room else state,
         distance_to_target=outcome.final_distances[0, :, None],
         terminated=successes.copy(),
         step_idx=lengths[:, None],
+        action=final_actions[:, None],
     )
     return EvaluationResults(
         backend=backend,

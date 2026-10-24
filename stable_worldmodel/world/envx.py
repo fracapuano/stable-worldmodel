@@ -116,6 +116,7 @@ class EnvXOutcome:
     path_costs: torch.Tensor
     control_costs: torch.Tensor
     collisions: torch.Tensor
+    final_rewards: torch.Tensor
 
 
 class _Engine:
@@ -195,6 +196,7 @@ class _Engine:
             zeros,
             zeros,
             zeros,
+            zeros,
         )
 
         def step(carry, item):
@@ -207,6 +209,7 @@ class _Engine:
                 returns,
                 path,
                 control,
+                final_rewards,
             ) = carry
             index, action = item
             active = (~success) & (index < limits)
@@ -245,6 +248,7 @@ class _Engine:
                 else success.astype(jnp.float32)
             )
             returns += jnp.where(active, reward, 0)
+            final_rewards = jnp.where(active, reward, final_rewards)
             return (
                 state,
                 values,
@@ -254,6 +258,7 @@ class _Engine:
                 returns,
                 path,
                 control,
+                final_rewards,
             ), None
 
         final, _ = jax.lax.scan(
@@ -261,7 +266,17 @@ class _Engine:
             initial,
             (jnp.arange(actions.shape[1]), jnp.swapaxes(actions, 0, 1)),
         )
-        _, values, distance, success, lengths, returns, path, control = final
+        (
+            _,
+            values,
+            distance,
+            success,
+            lengths,
+            returns,
+            path,
+            control,
+            final_rewards,
+        ) = final
         return (
             values,
             success,
@@ -271,6 +286,7 @@ class _Engine:
             path,
             control,
             jnp.zeros_like(lengths),
+            final_rewards,
         ), final[0]
 
     def close(self):
@@ -295,11 +311,7 @@ class EnvXPool:
         goal_transform=None,
         envx_options=None,
     ):
-        self.device = torch.device(device)
-        if self.device.type not in ('cuda', 'cpu'):
-            raise ValueError('envX supports CPU or CUDA devices')
-        if self.device.type == 'cuda' and self.device.index is None:
-            self.device = torch.device('cuda', torch.cuda.current_device())
+        self.device = torch.device('cuda')
         if env_name not in ENVIRONMENTS:
             raise ValueError(f'envX World does not support {env_name!r}')
         if min(num_envs, max_episode_steps) < 1:
@@ -342,10 +354,27 @@ class EnvXPool:
         self.single_action_space = action_space_for(env_name)
         self.action_space = batch_space(self.single_action_space, num_envs)
         self.seeds = np.zeros(num_envs, np.int64)
+        if device is not None:
+            self.set_device(device)
+
+    def set_device(self, device):
+        device = torch.device(device)
+        if device.type not in ('cuda', 'cpu'):
+            raise ValueError('envX supports CPU or CUDA devices')
+        if device.type == 'cuda' and device.index is None:
+            device = torch.device('cuda', torch.cuda.current_device())
+        if device != self.device:
+            if self._engines or self._renderer is not None:
+                raise ValueError(
+                    'cannot change an initialized envX pool device'
+                )
+            self._jax_device = None
+            self.device = device
 
     @property
     def jax_device(self):
         if self._jax_device is None:
+            self.set_device(self.device)
             os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
             from .jax_two_rooms import JaxTwoRoomsRollout
 

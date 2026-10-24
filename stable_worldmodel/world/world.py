@@ -94,8 +94,9 @@ class World:
             ``pixels`` observation; goal images are resized too. Set False
             for envs without pixels (e.g. audio): ``image_shape`` may then
             be omitted and the raw observation is lifted into info as-is.
-        device: Torch/JAX device for envX protocol evaluation;
-            defaults to cuda:0.
+        device: Torch/JAX device for envX protocol evaluation. When omitted,
+            follow the attached planner's device, or the current CUDA device
+            when the policy has no planner.
         envx_options: Static options forwarded to the pinned envX factory.
         **kwargs: Forwarded to ``gym.make`` (e.g. ``render_mode``).
     """
@@ -113,7 +114,7 @@ class World:
         goal_transform: Callable | None = None,
         image_resample: str | int | None = None,
         add_pixels: bool = True,
-        device: str | torch.device = 'cuda:0',
+        device: str | torch.device | None = None,
         envx_options: dict | None = None,
         **kwargs: Any,
     ):
@@ -147,6 +148,7 @@ class World:
         )
         self.env_name = env_name
         self._closed = False
+        self._infer_device = device is None
         from .envx import ENVIRONMENTS, EnvXPool
         from .jax_two_rooms import TwoRoomTaskPool
 
@@ -220,6 +222,12 @@ class World:
         Calls ``policy.set_env(self.envs)``. If the policy exposes a
         ``seed`` attribute and ``_set_seed`` method, the seed is applied.
         """
+        from .envx import EnvXPool
+
+        if isinstance(self.envs, EnvXPool) and self._infer_device:
+            device = getattr(getattr(policy, 'solver', None), 'device', None)
+            if device is not None:
+                self.envs.set_device(device)
         self.policy = policy
         self.policy.set_env(self.envs)
         if hasattr(self.policy, '_set_seed') and self.policy.seed is not None:
