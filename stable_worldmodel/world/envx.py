@@ -418,10 +418,7 @@ class EnvXPool:
     def _engine(self, count, *, render=False):
         if self._closed:
             raise RuntimeError('envX World is closed')
-        if render:
-            if self._renderer is not None and self._renderer.count != count:
-                self._renderer.close()
-                self._renderer = None
+        if render and count == self.num_envs:
             if self._renderer is None:
                 self._renderer = _Engine(
                     self.name,
@@ -431,11 +428,16 @@ class EnvXPool:
                     self.envx_options,
                 )
             return self._renderer
-        if count not in self._engines:
-            self._engines[count] = _Engine(
-                self.name, count, self.jax_device, None, self.envx_options
+        key = (count, render)
+        if key not in self._engines:
+            self._engines[key] = _Engine(
+                self.name,
+                count,
+                self.jax_device,
+                self.image_shape if render else None,
+                self.envx_options,
             )
-        return self._engines[count]
+        return self._engines[key]
 
     def _inputs(self, repeat=1, which=0):
         import jax

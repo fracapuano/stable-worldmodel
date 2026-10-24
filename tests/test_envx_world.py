@@ -1110,6 +1110,17 @@ def test_recorded_world_and_population_keep_executed_transitions(
         assert all(
             len(episode.steps) == episode.length for episode in single.episodes
         )
+
+        def unexpected_engine(*args, **kwargs):
+            pytest.fail('warm recording must reuse existing simulator engines')
+
+        monkeypatch.setattr(_Engine, '__init__', unexpected_engine)
+        warm = many.evaluate(p, solver=solvers[0], eval_budget=4, record=True)
+        assert all(
+            len(episode.steps) == episode.length
+            for evaluation in warm.evaluations
+            for episode in evaluation.episodes
+        )
     finally:
         many.close()
         many.close()
