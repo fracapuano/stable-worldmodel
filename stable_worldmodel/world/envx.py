@@ -117,6 +117,7 @@ class EnvXOutcome:
     control_costs: torch.Tensor
     collisions: torch.Tensor
     final_rewards: torch.Tensor
+    records: tuple = ()
 
 
 class _Engine:
@@ -152,7 +153,7 @@ class _Engine:
             self.adapter = StateAdapter(env, params, name)
         self.restore = jax.jit(self.adapter.restore)
         self.render = jax.jit(self.adapter.render) if image_shape else None
-        self.run = jax.jit(self._run)
+        self.run = jax.jit(self._run, static_argnames=('record',))
 
     def _metrics(self, state, goals, contract):
         import jax.numpy as jnp
@@ -174,7 +175,16 @@ class _Engine:
             )
         return values, distance, success
 
-    def _run(self, inputs, contract, actions, limits, initial_state=None):
+    def _run(
+        self,
+        inputs,
+        contract,
+        actions,
+        limits,
+        initial_state=None,
+        *,
+        record=False,
+    ):
         import jax
         import jax.numpy as jnp
 
@@ -249,6 +259,14 @@ class _Engine:
             )
             returns += jnp.where(active, reward, 0)
             final_rewards = jnp.where(active, reward, final_rewards)
+            trace = None
+            if record:
+                trace = (
+                    {'state': values, 'distance_to_target': distance[:, None]},
+                    reward,
+                )
+                if self.render is not None:
+                    trace[0]['pixels'] = self.render(state)
             return (
                 state,
                 values,
@@ -259,9 +277,9 @@ class _Engine:
                 path,
                 control,
                 final_rewards,
-            ), None
+            ), trace
 
-        final, _ = jax.lax.scan(
+        final, trace = jax.lax.scan(
             step,
             initial,
             (jnp.arange(actions.shape[1]), jnp.swapaxes(actions, 0, 1)),
@@ -277,17 +295,21 @@ class _Engine:
             control,
             final_rewards,
         ) = final
-        return (
-            values,
-            success,
-            distance,
-            returns,
-            lengths,
-            path,
-            control,
-            jnp.zeros_like(lengths),
-            final_rewards,
-        ), final[0]
+        result = (
+            (
+                values,
+                success,
+                distance,
+                returns,
+                lengths,
+                path,
+                control,
+                jnp.zeros_like(lengths),
+                final_rewards,
+            ),
+            final[0],
+        )
+        return (*result, trace) if record else result
 
     def close(self):
         self.restore = self.render = self.run = None
@@ -397,10 +419,13 @@ class EnvXPool:
         if self._closed:
             raise RuntimeError('envX World is closed')
         if render:
+            if self._renderer is not None and self._renderer.count != count:
+                self._renderer.close()
+                self._renderer = None
             if self._renderer is None:
                 self._renderer = _Engine(
                     self.name,
-                    self.num_envs,
+                    count,
                     self.jax_device,
                     self.image_shape,
                     self.envx_options,
@@ -601,7 +626,7 @@ class EnvXPool:
         )
         return None, rewards.cpu().numpy(), terminated, truncated, self._infos
 
-    def rollout(self, actions, *, max_steps=None, limits=None):
+    def rollout(self, actions, *, max_steps=None, limits=None, record=False):
         import jax
         import jax.numpy as jnp
 
@@ -644,24 +669,54 @@ class EnvXPool:
         alignment = 256 if self.device.type == 'cuda' else 64
         if plans.data_ptr() % alignment:
             plans = plans.clone()
-        engine = self._engine(population * tasks)
+        engine = self._engine(
+            population * tasks, render=record and bool(self.image_shape)
+        )
         contract = {
             key: jnp.tile(value, population)
             for key, value in self._contract.items()
         }
-        values, _ = engine.run(
+        result = engine.run(
             self._inputs(repeat=population),
             contract,
             jax.dlpack.from_dlpack(plans).reshape(
                 population * tasks, horizon, -1
             ),
             limits.reshape(-1),
+            record=record,
         )
+        values = result[0]
+        records = ()
+        if record:
+            from stable_worldmodel.evaluation.records import rollout_records
+
+            observations, rewards = result[2]
+            observations = {
+                key: torch.from_dlpack(value).reshape(
+                    horizon, population, tasks, *value.shape[2:]
+                )
+                for key, value in observations.items()
+            }
+            if 'pixels' in observations and self.image_transform:
+                pixels = observations['pixels']
+                pixels = self.image_transform(pixels.flatten(0, 2))
+                observations['pixels'] = pixels.reshape(
+                    horizon, population, tasks, *pixels.shape[1:]
+                )
+            records = rollout_records(
+                self._infos,
+                plans,
+                torch.from_dlpack(values[4]).reshape(population, tasks),
+                torch.from_dlpack(values[1]).reshape(population, tasks),
+                observations,
+                torch.from_dlpack(rewards).reshape(horizon, population, tasks),
+            )
         return EnvXOutcome(
             *(
                 torch.from_dlpack(v).reshape(population, tasks, *v.shape[1:])
                 for v in values
-            )
+            ),
+            records=records,
         )
 
     def close(self):

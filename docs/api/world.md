@@ -242,10 +242,19 @@ accelerator. The returned result is self-contained; the constituent Gym
 environments are not advanced to the envX terminal states.
 
 This evaluator is deliberately open-loop: `eval_budget` may not exceed
-`horizon * action_block`, and per-step records are not materialized. It plans
+`horizon * action_block`. It plans
 from the initial frame, matching the existing history warm-up behavior.
-Closed-loop replanning, filled histories, warm starts, early termination, and
-transition records are outside the supported path.
+Closed-loop replanning, filled histories and warm starts are outside the
+population path. Outcomes and records stop at first success or the action budget.
+
+For TwoRoom, PushT, Reacher and Cube, `World.evaluate(record=True)` and
+`ManyWorlds.evaluate(record=True)` return each episode's executed transitions in
+`EpisodeResult.steps`, including initial/next pixels and the restored goal.
+`World.evaluate(video="videos/")` writes an MP4 per task. Install the `format`
+extra for MP4 encoding. Recording renders the batched GPU states during the
+original rollout; it does not replay physics. Normal evaluation retains only
+summary metrics. Recording uses additional GPU memory for frames and rendering
+the complete population; allocation failures propagate without splitting it.
 
 Set protocol metadata `score="success"` for mean success or
 `score="distance"` for `1 - mean_final_distance / hypot(224, 224)`; distance

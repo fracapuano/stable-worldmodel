@@ -102,11 +102,72 @@ def episodes_from_rollout(
                 control_cost=float(controls[p, t]),
                 collisions=int(collisions[p, t]),
                 constraint_violations=0,
+                steps=(outcome.records[p][t] if outcome.records else ()),
             )
             for t, task in enumerate(protocol.tasks)
         )
         for p in range(len(successes))
     )
+
+
+def rollout_records(infos, actions, lengths, successes, observations, rewards):
+    """Materialize optional traces once, after the batched GPU execution.
+
+    Observations are time-major next observations; initial/goal observations
+    come from the existing task reset. No simulator is stepped during export.
+    """
+    infos, actions, lengths, successes, observations, rewards = recordable(
+        (infos, actions, lengths, successes, observations, rewards)
+    )
+    population = []
+    for p in range(actions.shape[0]):
+        tasks = []
+        for t in range(actions.shape[1]):
+            previous = {
+                key: value[t]
+                for key, value in infos.items()
+                if not key.startswith('_')
+            }
+            steps = []
+            for h in range(int(lengths[p, t])):
+                current = dict(previous)
+                updates = {
+                    key: value[h, p, t] for key, value in observations.items()
+                }
+                updates.update(
+                    action=actions[p, t, h], step_idx=torch.tensor(h + 1)
+                )
+                for key, value in updates.items():
+                    value = torch.as_tensor(value)
+                    before = previous.get(key)
+                    if before is not None:
+                        before = torch.as_tensor(before)
+                        value = value.reshape(1, *before.shape[1:])
+                        current[key] = torch.cat((before, value))[
+                            -len(before) :
+                        ]
+                    else:
+                        current[key] = value[None]
+                terminal = h + 1 == int(lengths[p, t])
+                hit = terminal and bool(successes[p, t])
+                current['terminated'] = hit
+                reward = float(rewards[h, p, t])
+                steps.append(
+                    StepRecord(
+                        decision=h,
+                        observation=previous,
+                        action=actions[p, t, h],
+                        next_observation=current,
+                        reward=reward,
+                        cost=-reward,
+                        terminated=hit,
+                        truncated=terminal and not hit,
+                    )
+                )
+                previous = current
+            tasks.append(tuple(steps))
+        population.append(tuple(tasks))
+    return tuple(population)
 
 
 @dataclass(frozen=True)

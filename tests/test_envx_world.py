@@ -148,22 +148,29 @@ def test_contract_metrics_and_wrapped_angle():
 
 
 @integration
-def test_first_success_inside_repeated_control_freezes_outcome():
+@pytest.mark.parametrize('record', [False, True])
+def test_first_success_inside_repeated_control_freezes_outcome(record):
     import jax.numpy as jnp
 
     engine = _Engine.__new__(_Engine)
     engine.name = 'reacher'
+    engine.render = None
     engine.adapter = SimpleNamespace(
         restore=lambda inputs: jnp.zeros((1, 2)),
         vector=lambda state: state,
         advance=lambda state, action, contract: state + action,
     )
-    result, simulator_state = engine._run(
+    output = engine._run(
         {'goal': jnp.asarray([[0.1, 0.0]])},
         {'repeat': jnp.asarray([2]), 'threshold': jnp.asarray([0.05])},
         jnp.asarray([[[0.1, 0], [1, 0], [-1, 0]]]),
         jnp.asarray([3]),
+        record=record,
     )
+    result, simulator_state = output[:2]
+    if record:
+        observations, _ = output[2]
+        np.testing.assert_allclose(observations['state'][:, 0], [[0.1, 0]] * 3)
     states, success, distances, _, lengths, paths, controls, _, rewards = (
         result
     )
@@ -443,7 +450,7 @@ def test_full_population_allocation_failure_propagates_without_retry(
         counts = []
         failure = RuntimeError('simulator device allocation failed')
 
-        def allocate(count):
+        def allocate(count, **kwargs):
             counts.append(count)
             raise failure
 
@@ -880,7 +887,6 @@ def test_complete_plan_preserves_last_transition_fields(name, monkeypatch):
         if name == 'two-room':
             torch.testing.assert_close(actions, plan[:, -1])
             np.testing.assert_array_equal(rewards, np.zeros(len(p.tasks)))
-            return
         recorded = world.evaluate(protocol=p, eval_budget=4, record=True)
         np.testing.assert_allclose(
             rewards, world.rewards, rtol=2e-4, atol=2e-4
@@ -1024,3 +1030,86 @@ def test_mixed_physics_intervals_are_rejected():
             world._reset_from_protocol(p, 4)
     finally:
         world.close()
+
+
+@integration
+@pytest.mark.parametrize('name', ['two-room', 'pusht', 'reacher', 'cube'])
+def test_recorded_world_and_population_keep_executed_transitions(
+    name, monkeypatch, tmp_path
+):
+    if name in ('reacher', 'cube') and DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('recording must not step legacy simulators')
+
+    monkeypatch.setattr(
+        'stable_worldmodel.world.env_pool.EnvPool.step', forbidden
+    )
+    monkeypatch.setattr(
+        'stable_worldmodel.envs.two_room.env.TwoRoomEnv.step', forbidden
+    )
+    p = protocol(name)
+    worlds = [world_for(p, pixels=True, cap=4) for _ in range(2)]
+    solvers = [
+        attach_policy(w, direction=direction)
+        for w, direction in zip(worlds, (1.0, -1.0))
+    ]
+    many = swm.ManyWorlds(worlds)
+    try:
+        single = worlds[0].evaluate(
+            protocol=p, eval_budget=4, record=True, video=tmp_path
+        )
+        assert len(single.model_queries) == 1
+        assert len(list(tmp_path.glob('*.mp4'))) == len(p.tasks)
+        population = many.evaluate(
+            p, solver=solvers[0], eval_budget=4, record=True
+        )
+        assert population.planning_calls == 1
+        for member, evaluation in enumerate(population.evaluations):
+            assert evaluation.task_keys == p.task_keys
+            for task, episode in enumerate(evaluation.episodes):
+                assert len(episode.steps) == episode.length <= 4
+                assert sum(
+                    step.reward for step in episode.steps
+                ) == pytest.approx(episode.episode_return, rel=1e-5)
+                assert episode.steps[-1].terminated == episode.success
+                assert episode.steps[-1].truncated != episode.success
+                for h, step in enumerate(episode.steps):
+                    torch.testing.assert_close(
+                        step.action,
+                        population.environment_actions[member, task, h].cpu(),
+                    )
+                    assert step.next_observation['pixels'].shape == (
+                        1,
+                        16,
+                        16,
+                        3,
+                    )
+                    torch.testing.assert_close(
+                        torch.as_tensor(step.observation['goal']),
+                        torch.as_tensor(step.next_observation['goal']),
+                    )
+                    if h:
+                        torch.testing.assert_close(
+                            step.observation['pixels'],
+                            episode.steps[h - 1].next_observation['pixels'],
+                        )
+                final = episode.steps[-1].next_observation
+                assert float(final['distance_to_target'][-1]) == pytest.approx(
+                    float(population.task_final_distances[member, task]),
+                    rel=1e-5,
+                )
+                if name != 'cube':
+                    torch.testing.assert_close(
+                        torch.as_tensor(
+                            episode.steps[0].observation['state'][-1]
+                        ),
+                        torch.tensor(p.tasks[task].start, dtype=torch.float32),
+                    )
+        assert all(
+            len(episode.steps) == episode.length for episode in single.episodes
+        )
+    finally:
+        many.close()
+        many.close()

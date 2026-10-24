@@ -19,8 +19,8 @@ from stable_worldmodel.evaluation import (
     EvaluationProtocol,
     EvaluationResults,
 )
-from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.evaluation.records import episodes_from_rollout
+from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.policy import WorldModelPolicy
 from stable_worldmodel.protocols import PopulationModel
 from stable_worldmodel.wrapper import (
@@ -647,10 +647,6 @@ class ManyWorlds:
         record: bool,
     ) -> ManyWorldsEvaluationResults:
         """Plan once and score every full plan in one compiled envX rollout."""
-        if record:
-            raise ValueError(
-                'envX ManyWorlds rollouts do not materialize per-step records'
-            )
         if eval_budget > self.config.plan_len:
             raise ValueError(
                 f'eval_budget {eval_budget} exceeds the generated plan length '
@@ -685,7 +681,7 @@ class ManyWorlds:
         )
         actions = self._environment_plan_tensor(planned, eval_budget)
 
-        outcome = self.worlds[0].envs.rollout(actions)
+        outcome = self.worlds[0].envs.rollout(actions, record=record)
         if isinstance(self.worlds[0].envs, EnvXPool):
             score_name = str(dict(protocol.metadata).get('score', 'distance'))
             if score_name == 'distance':

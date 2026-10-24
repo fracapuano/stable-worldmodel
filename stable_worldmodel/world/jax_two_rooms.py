@@ -30,6 +30,7 @@ class JaxTwoRoomsOutcome:
     control_costs: torch.Tensor
     collisions: torch.Tensor
     final_rewards: torch.Tensor
+    records: tuple = ()
 
 
 class TwoRoomTaskPool(EnvPool):
@@ -37,11 +38,20 @@ class TwoRoomTaskPool(EnvPool):
 
     execution_backend = 'envx'
 
-    def __init__(self, env_fns, *, max_episode_steps):
+    def __init__(
+        self,
+        env_fns,
+        *,
+        max_episode_steps,
+        image_shape=None,
+        image_transform=None,
+    ):
         super().__init__(env_fns)
         self.max_episode_steps = max_episode_steps
         self._rollout = None
         self._rollout_key = None
+        self.image_shape = image_shape
+        self.image_transform = image_transform
 
     def step(self, actions, mask=None):
         raise NotImplementedError(
@@ -49,7 +59,7 @@ class TwoRoomTaskPool(EnvPool):
             'per-step World rollouts are unsupported'
         )
 
-    def rollout(self, actions):
+    def rollout(self, actions, *, record=False):
         if self._closed:
             raise RuntimeError('TwoRoom task pool is closed')
         if self._stacked_infos is None:
@@ -70,7 +80,54 @@ class TwoRoomTaskPool(EnvPool):
             )
             self._rollout_key = key
         initial = self._rollout.initial_state(SimpleNamespace(envs=self))
-        return self._rollout(initial, actions)
+        outcome = self._rollout(initial, actions, record=record)
+        if record:
+            from dataclasses import replace
+
+            from stable_worldmodel.evaluation.records import rollout_records
+
+            outcome, (observations, rewards) = outcome
+            if 'pixels' in self._stacked_infos:
+                pixels = observations['pixels']
+                shape = pixels.shape
+                target = (
+                    self.image_shape
+                    or self._stacked_infos['pixels'].shape[-3:-1]
+                )
+                pixels = (
+                    torch.nn.functional.interpolate(
+                        pixels.reshape(-1, *shape[-3:])
+                        .permute(0, 3, 1, 2)
+                        .float(),
+                        size=target,
+                        mode='bilinear',
+                        align_corners=False,
+                        antialias=True,
+                    )
+                    .round()
+                    .clamp(0, 255)
+                    .to(torch.uint8)
+                    .permute(0, 2, 3, 1)
+                )
+                if self.image_transform:
+                    pixels = self.image_transform(pixels)
+                observations['pixels'] = pixels.reshape(
+                    *shape[:3], *pixels.shape[1:]
+                )
+            else:
+                observations.pop('pixels')
+            outcome = replace(
+                outcome,
+                records=rollout_records(
+                    self._stacked_infos,
+                    actions,
+                    outcome.lengths,
+                    outcome.successes,
+                    observations,
+                    rewards,
+                ),
+            )
+        return outcome
 
     def close(self):
         if self._rollout is not None:
@@ -150,7 +207,7 @@ class JaxTwoRoomsRollout:
         )
         key = jax.device_put(jax.random.key(2), self.device)
 
-        def score(initial_state, actions, params):
+        def score(initial_state, actions, params, *, record=False):
             _, trajectory = self.env.rollout(
                 key,
                 initial_state,
@@ -175,7 +232,7 @@ class JaxTwoRoomsRollout:
             lengths = active.sum(axis=0)
             final_index = lengths - 1
             environment_index = self._jnp.arange(self.num_envs)
-            return (
+            result = (
                 trajectory.observation[final_index, environment_index],
                 (trajectory.info['success'] & active).any(axis=0),
                 trajectory.info['distance_to_target'][
@@ -191,10 +248,30 @@ class JaxTwoRoomsRollout:
                 (trajectory.info['collided'] * active).sum(axis=0),
                 trajectory.reward[final_index, environment_index],
             )
+            if record:
+                # TwoRoom's dynamic render state is its position and action;
+                # layouts stay in the restored state. Reuse envX's renderer.
+                pixels = jax.vmap(
+                    lambda position: self.env.render(
+                        initial_state.replace(agent_position=position), params
+                    )
+                )(positions)
+                return result, (
+                    {
+                        'state': positions,
+                        'distance_to_target': trajectory.info[
+                            'distance_to_target'
+                        ][..., None],
+                        'collision': trajectory.info['collided'][..., None],
+                        'pixels': pixels,
+                    },
+                    trajectory.reward,
+                )
+            return result
 
         # The outer JIT lets XLA discard the unused trajectory instead of
         # materializing time * population * tasks worth of state and info.
-        self._score = jax.jit(score)
+        self._score = jax.jit(score, static_argnames=('record',))
 
     @staticmethod
     def _validate_cuda_packages() -> None:
@@ -298,7 +375,9 @@ class JaxTwoRoomsRollout:
         self,
         initial_state,
         actions: torch.Tensor,
-    ) -> JaxTwoRoomsOutcome:
+        *,
+        record=False,
+    ):
         """Roll out ``(P, T, time, 2)`` actions without a host copy."""
         expected = (
             self.population_size,
@@ -331,14 +410,27 @@ class JaxTwoRoomsRollout:
             .contiguous()
         )
         jax_actions = self._jax.dlpack.from_dlpack(time_major)
-        outputs = self._score(initial_state, jax_actions, self.params)
+        outputs = self._score(
+            initial_state, jax_actions, self.params, record=record
+        )
+        if record:
+            outputs, trace = outputs
+            trace = self._jax.tree.map(
+                lambda value: torch.from_dlpack(value).reshape(
+                    self.eval_budget,
+                    self.population_size,
+                    self.num_tasks,
+                    *value.shape[2:],
+                ),
+                trace,
+            )
 
         def to_torch(value):
             return torch.utils.dlpack.from_dlpack(value).reshape(
                 self.population_size, self.num_tasks, *value.shape[1:]
             )
 
-        return JaxTwoRoomsOutcome(
+        outcome = JaxTwoRoomsOutcome(
             final_observations=to_torch(outputs[0]),
             successes=to_torch(outputs[1]),
             final_distances=to_torch(outputs[2]),
@@ -349,6 +441,7 @@ class JaxTwoRoomsRollout:
             collisions=to_torch(outputs[7]),
             final_rewards=to_torch(outputs[8]),
         )
+        return (outcome, trace) if record else outcome
 
     def close(self):
         self._score = self.env = self.params = None

@@ -182,7 +182,10 @@ class World:
                     'TwoRoom uses the existing task reset options'
                 )
             self.envs = TwoRoomTaskPool(
-                [env_fn] * num_envs, max_episode_steps=max_episode_steps
+                [env_fn] * num_envs,
+                max_episode_steps=max_episode_steps,
+                image_shape=image_shape,
+                image_transform=image_transform,
             )
         else:
             self.envs = EnvPool([env_fn] * num_envs)
