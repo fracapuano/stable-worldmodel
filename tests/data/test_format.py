@@ -757,7 +757,7 @@ class TestCollectFormat:
         from stable_worldmodel.policy import RandomPolicy
 
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=2,
             image_shape=(32, 32),
             max_episode_steps=10,
@@ -782,7 +782,7 @@ class TestCollectFormat:
         from stable_worldmodel.policy import RandomPolicy
 
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=1,
             image_shape=(32, 32),
             max_episode_steps=5,

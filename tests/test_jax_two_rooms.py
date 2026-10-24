@@ -29,6 +29,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def forbid_legacy_physics(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail('TwoRoom physics must execute only through envX')
+
+    monkeypatch.setattr(
+        'stable_worldmodel.world.env_pool.EnvPool.step', unexpected
+    )
+    monkeypatch.setattr(
+        'stable_worldmodel.envs.two_room.env.TwoRoomEnv.step', unexpected
+    )
+
+
 class TinyTwoRoomsModel(nn.Module):
     def __init__(self, direction: float) -> None:
         super().__init__()
@@ -470,16 +483,8 @@ def test_many_worlds_rejects_custom_wrapper_stacks() -> None:
     class UnsupportedWrapper(gym.Wrapper):
         pass
 
-    worlds = [
-        _world(1.0, extra_wrappers=[UnsupportedWrapper]),
-        _world(-1.0, extra_wrappers=[UnsupportedWrapper]),
-    ]
-    try:
-        with pytest.raises(ValueError, match='custom wrapper'):
-            swm.ManyWorlds(worlds=worlds)
-    finally:
-        for world in worlds:
-            world.close()
+    with pytest.raises(ValueError, match='Gym wrappers'):
+        _world(1.0, extra_wrappers=[UnsupportedWrapper])
 
 
 def test_many_worlds_requires_envx(monkeypatch) -> None:

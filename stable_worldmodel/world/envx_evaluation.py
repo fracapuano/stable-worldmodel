@@ -13,17 +13,30 @@ from stable_worldmodel.policy import WorldModelPolicy
 
 @torch.inference_mode()
 def evaluate_world(world, protocol, budget, video, record, backend):
+    from .jax_two_rooms import TwoRoomTaskPool
+
     policy = world.policy
+    two_room = isinstance(world.envs, TwoRoomTaskPool)
     if (
         not isinstance(policy, WorldModelPolicy)
         or not isinstance(policy.solver, FastCEMSolver)
         or video
         or record
     ):
+        if two_room:
+            raise NotImplementedError(
+                'TwoRoom World envX execution requires a complete FastCEM '
+                'protocol plan without video or per-step records'
+            )
         return None
     if budget is None or budget < 1:
         raise ValueError('protocol evaluation requires eval_budget >= 1')
     if budget > policy.flatten_receding_horizon:
+        if two_room:
+            raise NotImplementedError(
+                'TwoRoom World envX execution requires eval_budget within '
+                'the selected complete plan'
+            )
         return None
     world._reset_from_protocol(protocol, budget)
     actions = policy._get_action_plan(dict(world.infos), budget)
@@ -38,8 +51,9 @@ def evaluate_world(world, protocol, budget, video, record, backend):
         [episode.episode_return for episode in episodes], np.float32
     )
     world.actions = actions
+    state = outcome.final_observations[0, :, None]
     world.infos.update(
-        state=outcome.final_observations[0, :, None],
+        state=state[..., :2] if two_room else state,
         distance_to_target=outcome.final_distances[0, :, None],
         terminated=successes.copy(),
         step_idx=lengths[:, None],

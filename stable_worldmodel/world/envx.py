@@ -299,22 +299,7 @@ class EnvXPool:
         if self.device.type not in ('cuda', 'cpu'):
             raise ValueError('envX supports CPU or CUDA devices')
         if self.device.type == 'cuda' and self.device.index is None:
-            # Resolve before envX/JAX initialize their CUDA backends.
             self.device = torch.device('cuda', torch.cuda.current_device())
-        os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
-        from .jax_two_rooms import JaxTwoRoomsRollout
-
-        JaxTwoRoomsRollout._validate_cuda_packages()
-        try:
-            import envx
-            import jax
-        except ImportError as error:
-            raise ImportError(
-                'Frozen envX evaluation requires Python 3.11 or 3.12 and '
-                'the pinned dependencies in stable-worldmodel[envx]'
-            ) from error
-        del envx
-
         if env_name not in ENVIRONMENTS:
             raise ValueError(f'envX World does not support {env_name!r}')
         if min(num_envs, max_episode_steps) < 1:
@@ -323,9 +308,7 @@ class EnvXPool:
             )
         self.env_name, self.name = env_name, ENVIRONMENTS[env_name]
         self.num_envs, self.max_episode_steps = num_envs, max_episode_steps
-        self.jax_device = jax.local_devices(
-            backend='gpu' if self.device.type == 'cuda' else 'cpu'
-        )[self.device.index or 0]
+        self._jax_device = None
         self.image_shape, self.image_transform, self.goal_transform = (
             image_shape,
             image_transform,
@@ -359,6 +342,27 @@ class EnvXPool:
         self.single_action_space = action_space_for(env_name)
         self.action_space = batch_space(self.single_action_space, num_envs)
         self.seeds = np.zeros(num_envs, np.int64)
+
+    @property
+    def jax_device(self):
+        if self._jax_device is None:
+            os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+            from .jax_two_rooms import JaxTwoRoomsRollout
+
+            JaxTwoRoomsRollout._validate_cuda_packages()
+            try:
+                import envx
+                import jax
+            except ImportError as error:
+                raise ImportError(
+                    'Frozen envX evaluation requires Python 3.11 or 3.12 and '
+                    'the pinned dependencies in stable-worldmodel[envx]'
+                ) from error
+            del envx
+            self._jax_device = jax.local_devices(
+                backend='gpu' if self.device.type == 'cuda' else 'cpu'
+            )[self.device.index or 0]
+        return self._jax_device
 
     def _engine(self, count, *, render=False):
         if self._closed:
@@ -446,6 +450,7 @@ class EnvXPool:
             raise ValueError(
                 'envX reset requires one complete reset option per task'
             )
+        _ = self.jax_device
         import jax
 
         if any(

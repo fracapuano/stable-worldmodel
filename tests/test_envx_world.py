@@ -41,6 +41,9 @@ def protocol(name='pusht', count=2):
             start = (100.0 + i * 20, 100, 250, 250, 0, 0, 0)
             goal = (160.0 + i * 20, 100, 250, 250, 0, 0, 0)
             options = (('goal_state', goal), ('variation', []))
+        elif name == 'two-room':
+            start, goal = (40.0 + i * 140, 49.0), (180.0 - i * 140, 49.0)
+            options = (('variation', []),)
         else:
             start, goal = (0.2 + i * 0.1, -0.3), (0.6, -0.7)
             options = (
@@ -57,7 +60,11 @@ def protocol(name='pusht', count=2):
         tasks.append(
             EvaluationTask(i, i + 11, i, start, goal, i, options=options)
         )
-    environment = next(k for k, v in ENVIRONMENTS.items() if v == name)
+    environment = (
+        'swm/TwoRoom-v1'
+        if name == 'two-room'
+        else next(k for k, v in ENVIRONMENTS.items() if v == name)
+    )
     return EvaluationProtocol('test', environment, tuple(tasks))
 
 
@@ -478,16 +485,17 @@ class TinyModel(nn.Module):
 
 
 def attach_policy(
-    world, *, horizon=4, receding=4, action_block=1, direction=1.0
+    world, *, horizon=4, receding=4, action_block=1, direction=1.0, device=None
 ):
-    model = TinyModel(direction).to(DEVICE)
+    device = DEVICE if device is None else device
+    model = TinyModel(direction).to(device)
     solver = FastCEMSolver(
         ShootingCostEvaluator(model, GoalMSE()),
         batch_size=world.num_envs,
         num_samples=4,
         n_steps=1,
         topk=2,
-        device=DEVICE,
+        device=device,
         compile_kernel=False,
     )
     world.set_policy(
@@ -540,7 +548,7 @@ def test_policy_attachment_does_not_construct_either_simulator(
         raise AssertionError('policy attachment must only need control spaces')
 
     monkeypatch.setattr('stable_worldmodel.world.world._make_env', unexpected)
-    monkeypatch.setattr('stable_worldmodel.world.envx.EnvXPool', unexpected)
+    monkeypatch.setattr('stable_worldmodel.world.envx._Engine', unexpected)
     world = world_for(protocol(name))
     try:
         attach_policy(world)
@@ -573,63 +581,119 @@ class DefaultTaskEnv(gym.Env):
         self.closed = True
 
 
-def test_ordinary_evaluation_keeps_environment_defaults(monkeypatch):
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube', 'two-room'])
+def test_unsupported_workflows_cannot_switch_to_gym(name, monkeypatch):
+    p = protocol(name)
+    world = world_for(p)
+    pool = world.envs
+
     def unexpected(*args, **kwargs):
-        raise AssertionError('ordinary evaluation must not require envX')
+        raise AssertionError('legacy physics must never execute')
 
+    monkeypatch.setattr(
+        'stable_worldmodel.world.env_pool.EnvPool.step', unexpected
+    )
+    try:
+        assert world.execution_backend == 'envx'
+        with pytest.raises(NotImplementedError, match='EvaluationProtocol'):
+            world.evaluate(episodes=2)
+        with pytest.raises(NotImplementedError, match='EvaluationProtocol'):
+            world.evaluate(dataset=object())
+        with pytest.raises(NotImplementedError, match='collect'):
+            world.collect(writer=object(), episodes=1)
+        assert world.envs is pool
+        assert world.execution_backend == 'envx'
+    finally:
+        world.close()
+
+
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_missing_envx_cannot_fall_back_to_gym(name, monkeypatch):
+    import sys
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('legacy simulator construction is forbidden')
+
+    monkeypatch.setattr('stable_worldmodel.world.world._make_env', unexpected)
+    monkeypatch.setitem(sys.modules, 'envx', None)
+    p = protocol(name)
+    world = world_for(p)
+    world.set_policy(swm.policy.RandomPolicy(seed=0))
+    try:
+        with pytest.raises(ImportError, match='requires Python'):
+            world.evaluate(protocol=p, eval_budget=2)
+        assert world.execution_backend == 'envx'
+    finally:
+        world.close()
+
+
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube', 'two-room'])
+def test_unsupported_wrappers_do_not_construct_legacy_simulators(
+    name, monkeypatch
+):
+    def unexpected(*args, **kwargs):
+        raise AssertionError('legacy simulator construction is forbidden')
+
+    monkeypatch.setattr('stable_worldmodel.world.world._make_env', unexpected)
+    with pytest.raises(ValueError, match='Gym wrappers'):
+        world_for(protocol(name), extra_wrappers=[gym.Wrapper])
+
+
+def test_discrete_pusht_cannot_use_the_legacy_simulator(monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError('legacy simulator construction is forbidden')
+
+    monkeypatch.setattr('stable_worldmodel.world.world._make_env', unexpected)
+    with pytest.raises(NotImplementedError, match='discrete PushT'):
+        swm.World('swm/PushT-Discrete-v1', 1, add_pixels=False)
+
+
+def test_other_environments_keep_their_existing_interfaces(monkeypatch):
     envs = [DefaultTaskEnv(), DefaultTaskEnv()]
     pending = iter(envs)
     monkeypatch.setattr(
         'stable_worldmodel.world.world._make_env',
         lambda *a, **kw: next(pending),
     )
-    monkeypatch.setattr('stable_worldmodel.world.envx.EnvXPool', unexpected)
-    world = world_for(protocol())
+    world = swm.World('test/Other-v0', 2, add_pixels=False)
     world.set_policy(swm.policy.RandomPolicy(seed=0))
     try:
-        result = world.evaluate(
-            episodes=2, options={'ordinary_task': 'original'}
-        )
-        assert result['success_rate'] == 0
-        assert all(
-            row['ordinary_task'] == 'original'
-            for e in envs
-            for row in e.options
-        )
+        assert world.evaluate(episodes=2, seed=0)['success_rate'] == 0
     finally:
         world.close()
-    assert all(e.closed for e in envs)
-
-
-@integration
-def test_world_returns_to_ordinary_task_after_protocol(monkeypatch):
-    envs = [DefaultTaskEnv(), DefaultTaskEnv()]
-    pending = iter(envs)
-    monkeypatch.setattr(
-        'stable_worldmodel.world.world._make_env',
-        lambda *a, **kw: next(pending),
-    )
-    world = world_for(protocol())
-    world.set_policy(swm.policy.RandomPolicy(seed=0))
-    try:
-        frozen = world.evaluate(protocol=protocol(), eval_budget=2)
-        assert frozen.task_keys == protocol().task_keys
-        assert all(not e.options for e in envs)
-        ordinary = world.evaluate(
-            episodes=2, options={'ordinary_task': 'original'}
-        )
-        assert ordinary['success_rate'] == 0
-        assert world.policy.env is world.envs
-    finally:
-        world.close()
-        world.close()
-    assert all(e.closed for e in envs)
+    assert all(env.closed for env in envs)
 
 
 @integration
 @pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
+def test_protocol_evaluation_never_returns_to_a_legacy_pool(name, monkeypatch):
+    if name in ('reacher', 'cube') and DEVICE == 'cpu':
+        pytest.skip('MJX integration requires CUDA')
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('legacy simulator construction is forbidden')
+
+    monkeypatch.setattr('stable_worldmodel.world.world._make_env', unexpected)
+    p = protocol(name)
+    world = world_for(p)
+    pool = world.envs
+    world.set_policy(swm.policy.RandomPolicy(seed=0))
+    try:
+        result = world.evaluate(protocol=p, eval_budget=2)
+        assert result.task_keys == p.task_keys
+        with pytest.raises(NotImplementedError, match='EvaluationProtocol'):
+            world.evaluate(episodes=2)
+        assert world.envs is pool
+        assert world.policy.env is pool
+        assert world.execution_backend == 'envx'
+    finally:
+        world.close()
+
+
+@integration
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube', 'two-room'])
 def test_blocked_plan_executes_25_controls_in_one_planning_call(name):
-    if name != 'pusht' and DEVICE == 'cpu':
+    if name in ('reacher', 'cube') and DEVICE == 'cpu':
         pytest.skip('MJX rendering requires CUDA')
     p = protocol(name)
     worlds = [world_for(p, pixels=True, cap=25) for _ in range(2)]
@@ -660,10 +724,20 @@ def test_blocked_plan_executes_25_controls_in_one_planning_call(name):
 
 
 @integration
-@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
-def test_public_world_and_manyworlds_evaluation(name):
-    if name != 'pusht' and DEVICE == 'cpu':
+@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube', 'two-room'])
+def test_public_world_and_manyworlds_evaluation(name, monkeypatch):
+    if name in ('reacher', 'cube') and DEVICE == 'cpu':
         pytest.skip('MJX rendering requires CUDA')
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('legacy physics must never execute')
+
+    monkeypatch.setattr(
+        'stable_worldmodel.world.env_pool.EnvPool.step', unexpected
+    )
+    monkeypatch.setattr(
+        'stable_worldmodel.envs.two_room.env.TwoRoomEnv.step', unexpected
+    )
     p = protocol(name)
     worlds = [world_for(p, pixels=True), world_for(p, pixels=True)]
     solvers = [
@@ -680,9 +754,10 @@ def test_public_world_and_manyworlds_evaluation(name):
         assert all(1 <= row.length <= 4 for row in result.episodes)
         population = many.evaluate(p, solver=solvers[0], eval_budget=4)
         assert population.task_final_distances.shape == (2, 2)
-        torch.testing.assert_close(
-            population.scores, -population.task_final_distances.mean(1)
-        )
+        expected = -population.task_final_distances.mean(1)
+        if name == 'two-room':
+            expected = 1 + expected / np.hypot(224, 224)
+        torch.testing.assert_close(population.scores, expected)
         assert all(
             value.task_keys == p.task_keys for value in population.evaluations
         )
@@ -691,15 +766,50 @@ def test_public_world_and_manyworlds_evaluation(name):
 
 
 @integration
+def test_two_room_world_uses_the_plan_cuda_device():
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip('requires two CUDA devices')
+    previous = torch.cuda.current_device()
+    world = None
+    try:
+        torch.cuda.set_device(1)
+        p = protocol('two-room', count=1)
+        world = swm.World(
+            p.environment, 1, image_shape=(16, 16), device='cuda'
+        )
+        attach_policy(world, horizon=2, receding=2, device='cuda:1')
+        result = world.evaluate(protocol=p, eval_budget=2)
+        assert result.metadata['simulator_backend'] == 'envx'
+        assert world.actions.device == torch.device('cuda:1')
+        assert world.infos['state'].device == world.actions.device
+        assert world.envs._rollout.device.id == 1
+    finally:
+        if world is not None:
+            world.close()
+        torch.cuda.set_device(previous)
+
+
+@integration
 @pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])
-def test_world_mpc_and_records_support_other_budgets(name):
+def test_world_mpc_and_records_support_other_budgets(name, tmp_path):
     if name != 'pusht' and DEVICE == 'cpu':
         pytest.skip('MJX rendering requires CUDA')
     p = protocol(name)
     world = world_for(p, pixels=True)
     attach_policy(world, horizon=2, receding=1)
     try:
-        result = world.evaluate(protocol=p, eval_budget=3, record=True)
+        result = world.evaluate(
+            protocol=p,
+            eval_budget=3,
+            record=True,
+            backend='recorded',
+            video=tmp_path,
+        )
+        assert result.backend == 'recorded'
+        assert result.protocol_digest == p.digest
+        assert result.task_keys == p.task_keys
+        assert result.controller_seeds == p.controller_seeds
+        assert len(list(tmp_path.rglob('*.mp4'))) == len(p.tasks)
         assert len(result.model_queries) >= 1
         assert all(len(row.steps) == row.length for row in result.episodes)
         assert all(row.length <= 3 for row in result.episodes)

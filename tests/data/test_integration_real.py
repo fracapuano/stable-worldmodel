@@ -21,11 +21,11 @@ class TestRealDataCollection:
         """Create a temporary directory for test data."""
         return tmp_path
 
-    def test_collect_and_load_pusht(self, temp_cache_dir):
-        """Test collecting data from PushT and loading with HDF5Dataset."""
-        # 1. Create World with PushT environment
+    def test_collect_and_load(self, temp_cache_dir):
+        """Test collecting real Gym data and loading with HDF5Dataset."""
+        # 1. Use a supported Gym collection environment.
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=2,
             image_shape=(64, 64),
             max_episode_steps=20,
@@ -88,7 +88,7 @@ class TestRealDataCollection:
         """Test loading dataset with frameskip."""
         # 1. Collect data
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=2,
             image_shape=(64, 64),
             max_episode_steps=30,
@@ -122,7 +122,7 @@ class TestRealDataCollection:
         """Test loading dataset with custom transform."""
         # 1. Collect data
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=2,
             image_shape=(64, 64),
             max_episode_steps=20,
@@ -161,7 +161,7 @@ class TestRealDataCollection:
         """Test loading dataset with specific keys cached."""
         # 1. Collect data
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=2,
             image_shape=(64, 64),
             max_episode_steps=20,
@@ -248,17 +248,16 @@ class TestCollectResetFrame:
         """The first buffered/recorded observation of a collected episode
         must exactly match world.infos right after reset()."""
         world = World(
-            env_name='swm/TwoRoom-v1',
+            env_name='Pendulum-v1',
             num_envs=1,
             image_shape=(32, 32),
             max_episode_steps=6,
-            render_target=True,
         )
         policy = RandomPolicy(seed=0)
         world.set_policy(policy)
 
         world.reset(seed=0)
-        reset_state = np.array(world.infos['state'][0]).copy()
+        reset_state = np.array(world.infos['observation'][0]).copy()
 
         h5_path = temp_cache_dir / 'datasets' / 'reset_frame.h5'
         world.collect(
@@ -267,7 +266,7 @@ class TestCollectResetFrame:
         world.envs.close()
 
         with h5py.File(h5_path, 'r') as f:
-            first_state = f['state'][0]
+            first_state = f['observation'][0]
 
         np.testing.assert_allclose(first_state, reset_state.squeeze())
 
@@ -275,11 +274,10 @@ class TestCollectResetFrame:
         """Recorded action arrays should contain exactly one NaN entry per
         episode, at the last index of that episode."""
         world = World(
-            env_name='swm/TwoRoom-v1',
+            env_name='Pendulum-v1',
             num_envs=1,
             image_shape=(32, 32),
             max_episode_steps=15,
-            render_target=True,
         )
         policy = RandomPolicy(seed=0)
         world.set_policy(policy)
@@ -309,11 +307,10 @@ class TestCollectResetFrame:
         still yield a well-formed episode (reset frame + terminal frame),
         not a spurious length-0 episode."""
         world = World(
-            env_name='swm/TwoRoom-v1',
+            env_name='Pendulum-v1',
             num_envs=1,
             image_shape=(32, 32),
             max_episode_steps=1,
-            render_target=True,
         )
         policy = RandomPolicy(seed=0)
         world.set_policy(policy)
@@ -341,7 +338,7 @@ class TestImageDatasetReal:
         """Test collecting data, converting to image format, and loading."""
         # 1. Collect data with World
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=2,
             image_shape=(64, 64),
             max_episode_steps=15,
@@ -397,7 +394,7 @@ class TestImageDatasetReal:
         """Test ImageDataset load_chunk with real data."""
         # 1. Collect and convert
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=2,
             image_shape=(64, 64),
             max_episode_steps=15,
@@ -457,7 +454,7 @@ class TestVideoDatasetReal:
 
         # 1. Collect data
         world = World(
-            env_name='swm/PushT-v1',
+            env_name='Pendulum-v1',
             num_envs=2,
             image_shape=(64, 64),
             max_episode_steps=15,

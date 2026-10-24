@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+
+from .env_pool import EnvPool
 
 if TYPE_CHECKING:
     from stable_worldmodel.world.world import World
@@ -28,6 +31,53 @@ class JaxTwoRoomsOutcome:
     collisions: torch.Tensor
 
 
+class TwoRoomTaskPool(EnvPool):
+    """Preserve Gym's task resets/rendering; execute plans only with envX."""
+
+    execution_backend = 'envx'
+
+    def __init__(self, env_fns, *, max_episode_steps):
+        super().__init__(env_fns)
+        self.max_episode_steps = max_episode_steps
+        self._rollout = None
+        self._rollout_key = None
+
+    def step(self, actions, mask=None):
+        raise NotImplementedError(
+            'TwoRoom World requires a complete FastCEM protocol plan; '
+            'per-step World rollouts are unsupported'
+        )
+
+    def rollout(self, actions):
+        if self._closed:
+            raise RuntimeError('TwoRoom task pool is closed')
+        if self._stacked_infos is None:
+            raise RuntimeError(
+                'reset the TwoRoom task pool before executing plans'
+            )
+        population, _, horizon = actions.shape[:3]
+        key = (population, horizon, actions.device)
+        if self._rollout_key != key:
+            if self._rollout is not None:
+                self._rollout.close()
+            self._rollout = JaxTwoRoomsRollout(
+                population_size=population,
+                num_tasks=self.num_envs,
+                eval_budget=horizon,
+                max_episode_steps=self.max_episode_steps,
+                device=actions.device,
+            )
+            self._rollout_key = key
+        initial = self._rollout.initial_state(SimpleNamespace(envs=self))
+        return self._rollout(initial, actions)
+
+    def close(self):
+        if self._rollout is not None:
+            self._rollout.close()
+            self._rollout = None
+        super().close()
+
+
 class JaxTwoRoomsRollout:
     """Execute ``population * tasks`` TwoRooms plans in one JAX program.
 
@@ -43,10 +93,20 @@ class JaxTwoRoomsRollout:
         num_tasks: int,
         eval_budget: int,
         max_episode_steps: int | None = None,
+        device: str | torch.device | None = None,
     ) -> None:
         # JAX otherwise reserves most of the accelerator on first use, which
         # is hostile to the Torch world models sharing the same device.
         os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+        requested = torch.device(device) if device is not None else None
+        if requested is not None and requested.type not in {'cpu', 'cuda'}:
+            raise ValueError('envX supports CPU or CUDA devices')
+        if (
+            requested is not None
+            and requested.type == 'cuda'
+            and requested.index is None
+        ):
+            requested = torch.device('cuda', torch.cuda.current_device())
         self._validate_cuda_packages()
         try:
             import envx
@@ -62,6 +122,13 @@ class JaxTwoRoomsRollout:
         self._jax = jax
         self._jnp = jnp
         self._state_type = EnvState
+        self.device = (
+            jax.local_devices(
+                backend='gpu' if requested.type == 'cuda' else 'cpu'
+            )[requested.index or 0]
+            if requested is not None
+            else None
+        )
         self.population_size = int(population_size)
         self.num_tasks = int(num_tasks)
         self.num_envs = self.population_size * self.num_tasks
@@ -71,15 +138,16 @@ class JaxTwoRoomsRollout:
         self.max_episode_steps = min(self.eval_budget, int(max_episode_steps))
         if self.max_episode_steps < 1:
             raise ValueError('max_episode_steps must be positive')
-        self.env, params = envx.make(
-            'two-rooms',
-            num_envs=self.num_envs,
-            observation_type='state',
-        )
+        with jax.default_device(self.device):
+            self.env, params = envx.make(
+                'two-rooms',
+                num_envs=self.num_envs,
+                observation_type='state',
+            )
         self.params = params.replace(
             max_steps_in_episode=self.max_episode_steps
         )
-        key = jax.random.key(2)
+        key = jax.device_put(jax.random.key(2), self.device)
 
         def score(initial_state, actions, params):
             _, trajectory = self.env.rollout(
@@ -149,7 +217,7 @@ class JaxTwoRoomsRollout:
             )
 
     def _repeat_tasks(self, value: Any):
-        value = self._jnp.asarray(value)
+        value = self._jax.device_put(value, self.device)
         repeats = (self.population_size,) + (1,) * value.ndim
         return self._jnp.tile(value, repeats).reshape(
             self.num_envs, *value.shape[1:]
@@ -278,6 +346,9 @@ class JaxTwoRoomsRollout:
             control_costs=to_torch(outputs[6]),
             collisions=to_torch(outputs[7]),
         )
+
+    def close(self):
+        self._score = self.env = self.params = None
 
 
 __all__ = ['JaxTwoRoomsOutcome', 'JaxTwoRoomsRollout']

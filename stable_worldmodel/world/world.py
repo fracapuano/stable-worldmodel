@@ -2,8 +2,8 @@
 
 ``World`` bundles three things:
 
-1. A batched simulator (``EnvPool``) that steps N envs in parallel and
-   can skip terminated envs via a mask.
+1. A simulator pool that executes the policy's actions and can skip
+   terminated envs via a mask.
 2. A preprocessing pipeline (``MegaWrapper``) that resizes pixels,
    lifts everything into the info dict, and applies optional transforms.
 3. A rollout loop that drives ``policy.get_action(infos)`` and handles
@@ -12,25 +12,14 @@
 Quick start::
 
     import stable_worldmodel as swm
+    from stable_worldmodel.evaluation import EvaluationProtocol
 
-    world = swm.World('swm/PushT-v1', num_envs=4, image_shape=(64, 64))
-    world.set_policy(policy)
-
-    # Record expert episodes to disk.
-    world.collect('data.lance', episodes=500, seed=0)
-
-    # Evaluate a policy over a fixed number of episodes.
-    results = world.evaluate(episodes=100, seed=42)
-
-    # Evaluate from dataset-defined start/goal states (one env per episode).
-    results = world.evaluate(
-        dataset=ds,
-        episodes_idx=[0, 1, 2, 3],
-        start_steps=[0, 10, 20, 30],
-        goal_offset=30,
-        eval_budget=50,
-        video='videos/',
+    protocol = EvaluationProtocol.read('tasks.json')
+    world = swm.World(
+        protocol.environment, num_envs=len(protocol.tasks), image_shape=(64, 64)
     )
+    world.set_policy(policy)
+    results = world.evaluate(protocol=protocol, eval_budget=25)
 """
 
 from __future__ import annotations
@@ -68,10 +57,9 @@ def _make_env(
 class World:
     """Drive a policy through a pool of preprocessed envs.
 
-    Ordinary runs use an ``EnvPool`` of ``num_envs`` environments wrapped by
-    ``MegaWrapper``. Frozen PushT, Reacher and Cube protocol evaluations use
-    envX internally. Attach a policy with ``set_policy(...)`` and then call
-    ``collect()`` or ``evaluate()`` to run rollouts.
+    PushT, Reacher, Cube and TwoRoom execute only through envX. Evaluate an
+    ``EvaluationProtocol``; unsupported workflows raise instead of using Gym
+    physics. Other environments retain their ``EnvPool`` interfaces.
 
     Attributes populated during a run:
         infos: Stacked info dict from the last reset/step. Tensor/array
@@ -106,7 +94,7 @@ class World:
             ``pixels`` observation; goal images are resized too. Set False
             for envs without pixels (e.g. audio): ``image_shape`` may then
             be omitted and the raw observation is lifted into info as-is.
-        device: Torch/JAX device for frozen envX protocol evaluation;
+        device: Torch/JAX device for envX protocol evaluation;
             defaults to cuda:0.
         envx_options: Static options forwarded to the pinned envX factory.
         **kwargs: Forwarded to ``gym.make`` (e.g. ``render_mode``).
@@ -129,6 +117,11 @@ class World:
         envx_options: dict | None = None,
         **kwargs: Any,
     ):
+        if env_name == 'swm/PushT-Discrete-v1':
+            raise NotImplementedError(
+                'envX World supports continuous swm/PushT-v1 controls; '
+                'discrete PushT execution is unsupported'
+            )
         if add_pixels and image_shape is None:
             raise ValueError('image_shape is required when add_pixels=True.')
         wrappers = [
@@ -154,38 +147,43 @@ class World:
         )
         self.env_name = env_name
         self._closed = False
-        self._protocol_envs = None
-        self._envx_config = None
-        from .envx import ENVIRONMENTS, action_space_for
+        from .envx import ENVIRONMENTS, EnvXPool
+        from .jax_two_rooms import TwoRoomTaskPool
 
-        if env_name in ENVIRONMENTS:
-            self._envx_unsupported = bool(
+        accelerated = env_name in ENVIRONMENTS or env_name == 'swm/TwoRoom-v1'
+        if accelerated:
+            if (
                 pre_wrappers
                 or extra_wrappers
-                or kwargs
-                or image_resample
+                or (env_name in ENVIRONMENTS and (kwargs or image_resample))
                 or not goal_conditioned
-            )
-            self._envx_config = {
-                'env_name': env_name,
-                'num_envs': num_envs,
-                'image_shape': image_shape if add_pixels else None,
-                'max_episode_steps': max_episode_steps,
-                'device': device,
-                'image_transform': image_transform,
-                'goal_transform': goal_transform,
-                'envx_options': envx_options,
-            }
-            if self._envx_unsupported:
-                self.envs = EnvPool([env_fn] * num_envs)
-            else:
-                self.envs = EnvPool(
-                    [env_fn] * num_envs,
-                    single_action_space=action_space_for(env_name),
+            ):
+                raise ValueError(
+                    'envX execution uses envx_options and task reset options; '
+                    'Gym wrappers, kwargs, image_resample and unconditioned '
+                    'goals are unsupported'
                 )
+        if env_name in ENVIRONMENTS:
+            self.envs = EnvXPool(
+                env_name,
+                num_envs,
+                image_shape=image_shape if add_pixels else None,
+                max_episode_steps=max_episode_steps,
+                device=device,
+                image_transform=image_transform,
+                goal_transform=goal_transform,
+                envx_options=envx_options,
+            )
+        elif env_name == 'swm/TwoRoom-v1':
+            if envx_options:
+                raise ValueError(
+                    'TwoRoom uses the existing task reset options'
+                )
+            self.envs = TwoRoomTaskPool(
+                [env_fn] * num_envs, max_episode_steps=max_episode_steps
+            )
         else:
             self.envs = EnvPool([env_fn] * num_envs)
-        self._default_envs = self.envs
         self.policy: Policy | None = None
         self.infos: dict = {}
         self.rewards: np.ndarray | None = None
@@ -203,40 +201,12 @@ class World:
         """The internally selected simulator, for diagnostics."""
         return getattr(self.envs, 'execution_backend', 'gym')
 
-    def _use_protocol_pool(self) -> None:
-        if self._closed:
-            raise RuntimeError('World is closed')
-        if self._envx_config is None:
-            return
-        if self._envx_unsupported:
-            raise ValueError(
-                'envX protocol evaluation uses envx_options and task reset '
-                'options; Gym wrappers, kwargs, image_resample and '
-                'unconditioned goals are unsupported'
-            )
-        if self._protocol_envs is None:
-            from .envx import EnvXPool
-
-            self._protocol_envs = EnvXPool(**self._envx_config)
-        self._set_pool(self._protocol_envs)
-
-    def _set_pool(self, pool) -> None:
-        if self.envs is pool:
-            return
-        self.envs = pool
-        self.infos = {}
-        if self.policy is not None:
-            if hasattr(self.policy, 'reset_state'):
-                self.policy.reset_state()
-            self.policy.set_env(pool)
-
     def close(self) -> None:
         """Close all envs and release their resources."""
         if getattr(self, '_closed', False):
             return
-        getattr(self, '_default_envs', self.envs).close()
-        if getattr(self, '_protocol_envs', None) is not None:
-            self._protocol_envs.close()
+        self.envs.close()
+        if self.execution_backend == 'envx':
             self.infos = {}
             self.actions = self.rewards = None
             self.terminateds = self.truncateds = None
@@ -284,6 +254,10 @@ class World:
         backend: str = '',
     ) -> dict:
         """Run the attached policy and return aggregated metrics.
+
+        PushT, Reacher, Cube and TwoRoom require ``protocol`` and
+        ``eval_budget``. Episodic and dataset modes below remain available
+        for other environments.
 
         Three modes of operation:
 
@@ -347,7 +321,10 @@ class World:
                 protocol, eval_budget, video, record, backend
             )
         if self.execution_backend == 'envx':
-            self._set_pool(self._default_envs)
+            raise NotImplementedError(
+                'envX World evaluation requires an EvaluationProtocol and '
+                'eval_budget; episodic and dataset evaluation are unsupported'
+            )
         if dataset is not None:
             mode = reset_mode or 'wait'
             return self._evaluate_from_dataset(
@@ -416,7 +393,10 @@ class World:
         from stable_worldmodel.data.format import EPISODE_DATA_KEY, get_format
 
         if self.execution_backend == 'envx':
-            self._set_pool(self._default_envs)
+            raise NotImplementedError(
+                'World.collect is unsupported for envX environments; '
+                'use protocol evaluation with record=True where supported'
+            )
         if (path is None) == (writer is None):
             raise ValueError(
                 'World.collect: pass exactly one of `path` or `writer`.'
@@ -654,7 +634,6 @@ class World:
         )
         from stable_worldmodel.evaluation.records import recordable
 
-        self._use_protocol_pool()
         if self.execution_backend == 'envx':
             from .envx_evaluation import evaluate_world
 
@@ -855,7 +834,9 @@ class World:
 
         if not isinstance(protocol, EvaluationProtocol):
             raise TypeError('protocol must be an EvaluationProtocol')
-        if self._envx_config is not None:
+        if self._closed:
+            raise RuntimeError('World is closed')
+        if self.execution_backend == 'envx':
             env_id = self.env_name
             accepted_names = {env_id}
         else:
@@ -878,7 +859,6 @@ class World:
             )
         if eval_budget is None or eval_budget < 1:
             raise ValueError('protocol evaluation requires eval_budget >= 1')
-        self._use_protocol_pool()
         seeds = [task.environment_seed for task in protocol.tasks]
         options = [self._task_reset_options(task) for task in protocol.tasks]
         self.reset(seed=seeds, options=options)
