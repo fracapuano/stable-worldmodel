@@ -74,35 +74,8 @@ class ZeroPolicy:
         return np.zeros(self.env.action_space.shape, dtype=np.float32)
 
 
-def test_world_evaluates_an_ordered_protocol():
-    protocol = make_protocol()
-    world = swm.World(
-        protocol.environment,
-        num_envs=1,
-        image_shape=None,
-        max_episode_steps=10,
-        add_pixels=False,
-    )
-    world.set_policy(ZeroPolicy())
-    try:
-        results = world.evaluate(
-            protocol=protocol,
-            eval_budget=3,
-            record=True,
-            backend='zero',
-        )
-    finally:
-        world.close()
-
-    assert results.protocol_digest == protocol.digest
-    assert results.task_keys == protocol.task_keys
-    assert results.controller_seeds == protocol.controller_seeds
-    assert results.backend == 'zero'
-    assert results.episodes[0].length == 3
-    assert len(results.episodes[0].steps) == 3
-
-
-def test_world_protocol_writes_task_videos(tmp_path):
+@pytest.mark.parametrize('workflow', ['records', 'video'])
+def test_two_room_rejects_unaccelerated_protocol_workflows(tmp_path, workflow):
     protocol = make_protocol()
     world = swm.World(
         protocol.environment,
@@ -112,18 +85,18 @@ def test_world_protocol_writes_task_videos(tmp_path):
     )
     world.set_policy(ZeroPolicy())
     try:
-        world.evaluate(
-            protocol=protocol,
-            eval_budget=2,
-            backend='zero',
-            video=tmp_path,
-        )
+        with pytest.raises(NotImplementedError, match='complete FastCEM'):
+            world.evaluate(
+                protocol=protocol,
+                eval_budget=2,
+                record=workflow == 'records',
+                video=tmp_path if workflow == 'video' else None,
+                backend='zero',
+            )
+        assert world.execution_backend == 'envx'
+        assert not list(tmp_path.iterdir())
     finally:
         world.close()
-
-    video_path = tmp_path / 'zero' / 'paired-task.mp4'
-    assert video_path.exists()
-    assert video_path.stat().st_size > 0
 
 
 class QuadraticCost:

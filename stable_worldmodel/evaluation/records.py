@@ -74,6 +74,41 @@ class EpisodeResult:
     steps: tuple[StepRecord, ...] = ()
 
 
+def episodes_from_rollout(
+    protocol, outcome
+) -> tuple[tuple[EpisodeResult, ...], ...]:
+    """Convert population/task rollout metrics once at the reporting boundary."""
+    successes, returns, lengths, paths, controls, collisions = (
+        value.detach().cpu().numpy()
+        for value in (
+            outcome.successes,
+            outcome.returns,
+            outcome.lengths,
+            outcome.path_costs,
+            outcome.control_costs,
+            outcome.collisions,
+        )
+    )
+    return tuple(
+        tuple(
+            EpisodeResult(
+                task_key=task.key,
+                environment_seed=task.environment_seed,
+                controller_seed=task.controller_seed,
+                success=bool(successes[p, t]),
+                episode_return=float(returns[p, t]),
+                length=int(lengths[p, t]),
+                path_cost=float(paths[p, t]),
+                control_cost=float(controls[p, t]),
+                collisions=int(collisions[p, t]),
+                constraint_violations=0,
+            )
+            for t, task in enumerate(protocol.tasks)
+        )
+        for p in range(len(successes))
+    )
+
+
 @dataclass(frozen=True)
 class EvaluationResults:
     """Condition-labelled, ordered results returned by ``World``."""

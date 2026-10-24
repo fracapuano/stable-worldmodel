@@ -8,6 +8,7 @@ import torch
 from torchvision import tv_tensors
 
 from stable_worldmodel.buffer import HistoryBuffer
+from stable_worldmodel.data.normalization import transform_tensor
 from stable_worldmodel.planning.solver import Solver
 from stable_worldmodel.protocols import Actionable, Transformable
 
@@ -46,7 +47,8 @@ class PlanConfig:
             that yields ``history_len`` strided frames with a full action
             block between each consecutive pair. Set higher to retain
             more raw history than you sample.
-        action_block: Number of times each action is repeated (frameskip).
+        action_block: Number of individual environment controls packed into
+            each model step. This is separate from simulator physics repeats.
         warm_start: Whether to use the previous plan to initialize the next one.
     """
 
@@ -135,29 +137,26 @@ class BasePolicy:
             is_numpy = isinstance(v, (np.ndarray | np.generic))
 
             if hasattr(self, 'process') and k in self.process:
-                if not is_numpy:
+                if torch.is_tensor(v):
+                    v = transform_tensor(self.process[k], v)
+                elif not is_numpy:
                     raise ValueError(
-                        f"Expected numpy array for key '{k}' in process, got {type(v)}"
+                        f'Expected numpy array or Torch tensor for key {k!r} in process, got {type(v)}'
                     )
-
-                # flatten extra dimensions if needed
-                shape = v.shape
-                if len(shape) > 2:
-                    v = v.reshape(-1, *shape[2:])
-
-                # process and reshape back
-                v = self.process[k].transform(v)
-                v = v.reshape(shape)
+                if is_numpy:
+                    shape = v.shape
+                    if len(shape) > 2:
+                        v = v.reshape(-1, *shape[2:])
+                    v = self.process[k].transform(v).reshape(shape)
 
             # collapse env and time dimensions for transform (e, t, ...) -> (e * t, ...)
             # then restore after transform
             if hasattr(self, 'transform') and k in self.transform:
                 shape = None
-                if is_numpy or torch.is_tensor(v):
-                    if v.ndim > 2:
-                        shape = v.shape
-                        v = v.reshape(-1, *shape[2:])
-                if k.startswith('pixels') or k.startswith('goal'):
+                if (is_numpy or torch.is_tensor(v)) and v.ndim > 2:
+                    shape = v.shape
+                    v = v.reshape(-1, *shape[2:])
+                if k.startswith(('pixels', 'goal')):
                     # permute channel first for transform
                     if is_numpy:
                         v = np.transpose(v, (0, 3, 1, 2))
@@ -250,7 +249,6 @@ class ExpertPolicy(BasePolicy):
             The expert action, or None if not available.
         """
         # Implement expert policy logic here
-        pass
 
 
 class FeedForwardPolicy(BasePolicy):
@@ -424,16 +422,7 @@ class WorldModelPolicy(BasePolicy):
             'Solver must implement the Solver protocol'
         )
 
-    def get_action(self, info_dict: dict, **kwargs: Any) -> np.ndarray:
-        """Get action via planning with the world model.
-
-        Args:
-            info_dict: Current state information from the environment.
-            **kwargs: Additional parameters for planning.
-
-        Returns:
-            The selected action(s) as a numpy array.
-        """
+    def _plan_actions(self, info_dict: dict, *, return_tensor: bool):
         assert hasattr(self, 'env'), 'Environment not set for the policy'
 
         n_envs = self.env.num_envs
@@ -470,6 +459,7 @@ class WorldModelPolicy(BasePolicy):
             if len(self._action_buffer[i]) == 0 and not dead[i]
         ]
 
+        plan = None
         if replan_idx:
             idx_tensor = torch.as_tensor(replan_idx, dtype=torch.long)
             sliced = {}
@@ -510,7 +500,15 @@ class WorldModelPolicy(BasePolicy):
                 else None
             )
 
-            outputs = self.solver(sliced, init_action=sliced_init)
+            solver_options = {}
+            if return_tensor:
+                from stable_worldmodel.planning import FastCEMSolver
+
+                if isinstance(self.solver, FastCEMSolver):
+                    solver_options['return_tensors'] = True
+            outputs = self.solver(
+                sliced, init_action=sliced_init, **solver_options
+            )
 
             actions = outputs['actions']
             keep_horizon = self.cfg.receding_horizon
@@ -530,7 +528,11 @@ class WorldModelPolicy(BasePolicy):
             if self.cfg.warm_start and rest.shape[1] > 0:
                 if self._next_init is None:
                     self._next_init = torch.zeros(
-                        n_envs, rest.shape[1], rest.shape[2], dtype=rest.dtype
+                        n_envs,
+                        rest.shape[1],
+                        rest.shape[2],
+                        dtype=rest.dtype,
+                        device=rest.device,
                     )
                 self._next_init[idx_tensor] = rest
             elif not self.cfg.warm_start:
@@ -543,13 +545,46 @@ class WorldModelPolicy(BasePolicy):
             for row, env_i in enumerate(replan_idx):
                 self._action_buffer[env_i].extend(plan[row])
 
+        return dead, plan if len(replan_idx) == n_envs else None
+
+    def _decode_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        actions = actions.detach().float()
+        scaler = self.process.get('action')
+        if scaler is not None:
+            actions = transform_tensor(scaler, actions, inverse=True)
+        return actions
+
+    def _get_action_plan(self, info_dict: dict, budget: int) -> torch.Tensor:
+        """Consume the selected control block after an evaluation reset."""
+        _, plan = self._plan_actions(info_dict, return_tensor=True)
+        if plan is None:
+            raise RuntimeError(
+                'complete-plan evaluation requires a fresh policy reset'
+            )
+        for buffer in self._action_buffer:
+            buffer.clear()
+        return self._decode_actions(plan[:, :budget]).contiguous()
+
+    def get_action(
+        self, info_dict: dict, *, return_tensor: bool = False, **kwargs: Any
+    ) -> np.ndarray | torch.Tensor:
+        """Return the next control, replanning when its buffer is empty."""
+        dead, _ = self._plan_actions(info_dict, return_tensor=return_tensor)
+        n_envs = self.env.num_envs
         single_shape = self.env.single_action_space.shape
         is_discrete = 'Discrete' in type(self.env.single_action_space).__name__
 
+        action_device = 'cpu'
+        if return_tensor:
+            action_device = next(
+                (buffer[0].device for buffer in self._action_buffer if buffer),
+                'cpu',
+            )
         action = torch.full(
             (n_envs, *single_shape),
             fill_value=0 if is_discrete else float('nan'),
             dtype=torch.long if is_discrete else torch.float32,
+            device=action_device,
         )
 
         for i in range(n_envs):
@@ -557,6 +592,8 @@ class WorldModelPolicy(BasePolicy):
                 action[i] = self._action_buffer[i].popleft()
 
         action = action.reshape(*self.env.action_space.shape)
+        if return_tensor:
+            return self._decode_actions(action)
         action = action.numpy()
 
         if 'action' in self.process:

@@ -16,11 +16,11 @@ from typing_extensions import Self
 
 from stable_worldmodel.envs.two_room.env import TwoRoomEnv
 from stable_worldmodel.evaluation import (
-    EpisodeResult,
     EvaluationProtocol,
     EvaluationResults,
 )
 from stable_worldmodel.planning import FastCEMSolver
+from stable_worldmodel.evaluation.records import episodes_from_rollout
 from stable_worldmodel.policy import WorldModelPolicy
 from stable_worldmodel.protocols import PopulationModel
 from stable_worldmodel.wrapper import (
@@ -31,6 +31,7 @@ from stable_worldmodel.wrapper import (
     ResizeGoalWrapper,
 )
 
+from .envx import EnvXPool
 from .world import World
 
 _ENVX_WRAPPERS = (
@@ -141,13 +142,14 @@ class ManyWorldsEvaluationResults:
 
 
 class ManyWorlds:
-    """Evaluate weight-bound TwoRoom Worlds in one envX population run.
+    """Evaluate weight-bound Worlds in one envX population run.
 
     Each input ``World`` must already have a ``WorldModelPolicy`` backed by a
     compatible ``FastCEMSolver``. This preserves the invariant that one World
     owns one concrete model instance and weight set. ``evaluate`` replaces the
     individual solver calls with one population FastCEM graph and executes the
-    complete plans in one open-loop envX rollout.
+    complete plans in one open-loop envX rollout. All population members and
+    tasks execute together; device allocation failures propagate to the caller.
 
     Every LeWM parameter and persistent buffer may differ across Worlds. The
     model architecture, policy preprocessing, action space, and MPC
@@ -197,7 +199,6 @@ class ManyWorlds:
                 'documented in docs/api/world.md.'
             )
         self.envs = self.worlds[0].envs
-        self._jax_rollout = None
 
         if model_names is None:
             model_names = (
@@ -246,15 +247,10 @@ class ManyWorlds:
         )
 
     def _common_episode_limit(self) -> int:
-        limits = {
-            getattr(getattr(env, 'spec', None), 'max_episode_steps', None)
-            for world in self.worlds
-            for env in world.envs.envs
-        }
-        if None in limits or len(limits) != 1:
+        limits = {world.envs.max_episode_steps for world in self.worlds}
+        if len(limits) != 1:
             raise ValueError(
-                'envX requires every World task to use the same positive '
-                'max_episode_steps'
+                'envX requires the same positive max_episode_steps'
             )
         limit = int(limits.pop())
         if limit < 1:
@@ -290,6 +286,32 @@ class ManyWorlds:
 
     def _validate_envx_worlds(self) -> None:
         """Reject every simulator configuration outside the tested envX path."""
+        if any(world.execution_backend != 'envx' for world in self.worlds):
+            raise ValueError('ManyWorlds requires envX World execution')
+        if len({world.env_name for world in self.worlds}) != 1:
+            raise ValueError('ManyWorlds cannot mix environments')
+        if isinstance(self.worlds[0].envs, EnvXPool):
+            first = self.worlds[0]
+
+            for world in self.worlds:
+                if (
+                    world.env_name != first.env_name
+                    or world.envs.device != first.envs.device
+                    or world.envs.image_shape != first.envs.image_shape
+                    or not _equivalent(
+                        world.envs.envx_options, first.envs.envx_options
+                    )
+                    or not _equivalent(
+                        world.envs.image_transform, first.envs.image_transform
+                    )
+                    or not _equivalent(
+                        world.envs.goal_transform, first.envs.goal_transform
+                    )
+                ):
+                    raise ValueError(
+                        'envX Worlds must share environment, device, rendering and simulator options'
+                    )
+            return
         for world_index, world in enumerate(self.worlds):
             for task_index, wrapped in enumerate(world.envs.envs):
                 env_id = getattr(getattr(wrapped, 'spec', None), 'id', None)
@@ -353,7 +375,7 @@ class ManyWorlds:
 
     @property
     def bootstrap_simulator_count(self) -> int:
-        """Gym envs stepped/reset for observations by this evaluator."""
+        """Task states used to render initial/goal observations."""
         return self.num_tasks
 
     @property
@@ -470,21 +492,7 @@ class ManyWorlds:
                     )
 
     def _infer_eval_budget(self) -> int:
-        budgets = []
-        for world in self.worlds:
-            env = world.envs.envs[0]
-            budget = getattr(env, '_max_episode_steps', None)
-            if budget is None:
-                budget = getattr(
-                    getattr(env, 'spec', None), 'max_episode_steps', None
-                )
-            budgets.append(budget)
-        if any(value is None for value in budgets) or len(set(budgets)) != 1:
-            raise ValueError(
-                'eval_budget is required when Worlds do not share one explicit '
-                'max_episode_steps value'
-            )
-        return int(budgets[0])
+        return self._envx_episode_limit
 
     def _environment_plan_tensor(
         self, planned: torch.Tensor, eval_budget: int
@@ -500,6 +508,8 @@ class ManyWorlds:
             raw_dim,
         )[:, :, :eval_budget]
         actions = actions.detach().float()
+        if isinstance(self.worlds[0].envs, EnvXPool):
+            return self.policies[0]._decode_actions(actions)
         process = self.policies[0].process
         if 'action' in process:
             transformed = process['action'].inverse_transform(
@@ -574,24 +584,15 @@ class ManyWorlds:
         *,
         expand_population: bool,
     ) -> dict[str, Any]:
-        """Reset only the task-sized Gym pool used for initial/goal pixels."""
+        """Restore/render only T task states before population planning."""
         first = self.worlds[0]
         first._reset_from_protocol(protocol, eval_budget)
         for world in self.worlds[1:]:
-            env = world.envs.envs[0]
-            spec = getattr(env, 'spec', None)
-            accepted_names = {
-                getattr(spec, 'id', None),
-                getattr(env.unwrapped, 'env_name', None),
-            }
-            if protocol.environment not in accepted_names:
+            if world.env_name != protocol.environment or world.num_envs != len(
+                protocol.tasks
+            ):
                 raise ValueError(
-                    f'protocol environment {protocol.environment!r} does not '
-                    f'match World environment {getattr(spec, "id", None)!r}'
-                )
-            if world.num_envs != len(protocol.tasks):
-                raise ValueError(
-                    'protocol evaluation requires one World env per task'
+                    'protocol environment or task count differs from World'
                 )
         for policy in self.policies[1:]:
             policy.reset_state()
@@ -684,32 +685,23 @@ class ManyWorlds:
         )
         actions = self._environment_plan_tensor(planned, eval_budget)
 
-        from .jax_two_rooms import JaxTwoRoomsRollout
-
-        episode_limit = min(eval_budget, self._envx_episode_limit)
-        if (
-            self._jax_rollout is None
-            or self._jax_rollout.eval_budget != eval_budget
-            or self._jax_rollout.max_episode_steps != episode_limit
-        ):
-            self._jax_rollout = JaxTwoRoomsRollout(
-                population_size=self.population_size,
-                num_tasks=self.num_tasks,
-                eval_budget=eval_budget,
-                max_episode_steps=episode_limit,
+        outcome = self.worlds[0].envs.rollout(actions)
+        if isinstance(self.worlds[0].envs, EnvXPool):
+            score_name = str(dict(protocol.metadata).get('score', 'distance'))
+            if score_name == 'distance':
+                scores = -outcome.final_distances.float().mean(dim=1)
+            elif score_name == 'success':
+                scores = outcome.successes.float().mean(dim=1)
+            else:
+                raise ValueError(
+                    "protocol score must be 'distance' or 'success'"
+                )
+        else:
+            score_name, scores = self._score_two_rooms(
+                protocol, outcome.successes, outcome.final_distances
             )
-        initial_state = self._jax_rollout.initial_state(self.worlds[0])
-        outcome = self._jax_rollout(initial_state, actions)
-        score_name, scores = self._score_two_rooms(
-            protocol, outcome.successes, outcome.final_distances
-        )
-        success_values = outcome.successes.detach().cpu().numpy().astype(bool)
+        episodes = episodes_from_rollout(protocol, outcome)
         distance_values = outcome.final_distances.detach().cpu().numpy()
-        returns = outcome.returns.detach().cpu().numpy()
-        lengths = outcome.lengths.detach().cpu().numpy()
-        path_costs = outcome.path_costs.detach().cpu().numpy()
-        control_costs = outcome.control_costs.detach().cpu().numpy()
-        collisions = outcome.collisions.detach().cpu().numpy()
 
         evaluations = tuple(
             EvaluationResults(
@@ -719,31 +711,7 @@ class ManyWorlds:
                     f'{type(self.models[0 if population is not None else population_index]).__qualname__}'
                 ),
                 protocol_digest=protocol.digest,
-                episodes=tuple(
-                    EpisodeResult(
-                        task_key=task.key,
-                        environment_seed=task.environment_seed,
-                        controller_seed=task.controller_seed,
-                        success=bool(
-                            success_values[population_index, task_index]
-                        ),
-                        episode_return=float(
-                            returns[population_index, task_index]
-                        ),
-                        length=int(lengths[population_index, task_index]),
-                        path_cost=float(
-                            path_costs[population_index, task_index]
-                        ),
-                        control_cost=float(
-                            control_costs[population_index, task_index]
-                        ),
-                        collisions=int(
-                            collisions[population_index, task_index]
-                        ),
-                        constraint_violations=0,
-                    )
-                    for task_index, task in enumerate(protocol.tasks)
-                ),
+                episodes=episodes[population_index],
                 model_queries=(),
                 metadata={
                     'split': protocol.split,

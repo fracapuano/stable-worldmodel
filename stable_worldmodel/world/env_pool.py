@@ -28,26 +28,51 @@ class EnvPool:
     Args:
         env_fns: List of zero-arg factories, one per env. Each is called
             once and the result is kept for the lifetime of the pool.
+        single_action_space: Known control space. When supplied, defer Gym
+            construction until reset or observation-space access.
     """
 
-    def __init__(self, env_fns: list):
-        self.envs = [fn() for fn in env_fns]
-        self._single_env = self.envs[0]
+    def __init__(self, env_fns: list, *, single_action_space=None):
+        self._env_fns = env_fns
+        self._envs = None
+        self._closed = False
+        self._single_action_space = single_action_space
         self._stacked_infos: dict[str, Any] | None = None
-        self.seeds = np.zeros(len(self.envs), dtype=np.int64)
+        self.seeds = np.zeros(len(env_fns), dtype=np.int64)
         # Cache batched spaces — rebuilding them per-access creates a fresh
         # unseeded space each call, so .seed() / .sample() never advances RNG.
-        self._action_space = batch_space(
-            self._single_env.action_space, len(self.envs)
+        self._action_space = (
+            batch_space(single_action_space, len(env_fns))
+            if single_action_space is not None
+            else None
         )
-        self._observation_space = batch_space(
-            self._single_env.observation_space, len(self.envs)
-        )
+        self._observation_space = None
+        if single_action_space is None:
+            self._initialize()
+
+    def _initialize(self):
+        if self._envs is None:
+            if self._closed:
+                raise RuntimeError('EnvPool is closed')
+            self._envs = [fn() for fn in self._env_fns]
+            if self._single_action_space is None:
+                self._single_action_space = self._envs[0].action_space
+                self._action_space = batch_space(
+                    self._single_action_space, self.num_envs
+                )
+            self._observation_space = batch_space(
+                self._envs[0].observation_space, self.num_envs
+            )
+
+    @property
+    def envs(self) -> list:
+        self._initialize()
+        return self._envs
 
     @property
     def num_envs(self) -> int:
         """Number of envs in the pool."""
-        return len(self.envs)
+        return len(self._env_fns)
 
     @property
     def action_space(self) -> gym.Space:
@@ -57,22 +82,23 @@ class EnvPool:
     @property
     def single_action_space(self) -> gym.Space:
         """Action space of a single env."""
-        return self._single_env.action_space
+        return self._single_action_space
 
     @property
     def observation_space(self) -> gym.Space:
         """Batched observation space."""
+        self._initialize()
         return self._observation_space
 
     @property
     def single_observation_space(self) -> gym.Space:
         """Observation space of a single env."""
-        return self._single_env.observation_space
+        return self.envs[0].observation_space
 
     @property
     def variation_space(self):
         """Variation space from the unwrapped env, or ``None`` if not defined."""
-        return getattr(self._single_env.unwrapped, 'variation_space', None)
+        return getattr(self.envs[0].unwrapped, 'variation_space', None)
 
     @property
     def single_variation_space(self):
@@ -143,8 +169,9 @@ class EnvPool:
 
     def close(self):
         """Close every env in the pool."""
-        for env in self.envs:
+        for env in self._envs or ():
             env.close()
+        self._closed = True
 
 
 def _broadcast_arg(arg, n: int, increment: bool = False) -> list:

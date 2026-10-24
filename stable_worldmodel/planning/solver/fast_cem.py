@@ -645,7 +645,11 @@ class FastCEMSolver(CEMSolver):
 
     @torch.inference_mode()
     def solve(
-        self, info: dict, init_action: torch.Tensor | None = None
+        self,
+        info: dict,
+        init_action: torch.Tensor | None = None,
+        *,
+        return_tensors: bool = False,
     ) -> dict:
         """Solve through the standard planner interface."""
         started = time.perf_counter()
@@ -678,10 +682,11 @@ class FastCEMSolver(CEMSolver):
         actions = torch.cat([output['actions'] for output in outputs])
         std = torch.cat([output['var'][0] for output in outputs])
         costs = torch.cat([output['costs'] for output in outputs])
-        actions, std = actions.cpu(), std.cpu()
+        if not return_tensors:
+            actions, std = actions.cpu(), std.cpu()
         return {
             'actions': actions,
-            'costs': costs.cpu().tolist(),
+            'costs': costs if return_tensors else costs.cpu().tolist(),
             'mean': [actions],
             'var': [std],
             'solve_time_seconds': time.perf_counter() - started,

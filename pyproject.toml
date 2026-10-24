@@ -35,6 +35,12 @@ dependencies = [
 swm = "stable_worldmodel.cli:app"
 
 [project.optional-dependencies]
+envx = [
+    "envx @ git+https://github.com/fracapuano/envX.git@d26c817c1124229c819be574f137cd68bda4380a ; python_version >= '3.11' and python_version < '3.13'",
+    "mujoco>=3.11,<3.12; python_version >= '3.11' and python_version < '3.13'",
+    "mujoco-mjx[warp]>=3.11,<3.12; python_version >= '3.11' and python_version < '3.13'",
+    "jax>=0.7,<0.11; python_version >= '3.11' and python_version < '3.13'",
+]
 train = [
     "transformers>=4.50.0,<5",
     "stable-pretraining>=0.1.8",
