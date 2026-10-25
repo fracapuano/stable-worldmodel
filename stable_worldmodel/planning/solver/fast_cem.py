@@ -82,9 +82,11 @@ class _PopulationCEMLoop(_CEMLoop):
     """Fixed-shape CEM loop over ``(population, tasks, samples, ...)``."""
 
     def _step(self, mean, std, noise, *prepared):
-        # Common random numbers across models, independent distributions.
+        # Noise may be shared or member-specific; distributions are independent.
         candidates = torch.addcmul(
-            mean[:, :, None], noise[None], std[:, :, None]
+            mean[:, :, None],
+            noise if noise.ndim == 5 else noise[None],
+            std[:, :, None],
         )
         candidates[:, :, 0].copy_(mean)
         costs = self.cost(candidates, *prepared)
@@ -518,7 +520,8 @@ class FastCEMSolver(CEMSolver):
             self.horizon,
             self.action_dim,
         )
-        if tuple(noise.shape) != expected:
+        member_expected = (self.n_steps, population, *expected[1:])
+        if tuple(noise.shape) not in (expected, member_expected):
             raise ValueError(f'expected population noise shape {expected}')
         if not _same_device(noise.device, device):
             raise ValueError('noise must already reside on the solver device')
@@ -547,8 +550,16 @@ class FastCEMSolver(CEMSolver):
         *,
         noise: torch.Tensor | None = None,
         init_action: torch.Tensor | None = None,
+        population_in_dims: int | None = None,
     ) -> dict[str, Any]:
-        """Solve one population using this solver's existing configuration."""
+        """Solve a population, optionally mapping input tensors on axis zero.
+
+        With ``population_in_dims=0``, info tensors are ``(P, T, ...)`` and
+        noise is ``(P, steps, T, samples, horizon, action)``. Otherwise info
+        and noise are shared by the opaque population as before.
+        """
+        if population_in_dims not in (None, 0):
+            raise ValueError('population_in_dims must be None or 0')
         started = time.perf_counter()
         if isinstance(models, PopulationModel):
             population = models
@@ -575,8 +586,11 @@ class FastCEMSolver(CEMSolver):
                 raise TypeError(
                     'population model inputs must be non-empty tensors'
                 )
-            tasks = next(iter(model_info.values())).size(0)
-            if any(value.size(0) != tasks for value in model_info.values()):
+            task_axis = 1 if population_in_dims == 0 else 0
+            tasks = next(iter(model_info.values())).size(task_axis)
+            if any(
+                value.size(task_axis) != tasks for value in model_info.values()
+            ):
                 raise ValueError(
                     'population model inputs must share a task axis'
                 )
@@ -589,17 +603,38 @@ class FastCEMSolver(CEMSolver):
                 self.horizon,
                 self.action_dim,
             )
+            if population_in_dims == 0:
+                expected = (population.population_size, *expected)
+                if any(
+                    value.size(0) != population.population_size
+                    for value in model_info.values()
+                ):
+                    raise ValueError('inputs and model disagree on population')
+                if noise.ndim == 5:
+                    noise = noise.unsqueeze(0).expand(
+                        population.population_size, *noise.shape
+                    )
             if tuple(noise.shape) != expected:
                 raise ValueError(f'expected population noise shape {expected}')
             mean, std = self.init_action_distrib(tasks, init_action)
             mean = mean.to(device=self.device, dtype=self.dtype)
             std = std.to(device=self.device, dtype=self.dtype)
+            forward_options = {}
+            if population_in_dims == 0:
+                mean = mean.unsqueeze(0).expand(
+                    population.population_size, *mean.shape
+                )
+                std = std.unsqueeze(0).expand(
+                    population.population_size, *std.shape
+                )
+                forward_options['population_in_dims'] = 0
             mean, std, costs = population.forward(
                 model_info,
                 mean,
                 std,
                 noise,
                 module=self._mapped_population_loop,
+                **forward_options,
             )
             expected_actions = (
                 population.population_size,
@@ -634,6 +669,8 @@ class FastCEMSolver(CEMSolver):
             output['solve_time_seconds'] = time.perf_counter() - started
             return output
 
+        if population_in_dims == 0 and noise is not None:
+            noise = noise.movedim(0, 1)
         output = self.solve_population_tensors(
             models,
             self.prepare_population(info, models),

@@ -74,21 +74,64 @@ class RepeatedPopulation:
         self.model = model
         self.population_size = size
 
-    def forward(self, *args, module: nn.Module, **kwargs):
+    def forward(
+        self, *args, module: nn.Module, population_in_dims=None, **kwargs
+    ):
         parameters, buffers = stack_module_state(
             [deepcopy(module) for _ in range(self.population_size)]
         )
 
-        def call(member_parameters, member_buffers):
+        def call(member_parameters, member_buffers, *member_args):
             return functional_call(
                 module,
                 (member_parameters, member_buffers),
-                args,
+                member_args,
                 kwargs,
                 strict=True,
             )
 
-        return vmap(call)(parameters, buffers)
+        return vmap(
+            call, in_dims=(0, 0, *((population_in_dims,) * len(args)))
+        )(parameters, buffers, *args)
+
+
+@pytest.mark.parametrize('opaque', [False, True])
+def test_population_specific_tasks_and_noise_match_serial_solves(opaque):
+    torch.manual_seed(71)
+    model = _model()
+    solver = FastCEMSolver(
+        ShootingCostEvaluator(model, GoalMSE()),
+        num_samples=8,
+        n_steps=2,
+        topk=2,
+        compile_kernel=False,
+    )
+    _configure(solver, tasks=2)
+    info = {
+        'emb': torch.randn(3, 2, 1, 4),
+        'goal_emb': torch.randn(3, 2, 1, 4),
+    }
+    noise = torch.stack([solver.sample_noise(2) for _ in range(3)])
+    models = (
+        RepeatedPopulation(model, 3)
+        if opaque
+        else (model, deepcopy(model), deepcopy(model))
+    )
+    actual = solver.solve_population(
+        info, models, noise=noise, population_in_dims=0
+    )
+    for index in range(3):
+        expected = solver.solve_tensors(
+            solver.prepare({key: value[index] for key, value in info.items()}),
+            noise=noise[index],
+        )
+        torch.testing.assert_close(
+            actual['actions'][index], expected['actions'], rtol=3e-5, atol=3e-6
+        )
+        torch.testing.assert_close(
+            actual['costs'][index], expected['costs'], rtol=3e-5, atol=3e-6
+        )
+    assert not torch.equal(actual['actions'][0], actual['actions'][1])
 
 
 def test_population_fast_cem_matches_independent_fast_cem_solves():

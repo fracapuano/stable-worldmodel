@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+from dataclasses import replace
 from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
@@ -513,6 +514,134 @@ def attach_policy(
         )
     )
     return solver
+
+
+class RepeatedPopulation:
+    backend = 'test-functional-vmap'
+    compiled = False
+
+    def __init__(self, model, size):
+        self.model, self.population_size = model, size
+
+    def forward(self, *args, module, population_in_dims=None, **kwargs):
+        from torch.func import functional_call, stack_module_state, vmap
+
+        parameters, buffers = stack_module_state(
+            [deepcopy(module) for _ in range(self.population_size)]
+        )
+
+        def call(parameters, buffers, *member_args):
+            return functional_call(
+                module, (parameters, buffers), member_args, kwargs, strict=True
+            )
+
+        return vmap(
+            call, in_dims=(0, 0, *((population_in_dims,) * len(args)))
+        )(parameters, buffers, *args)
+
+
+@integration
+@pytest.mark.parametrize('name', ['two-room', 'pusht', 'reacher', 'cube'])
+@pytest.mark.parametrize('opaque', [False, True])
+def test_member_protocols_match_individual_worlds_in_one_physics_batch(
+    name, opaque, monkeypatch
+):
+    if name in ('reacher', 'cube') and DEVICE == 'cpu':
+        pytest.skip('MJX rendering requires CUDA')
+    p = protocol(name)
+    protocols = (p, replace(p, tasks=tuple(reversed(p.tasks))), p)
+    worlds = [world_for(p, pixels=True) for _ in protocols]
+    solvers = [attach_policy(w) for w in worlds]
+    many = (
+        swm.ManyWorlds.from_population(worlds[0], population_size=3)
+        if opaque
+        else swm.ManyWorlds(worlds)
+    )
+    rollouts = []
+    original = worlds[0].envs._with_num_envs
+
+    def make_pool(count):
+        pool = original(count)
+        rollout = pool.rollout
+
+        def run(actions):
+            rollouts.append(tuple(actions.shape))
+            return rollout(actions)
+
+        monkeypatch.setattr(pool, 'rollout', run)
+        return pool
+
+    monkeypatch.setattr(worlds[0].envs, '_with_num_envs', make_pool)
+    population = (
+        RepeatedPopulation(solvers[0].cost.model, 3) if opaque else None
+    )
+    try:
+        for invalid in (protocols[:2], (p, replace(p, tasks=p.tasks[:1]), p)):
+            with pytest.raises(ValueError):
+                many.evaluate(
+                    invalid,
+                    solver=solvers[0],
+                    population=population,
+                    eval_budget=4,
+                )
+        actual = many.evaluate(
+            protocols, solver=solvers[0], population=population, eval_budget=4
+        )
+        assert rollouts == [
+            (1, 6, 4, worlds[0].envs.single_action_space.shape[0])
+        ]
+        assert many.bootstrap_simulator_count == 6
+        assert actual.task_final_distances.shape == (3, 2)
+        for index, (world, member_protocol) in enumerate(
+            zip(worlds, protocols, strict=True)
+        ):
+            plans = []
+            world.policy.on_plan = lambda event, plans=plans: plans.append(
+                event['selected_plan']
+            )
+            expected = world.evaluate(protocol=member_protocol, eval_budget=4)
+            assert (
+                actual.evaluations[index].protocol_digest
+                == member_protocol.digest
+            )
+            assert (
+                actual.evaluations[index].task_keys
+                == member_protocol.task_keys
+            )
+            assert (
+                actual.evaluations[index].controller_seeds
+                == member_protocol.controller_seeds
+            )
+            torch.testing.assert_close(
+                actual.environment_actions[index],
+                plans[0],
+                rtol=2e-4,
+                atol=2e-4,
+            )
+            torch.testing.assert_close(
+                actual.task_final_distances[index],
+                world.infos['distance_to_target'].reshape(-1),
+                rtol=2e-4,
+                atol=2e-4,
+            )
+            assert [e.length for e in actual.evaluations[index].episodes] == [
+                e.length for e in expected.episodes
+            ]
+        pool = many._member_envs
+        many.close()
+        many.close()
+        assert pool._closed
+        with pytest.raises(RuntimeError, match='closed'):
+            many.evaluate(
+                protocols,
+                solver=solvers[0],
+                population=population,
+                eval_budget=4,
+            )
+    finally:
+        many.close()
+        for world in worlds:
+            world.close()
 
 
 @pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube'])

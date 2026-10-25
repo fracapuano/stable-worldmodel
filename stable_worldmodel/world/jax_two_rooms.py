@@ -43,6 +43,12 @@ class TwoRoomTaskPool(EnvPool):
         self._rollout = None
         self._rollout_key = None
 
+    def _with_num_envs(self, num_envs):
+        return type(self)(
+            [self._env_fns[0]] * num_envs,
+            max_episode_steps=self.max_episode_steps,
+        )
+
     def step(self, actions, mask=None):
         raise NotImplementedError(
             'TwoRoom World requires a complete FastCEM protocol plan; '

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from importlib.util import find_spec
 from typing import Any
 
@@ -19,8 +19,8 @@ from stable_worldmodel.evaluation import (
     EvaluationProtocol,
     EvaluationResults,
 )
-from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.evaluation.records import episodes_from_rollout
+from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.policy import WorldModelPolicy
 from stable_worldmodel.protocols import PopulationModel
 from stable_worldmodel.wrapper import (
@@ -199,6 +199,9 @@ class ManyWorlds:
                 'documented in docs/api/world.md.'
             )
         self.envs = self.worlds[0].envs
+        self._member_envs = None
+        self._closed = False
+        self._bootstrap_simulator_count = self.num_tasks
 
         if model_names is None:
             model_names = (
@@ -376,7 +379,7 @@ class ManyWorlds:
     @property
     def bootstrap_simulator_count(self) -> int:
         """Task states used to render initial/goal observations."""
-        return self.num_tasks
+        return self._bootstrap_simulator_count
 
     @property
     def config(self):
@@ -384,8 +387,12 @@ class ManyWorlds:
 
     def close(self) -> None:
         """Close every owned World; safe when the Worlds are already closed."""
+        if self._member_envs is not None:
+            self._member_envs.close()
+            self._member_envs = None
         for world in self.worlds:
             world.close()
+        self._closed = True
 
     def _validate_world_shapes(self) -> None:
         first_world = self.worlds[0]
@@ -585,6 +592,7 @@ class ManyWorlds:
         expand_population: bool,
     ) -> dict[str, Any]:
         """Restore/render only T task states before population planning."""
+        self._bootstrap_simulator_count = self.num_tasks
         first = self.worlds[0]
         first._reset_from_protocol(protocol, eval_budget)
         for world in self.worlds[1:]:
@@ -636,10 +644,38 @@ class ManyWorlds:
             f'got {score_name!r}'
         )
 
+    def _reset_member_protocols(self, protocols):
+        """Restore all P*T states without changing the input Worlds' pools."""
+        self._bootstrap_simulator_count = self.simulator_count
+        if self._member_envs is None:
+            self._member_envs = self.envs._with_num_envs(
+                self.population_size * self.num_tasks
+            )
+        tasks = tuple(
+            task for protocol in protocols for task in protocol.tasks
+        )
+        _, raw_info = self._member_envs.reset(
+            seed=[task.environment_seed for task in tasks],
+            options=[World._task_reset_options(task) for task in tasks],
+        )
+        raw_info['controller_seed'] = np.asarray(
+            [task.controller_seed for task in tasks], dtype=np.int64
+        )[:, None]
+        for policy in self.policies:
+            policy.reset_state()
+        info = self.policies[0]._prepare_info(raw_info)
+        return {
+            key: value.reshape(
+                self.population_size, self.num_tasks, *value.shape[1:]
+            )
+            for key, value in info.items()
+            if isinstance(value, (torch.Tensor, np.ndarray))
+        }
+
     @torch.inference_mode()
     def _evaluate_envx(
         self,
-        protocol: EvaluationProtocol,
+        protocol: EvaluationProtocol | Sequence[EvaluationProtocol],
         *,
         solver: FastCEMSolver,
         population: PopulationModel | None,
@@ -657,24 +693,50 @@ class ManyWorlds:
                 f'{self.config.plan_len}'
             )
 
-        info = self._reset_envx(
-            protocol,
-            eval_budget,
-            expand_population=population is None,
+        member_tasks = not isinstance(protocol, EvaluationProtocol)
+        protocols = (
+            tuple(protocol)
+            if member_tasks
+            else (protocol,) * self.population_size
+        )
+        info = (
+            self._reset_member_protocols(protocols)
+            if member_tasks
+            else self._reset_envx(
+                protocol, eval_budget, expand_population=population is None
+            )
         )
         seeds = info.get('controller_seed')
-        noise = solver._batch_noise(
-            self.num_tasks,
-            0,
-            None
-            if seeds is None
-            else (seeds[0] if population is None else seeds),
-            np.zeros((self.num_tasks, 1), dtype=np.int64),
+        noise_tasks = (
+            self.population_size * self.num_tasks
+            if member_tasks
+            else self.num_tasks
         )
+        if seeds is not None:
+            if member_tasks:
+                seeds = seeds.reshape(noise_tasks, 1)
+            elif population is None:
+                seeds = seeds[0]
+        noise = solver._batch_noise(
+            noise_tasks,
+            0,
+            seeds,
+            np.zeros((noise_tasks, 1), dtype=np.int64),
+        )
+        solver_options = {}
+        if member_tasks:
+            noise = noise.reshape(
+                solver.n_steps,
+                self.population_size,
+                self.num_tasks,
+                *noise.shape[2:],
+            ).movedim(1, 0)
+            solver_options['population_in_dims'] = 0
         output = solver.solve_population(
             info,
             self.models if population is None else population,
             noise=noise,
+            **solver_options,
         )
         planned = output['actions']
         self._notify_plans(
@@ -685,9 +747,28 @@ class ManyWorlds:
         )
         actions = self._environment_plan_tensor(planned, eval_budget)
 
-        outcome = self.worlds[0].envs.rollout(actions)
+        if member_tasks:
+            flat = actions.reshape(
+                1, self.population_size * self.num_tasks, *actions.shape[2:]
+            )
+            flat_outcome = self._member_envs.rollout(flat)
+            outcome = type(flat_outcome)(
+                **{
+                    field.name: getattr(flat_outcome, field.name).reshape(
+                        self.population_size,
+                        self.num_tasks,
+                        *getattr(flat_outcome, field.name).shape[2:],
+                    )
+                    for field in fields(flat_outcome)
+                }
+            )
+        else:
+            outcome = self.worlds[0].envs.rollout(actions)
+        first_protocol = protocols[0]
         if isinstance(self.worlds[0].envs, EnvXPool):
-            score_name = str(dict(protocol.metadata).get('score', 'distance'))
+            score_name = str(
+                dict(first_protocol.metadata).get('score', 'distance')
+            )
             if score_name == 'distance':
                 scores = -outcome.final_distances.float().mean(dim=1)
             elif score_name == 'success':
@@ -698,7 +779,7 @@ class ManyWorlds:
                 )
         else:
             score_name, scores = self._score_two_rooms(
-                protocol, outcome.successes, outcome.final_distances
+                first_protocol, outcome.successes, outcome.final_distances
             )
         episodes = episodes_from_rollout(protocol, outcome)
         distance_values = outcome.final_distances.detach().cpu().numpy()
@@ -710,12 +791,12 @@ class ManyWorlds:
                     f'{type(self.models[0 if population is not None else population_index]).__module__}.'
                     f'{type(self.models[0 if population is not None else population_index]).__qualname__}'
                 ),
-                protocol_digest=protocol.digest,
+                protocol_digest=member_protocol.digest,
                 episodes=episodes[population_index],
                 model_queries=(),
                 metadata={
-                    'split': protocol.split,
-                    'environment': protocol.environment,
+                    'split': member_protocol.split,
+                    'environment': member_protocol.environment,
                     'eval_budget': eval_budget,
                     'population_index': population_index,
                     'simulator_backend': 'envx',
@@ -724,7 +805,7 @@ class ManyWorlds:
                     ),
                 },
             )
-            for population_index in range(self.population_size)
+            for population_index, member_protocol in enumerate(protocols)
         )
         return ManyWorldsEvaluationResults(
             model_names=self.model_names,
@@ -745,7 +826,7 @@ class ManyWorlds:
     @torch.inference_mode()
     def evaluate(
         self,
-        protocol: EvaluationProtocol,
+        protocol: EvaluationProtocol | Sequence[EvaluationProtocol],
         *,
         solver: FastCEMSolver,
         population: PopulationModel | None = None,
@@ -756,10 +837,37 @@ class ManyWorlds:
 
         There is no per-World solver call or model loop: CEM, model ranking,
         action postprocessing, and TwoRoom execution stay tensorized across
-        the population on the accelerator.
+        the population on the accelerator. Pass one protocol to share its
+        tasks, or P protocols to assign one fixed-size task minibatch per
+        member. Results retain the input member/task ordering. Call ``close``
+        to release the additional task pool used by per-member protocols.
         """
+        if self._closed or any(world._closed for world in self.worlds):
+            raise RuntimeError('ManyWorlds or its input World is closed')
         if not isinstance(protocol, EvaluationProtocol):
-            raise TypeError('protocol must be an EvaluationProtocol')
+            if not isinstance(protocol, Sequence) or not all(
+                isinstance(item, EvaluationProtocol) for item in protocol
+            ):
+                raise TypeError(
+                    'protocol must be an EvaluationProtocol or a sequence of protocols'
+                )
+            protocol = tuple(protocol)
+            if len(protocol) != self.population_size:
+                raise ValueError('expected one protocol per population member')
+            if any(
+                item.environment != self.worlds[0].env_name
+                or len(item.tasks) != self.num_tasks
+                for item in protocol
+            ):
+                raise ValueError(
+                    'member protocols must match the World environment and task count'
+                )
+            score = str(dict(protocol[0].metadata).get('score', 'distance'))
+            if any(
+                str(dict(item.metadata).get('score', 'distance')) != score
+                for item in protocol
+            ):
+                raise ValueError('member protocols must use the same score')
         if eval_budget is None:
             eval_budget = self._infer_eval_budget()
         if eval_budget < 1:
