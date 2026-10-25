@@ -78,6 +78,8 @@ def episodes_from_rollout(
     protocol, outcome
 ) -> tuple[tuple[EpisodeResult, ...], ...]:
     """Convert population/task rollout metrics once at the reporting boundary."""
+    from .protocol import EvaluationProtocol
+
     successes, returns, lengths, paths, controls, collisions = (
         value.detach().cpu().numpy()
         for value in (
@@ -88,6 +90,11 @@ def episodes_from_rollout(
             outcome.control_costs,
             outcome.collisions,
         )
+    )
+    protocols = (
+        (protocol,) * len(successes)
+        if isinstance(protocol, EvaluationProtocol)
+        else protocol
     )
     return tuple(
         tuple(
@@ -103,9 +110,9 @@ def episodes_from_rollout(
                 collisions=int(collisions[p, t]),
                 constraint_violations=0,
             )
-            for t, task in enumerate(protocol.tasks)
+            for t, task in enumerate(member_protocol.tasks)
         )
-        for p in range(len(successes))
+        for p, member_protocol in enumerate(protocols)
     )
 
 

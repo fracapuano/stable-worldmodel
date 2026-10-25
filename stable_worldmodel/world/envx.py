@@ -357,6 +357,18 @@ class EnvXPool:
         if device is not None:
             self.set_device(device)
 
+    def _with_num_envs(self, num_envs):
+        return type(self)(
+            self.env_name,
+            num_envs,
+            image_shape=self.image_shape,
+            max_episode_steps=self.max_episode_steps,
+            device=self.device,
+            image_transform=self.image_transform,
+            goal_transform=self.goal_transform,
+            envx_options=self.envx_options,
+        )
+
     def set_device(self, device):
         device = torch.device(device)
         if device.type not in ('cuda', 'cpu'):
