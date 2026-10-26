@@ -84,22 +84,12 @@ def task_inputs(name, options):
         'action_scale': 100.0,
         'clip_target': False,
     }
-    if name == 'pusht':
-        defaults['distance_metric'] = 'pusht-state7-l2'
     unknown = contract.keys() - defaults.keys()
     if unknown:
         raise ValueError(
             f'unsupported task_contract options: {sorted(unknown)}'
         )
     defaults.update(contract)
-    if name == 'pusht':
-        metrics = ('pusht-state7-l2', 'pusht-pose-l2')
-        if defaults['distance_metric'] not in metrics:
-            raise ValueError(f'PushT distance_metric must be one of {metrics}')
-        # Task strings stay at the public boundary; JAX receives a batched ID.
-        defaults['distance_metric'] = metrics.index(
-            defaults['distance_metric']
-        )
     repeat = defaults['repeat']
     if not isinstance(repeat, int) or repeat < 1:
         raise ValueError('task_contract repeat must be a positive integer')
@@ -181,12 +171,7 @@ class _Engine:
             translation = jnp.linalg.norm(
                 values[:, 2:4] - goals[:, 2:4], axis=-1
             )
-            pose_distance = jnp.hypot(translation, jnp.rad2deg(angle))
-            distance = jnp.where(
-                contract.get('distance_metric', 0) == 1,
-                pose_distance,
-                jnp.linalg.norm(values - goals, axis=-1),
-            )
+            distance = jnp.hypot(translation, jnp.rad2deg(angle))
             success = (position < contract['position_threshold']) & (
                 angle < contract['angle_threshold']
             )

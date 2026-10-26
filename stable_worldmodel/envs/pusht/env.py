@@ -351,6 +351,7 @@ class PushT(gym.Env):
         return observation, reward, terminated, truncated, info
 
     def eval_state(self, goal_state, cur_state):
+        """Return success and T-pose distance in pixels and degrees."""
         # success if position difference is < 20, and angle difference < np.pi/9
         goal_state = np.asarray(goal_state, dtype=np.float64)
         cur_state = np.asarray(cur_state, dtype=np.float64)
@@ -367,7 +368,12 @@ class PushT(gym.Env):
         angle_diff = np.minimum(angle_diff, symmetry - angle_diff)
 
         success = pos_diff < 20 and angle_diff < np.pi / 9
-        state_dist = np.linalg.norm(goal_state - cur_state)
+        pose_angle = np.abs(goal_state[4] - cur_state[4]) % (2 * np.pi)
+        pose_angle = np.minimum(pose_angle, 2 * np.pi - pose_angle)
+        state_dist = np.hypot(
+            np.linalg.norm(goal_state[2:4] - cur_state[2:4]),
+            np.rad2deg(pose_angle),
+        )
 
         return success, state_dist
 
