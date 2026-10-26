@@ -165,10 +165,13 @@ class _Engine:
             distance = jnp.linalg.norm(values - goals[:, :3], axis=-1)
             success = distance <= contract['threshold']
         else:
-            distance = jnp.linalg.norm(values - goals, axis=-1)
             position = jnp.linalg.norm(values[:, :4] - goals[:, :4], axis=-1)
             angle = jnp.mod(jnp.abs(values[:, 4] - goals[:, 4]), 2 * jnp.pi)
             angle = jnp.minimum(angle, 2 * jnp.pi - angle)
+            translation = jnp.linalg.norm(
+                values[:, 2:4] - goals[:, 2:4], axis=-1
+            )
+            distance = jnp.hypot(translation, jnp.rad2deg(angle))
             success = (position < contract['position_threshold']) & (
                 angle < contract['angle_threshold']
             )

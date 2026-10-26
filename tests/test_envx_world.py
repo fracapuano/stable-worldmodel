@@ -139,13 +139,95 @@ def test_contract_metrics_and_wrapped_angle():
         )
         np.testing.assert_array_equal(success, expected)
         if name == 'pusht':
-            # Fitness keeps the declared raw state7 L2 distance, including
-            # velocity and raw angle, even when angular success wraps.
+            # Distance ignores pusher position/velocity and wraps T rotation.
+            # Float32 radian roundoff is amplified by conversion to degrees.
             np.testing.assert_allclose(
-                distances[0],
-                np.linalg.norm(np.asarray(states[0]) - goals[0]),
-                rtol=1e-6,
+                distances, [np.rad2deg(0.02), 0], rtol=1e-5, atol=5e-5
             )
+
+
+@pytest.mark.parametrize(
+    'position,angle,goal_angle,expected,expected_success',
+    [
+        ([0, 0], 0, 0, 0, True),
+        ([3, 4], 0, 0, 5, True),
+        ([0, 0], np.pi / 2, 0, 90, False),
+        ([0, 0], np.deg2rad(359), np.deg2rad(1), 2, True),
+        ([0, 0], np.deg2rad(1), np.deg2rad(359), 2, True),
+        ([0, 0], np.pi, 0, 180, False),
+        ([3, 4], np.pi / 6, 0, np.sqrt(5**2 + 30**2), False),
+    ],
+)
+def test_pusht_pose_distance_ignores_pusher_and_preserves_success(
+    position, angle, goal_angle, expected, expected_success
+):
+    jax = pytest.importorskip('jax')
+    jnp = pytest.importorskip('jax.numpy')
+    engine = _Engine.__new__(_Engine)
+    engine.name = 'pusht'
+    engine.adapter = SimpleNamespace(vector=lambda value: value)
+    # Both rows have the same T pose but different pusher positions/velocities.
+    states = jnp.asarray(
+        [
+            [100, 200, *position, angle, 300, -400],
+            [0, 0, *position, angle, 0, 0],
+        ]
+    )
+    goals = jnp.asarray([[0, 0, 0, 0, goal_angle, 0, 0]] * 2)
+    options = swm.World._task_reset_options(protocol().tasks[0])
+    _, _, contract = task_inputs('pusht', options)
+    _, distance, success = jax.jit(engine._metrics)(states, goals, contract)
+    np.testing.assert_allclose(distance, [expected] * 2, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(success, [False, expected_success])
+
+
+def test_pusht_pose_distance_matches_native_evaluation():
+    jax = pytest.importorskip('jax')
+    jnp = pytest.importorskip('jax.numpy')
+    native = pytest.importorskip('stable_worldmodel.envs.pusht.env').PushT()
+    engine = _Engine.__new__(_Engine)
+    engine.name = 'pusht'
+    engine.adapter = SimpleNamespace(vector=lambda value: value)
+    states = np.asarray(
+        [
+            [100, 200, 3, 4, np.pi / 6, 300, -400],
+            [0, 0, 0, 0, np.deg2rad(359), 0, 0],
+        ],
+        dtype=np.float32,
+    )
+    goals = np.asarray(
+        [[0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, np.deg2rad(1), 0, 0]],
+        dtype=np.float32,
+    )
+    options = swm.World._task_reset_options(protocol().tasks[0])
+    _, _, contract = task_inputs('pusht', options)
+    try:
+        native.variation_space.set_value(
+            {'block.shape': native.shapes.index('T')}
+        )
+        expected_success, expected_distance = zip(
+            *(
+                native.eval_state(goal, state)
+                for goal, state in zip(goals, states, strict=True)
+            ),
+            strict=True,
+        )
+        _, distances, success = jax.jit(engine._metrics)(
+            jnp.asarray(states), jnp.asarray(goals), contract
+        )
+        np.testing.assert_allclose(
+            distances, expected_distance, rtol=1e-5, atol=1e-5
+        )
+        np.testing.assert_array_equal(success, expected_success)
+    finally:
+        native.close()
+
+
+def test_pusht_distance_cannot_be_overridden():
+    options = swm.World._task_reset_options(protocol().tasks[0])
+    options['task_contract'] = {'distance_metric': 'pusht-state7-l2'}
+    with pytest.raises(ValueError, match='unsupported task_contract'):
+        task_inputs('pusht', options)
 
 
 @integration
@@ -896,6 +978,16 @@ def test_public_world_and_manyworlds_evaluation(name, monkeypatch):
         'stable_worldmodel.envs.two_room.env.TwoRoomEnv.step', unexpected
     )
     p = protocol(name)
+    if name == 'pusht':
+        tasks = []
+        for task in p.tasks:
+            goal = (*task.goal[:2], 280, 250, np.pi / 6, 0, 0)
+            options = dict(task.options)
+            options['goal_state'] = goal
+            tasks.append(
+                replace(task, goal=goal, options=tuple(options.items()))
+            )
+        p = replace(p, tasks=tuple(tasks))
     worlds = [world_for(p, pixels=True), world_for(p, pixels=True)]
     solvers = [
         attach_policy(w, direction=float(1 - i * 2))
@@ -909,6 +1001,15 @@ def test_public_world_and_manyworlds_evaluation(name, monkeypatch):
         assert result.task_keys == p.task_keys
         assert result.metadata['planning_calls'] == len(events) == 1
         assert all(1 <= row.length <= 4 for row in result.episodes)
+        if name == 'pusht':
+            states = torch.as_tensor(worlds[0].infos['state'])[:, -1]
+            goals = states.new_tensor([task.goal for task in p.tasks])
+            translation = (states[:, 2:4] - goals[:, 2:4]).norm(dim=-1)
+            angle = (states[:, 4] - goals[:, 4] + np.pi) % (2 * np.pi) - np.pi
+            expected = torch.hypot(translation, torch.rad2deg(angle))
+            torch.testing.assert_close(
+                worlds[0].infos['distance_to_target'].reshape(-1), expected
+            )
         population = many.evaluate(p, solver=solvers[0], eval_budget=4)
         assert population.task_final_distances.shape == (2, 2)
         expected = -population.task_final_distances.mean(1)

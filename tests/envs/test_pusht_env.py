@@ -28,13 +28,13 @@ def test_pusht_default_tee_respects_block_scale_variation(scale):
 @pytest.mark.parametrize(
     'shape,angle,expected_success,expected_distance',
     [
-        ('L', np.pi, False, np.pi),
-        ('T', np.pi, False, np.pi),
-        ('Z', np.pi, True, np.pi),
-        ('square', np.pi / 2, True, np.pi / 2),
-        ('I', np.pi, True, np.pi),
-        ('small_tee', np.pi, False, np.pi),
-        ('+', np.pi / 2, True, np.pi / 2),
+        ('L', np.pi, False, 180),
+        ('T', np.pi, False, 180),
+        ('Z', np.pi, True, 180),
+        ('square', np.pi / 2, True, 90),
+        ('I', np.pi, True, 180),
+        ('small_tee', np.pi, False, 180),
+        ('+', np.pi / 2, True, 90),
     ],
 )
 def test_pusht_eval_state_respects_block_shape_rotation_symmetry(

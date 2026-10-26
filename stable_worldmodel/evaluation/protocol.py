@@ -30,6 +30,12 @@ class EvaluationTask:
     ``repeat``, ``threshold``, PushT's ``position_threshold``/
     ``angle_threshold`` and its ``relative``/``action_scale``/``clip_target``
     controls. These options apply to the frozen task evaluation only.
+
+    PushT distance always measures T pose:
+    sqrt(dx**2 + dy**2 + wrapped_angle_degrees**2). Position is in native
+    pixels and angle uses the shortest difference in degrees, giving one
+    pixel and one degree equal weight. Pusher state is excluded from
+    distance; success and full-state restoration are unchanged.
     """
 
     environment_seed: int
