@@ -148,6 +148,82 @@ def test_contract_metrics_and_wrapped_angle():
             )
 
 
+@pytest.mark.parametrize(
+    'position,angle,goal_angle,expected',
+    [
+        ([0, 0], 0, 0, 0),
+        ([3, 4], 0, 0, 5),
+        ([0, 0], np.pi / 2, 0, 90),
+        ([0, 0], np.deg2rad(359), np.deg2rad(1), 2),
+        ([0, 0], np.deg2rad(1), np.deg2rad(359), 2),
+        ([0, 0], np.pi, 0, 180),
+        ([3, 4], np.pi / 6, 0, np.sqrt(5**2 + 30**2)),
+    ],
+)
+def test_pusht_pose_distance_ignores_pusher_and_preserves_success(
+    position, angle, goal_angle, expected
+):
+    jax = pytest.importorskip('jax')
+    jnp = pytest.importorskip('jax.numpy')
+    engine = _Engine.__new__(_Engine)
+    engine.name = 'pusht'
+    engine.adapter = SimpleNamespace(vector=lambda value: value)
+    # Both rows have the same T pose but different pusher positions/velocities.
+    states = jnp.asarray(
+        [
+            [100, 200, *position, angle, 300, -400],
+            [0, 0, *position, angle, 0, 0],
+        ]
+    )
+    goals = jnp.asarray([[0, 0, 0, 0, goal_angle, 0, 0]] * 2)
+    options = swm.World._task_reset_options(protocol().tasks[0])
+    _, _, legacy = task_inputs('pusht', options)
+    options['task_contract'] = {'distance_metric': 'pusht-pose-l2'}
+    _, _, contract = task_inputs('pusht', options)
+    _, distance, success = jax.jit(engine._metrics)(states, goals, contract)
+    _, _, original_success = engine._metrics(states, goals, legacy)
+    np.testing.assert_allclose(distance, [expected] * 2, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(success, original_success)
+
+
+def test_pusht_distance_metric_is_a_batched_task_option():
+    jax = pytest.importorskip('jax')
+    jnp = pytest.importorskip('jax.numpy')
+    engine = _Engine.__new__(_Engine)
+    engine.name = 'pusht'
+    engine.adapter = SimpleNamespace(vector=lambda value: value)
+    states = jnp.asarray([[0, 0, 100, 0, np.pi / 2, 0, 0]] * 2)
+    contract = {
+        'distance_metric': jnp.asarray([0, 1]),
+        'position_threshold': 20,
+        'angle_threshold': np.pi / 9,
+    }
+    _, distances, _ = jax.jit(engine._metrics)(
+        states, jnp.zeros((2, 7)), contract
+    )
+    np.testing.assert_allclose(
+        distances,
+        [np.hypot(100, np.pi / 2), np.hypot(100, 90)],
+        rtol=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    'contract',
+    [
+        {'distance_metric': 'unknown'},
+        {'distance_metric': 1},
+        {'position_scale': 512},
+        {'angle_scale': np.pi},
+    ],
+)
+def test_invalid_pusht_distance_contract_is_rejected(contract):
+    options = swm.World._task_reset_options(protocol().tasks[0])
+    options['task_contract'] = contract
+    with pytest.raises(ValueError):
+        task_inputs('pusht', options)
+
+
 @integration
 def test_first_success_inside_repeated_control_freezes_outcome():
     import jax.numpy as jnp
@@ -881,7 +957,9 @@ def test_blocked_plan_executes_25_controls_in_one_planning_call(name):
 
 
 @integration
-@pytest.mark.parametrize('name', ['pusht', 'reacher', 'cube', 'two-room'])
+@pytest.mark.parametrize(
+    'name', ['pusht', 'pusht-pose', 'reacher', 'cube', 'two-room']
+)
 def test_public_world_and_manyworlds_evaluation(name, monkeypatch):
     if name in ('reacher', 'cube') and DEVICE == 'cpu':
         pytest.skip('MJX rendering requires CUDA')
@@ -895,7 +973,18 @@ def test_public_world_and_manyworlds_evaluation(name, monkeypatch):
     monkeypatch.setattr(
         'stable_worldmodel.envs.two_room.env.TwoRoomEnv.step', unexpected
     )
-    p = protocol(name)
+    p = protocol('pusht' if name == 'pusht-pose' else name)
+    if name == 'pusht-pose':
+        tasks = []
+        for task in p.tasks:
+            goal = (*task.goal[:2], 280, 250, np.pi / 6, 0, 0)
+            options = dict(task.options)
+            options['goal_state'] = goal
+            options['task_contract'] = {'distance_metric': 'pusht-pose-l2'}
+            tasks.append(
+                replace(task, goal=goal, options=tuple(options.items()))
+            )
+        p = replace(p, tasks=tuple(tasks))
     worlds = [world_for(p, pixels=True), world_for(p, pixels=True)]
     solvers = [
         attach_policy(w, direction=float(1 - i * 2))
@@ -909,6 +998,15 @@ def test_public_world_and_manyworlds_evaluation(name, monkeypatch):
         assert result.task_keys == p.task_keys
         assert result.metadata['planning_calls'] == len(events) == 1
         assert all(1 <= row.length <= 4 for row in result.episodes)
+        if name == 'pusht-pose':
+            states = torch.as_tensor(worlds[0].infos['state'])[:, -1]
+            goals = states.new_tensor([task.goal for task in p.tasks])
+            translation = (states[:, 2:4] - goals[:, 2:4]).norm(dim=-1)
+            angle = (states[:, 4] - goals[:, 4] + np.pi) % (2 * np.pi) - np.pi
+            expected = torch.hypot(translation, torch.rad2deg(angle))
+            torch.testing.assert_close(
+                worlds[0].infos['distance_to_target'].reshape(-1), expected
+            )
         population = many.evaluate(p, solver=solvers[0], eval_budget=4)
         assert population.task_final_distances.shape == (2, 2)
         expected = -population.task_final_distances.mean(1)
