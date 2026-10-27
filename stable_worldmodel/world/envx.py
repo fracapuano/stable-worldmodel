@@ -159,7 +159,10 @@ class _Engine:
 
         values = self.adapter.vector(state)
         if self.name == 'reacher':
-            distance = jnp.max(jnp.abs(values - goals), axis=-1)
+            delta = values - goals
+            # Only the shoulder is periodic; the wrist has joint limits.
+            shoulder = jnp.arctan2(jnp.sin(delta[:, 0]), jnp.cos(delta[:, 0]))
+            distance = jnp.maximum(jnp.abs(shoulder), jnp.abs(delta[:, 1]))
             success = distance < contract['threshold']
         elif self.name == 'cube':
             distance = jnp.linalg.norm(values - goals[:, :3], axis=-1)

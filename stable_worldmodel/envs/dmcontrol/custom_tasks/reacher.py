@@ -15,6 +15,7 @@ class ReacherQPosMatchTask(reacher.Reacher):
         random: Random seed or RandomState.
         qpos_threshold: Per-joint absolute tolerance (in radians) used to
             determine whether the current qpos matches the target qpos.
+            Shoulder error wraps over full turns; wrist error respects limits.
     """
 
     def __init__(
@@ -27,7 +28,10 @@ class ReacherQPosMatchTask(reacher.Reacher):
     def get_termination(self, physics):
         if self.target_qpos is None:
             return None
-        diff = np.abs(physics.data.qpos - self.target_qpos)
+        delta = physics.data.qpos - self.target_qpos
+        # The shoulder is periodic; the wrist is limited to +/-160 degrees.
+        shoulder = np.arctan2(np.sin(delta[0]), np.cos(delta[0]))
+        diff = np.array([np.abs(shoulder), np.abs(delta[1])])
         if np.all(diff < self.qpos_threshold):
             return 0.0
         return None
