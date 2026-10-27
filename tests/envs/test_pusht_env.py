@@ -4,6 +4,30 @@ import pytest
 from stable_worldmodel.envs.pusht.env import PushT
 
 
+@pytest.mark.parametrize(
+    'pusher,block,angle,expected_distance,expected_success',
+    [
+        ([0, 0], [0, 0], 0, 0, True),
+        ([18, 0], [0, 0], 0, 18, True),
+        ([30, 0], [0, 0], 0, 30, False),
+        ([12, 0], [0, 16], 0, 20, False),
+        ([3, 4], [0, 0], np.pi / 6, np.hypot(5, 30), False),
+    ],
+)
+def test_pusht_distance_includes_pusher_and_preserves_success(
+    pusher, block, angle, expected_distance, expected_success
+):
+    env = PushT()
+    try:
+        goal = np.array([100.0, 100.0, 256.0, 256.0, 0.0, 0.0, 0.0])
+        state = goal + np.array([*pusher, *block, angle, 300.0, -400.0])
+        success, distance = env.eval_state(goal, state)
+        assert bool(success) is expected_success
+        assert distance == pytest.approx(expected_distance)
+    finally:
+        env.close()
+
+
 @pytest.mark.parametrize('scale', [20, 60])
 def test_pusht_default_tee_respects_block_scale_variation(scale):
     env = PushT()

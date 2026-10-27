@@ -139,10 +139,10 @@ def test_contract_metrics_and_wrapped_angle():
         )
         np.testing.assert_array_equal(success, expected)
         if name == 'pusht':
-            # Distance ignores pusher position/velocity and wraps T rotation.
+            # Distance includes pusher position, ignores velocity, and wraps T rotation.
             # Float32 radian roundoff is amplified by conversion to degrees.
             np.testing.assert_allclose(
-                distances, [np.rad2deg(0.02), 0], rtol=1e-5, atol=5e-5
+                distances, [np.rad2deg(0.02), 20], rtol=1e-5, atol=5e-5
             )
 
 
@@ -158,7 +158,7 @@ def test_contract_metrics_and_wrapped_angle():
         ([3, 4], np.pi / 6, 0, np.sqrt(5**2 + 30**2), False),
     ],
 )
-def test_pusht_pose_distance_ignores_pusher_and_preserves_success(
+def test_pusht_pose_distance_includes_pusher_and_ignores_velocity(
     position, angle, goal_angle, expected, expected_success
 ):
     jax = pytest.importorskip('jax')
@@ -166,19 +166,23 @@ def test_pusht_pose_distance_ignores_pusher_and_preserves_success(
     engine = _Engine.__new__(_Engine)
     engine.name = 'pusht'
     engine.adapter = SimpleNamespace(vector=lambda value: value)
-    # Both rows have the same T pose but different pusher positions/velocities.
+    # Pusher position contributes to distance; its velocity does not.
     states = jnp.asarray(
         [
             [100, 200, *position, angle, 300, -400],
+            [100, 200, *position, angle, 0, 0],
             [0, 0, *position, angle, 0, 0],
         ]
     )
-    goals = jnp.asarray([[0, 0, 0, 0, goal_angle, 0, 0]] * 2)
+    goals = jnp.asarray([[0, 0, 0, 0, goal_angle, 0, 0]] * 3)
     options = swm.World._task_reset_options(protocol().tasks[0])
     _, _, contract = task_inputs('pusht', options)
     _, distance, success = jax.jit(engine._metrics)(states, goals, contract)
-    np.testing.assert_allclose(distance, [expected] * 2, rtol=1e-5, atol=1e-5)
-    np.testing.assert_array_equal(success, [False, expected_success])
+    with_pusher = np.hypot(np.hypot(100, 200), expected)
+    np.testing.assert_allclose(
+        distance, [with_pusher, with_pusher, expected], rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_array_equal(success, [False, False, expected_success])
 
 
 def test_pusht_pose_distance_matches_native_evaluation():
@@ -1004,9 +1008,9 @@ def test_public_world_and_manyworlds_evaluation(name, monkeypatch):
         if name == 'pusht':
             states = torch.as_tensor(worlds[0].infos['state'])[:, -1]
             goals = states.new_tensor([task.goal for task in p.tasks])
-            translation = (states[:, 2:4] - goals[:, 2:4]).norm(dim=-1)
+            position = (states[:, :4] - goals[:, :4]).norm(dim=-1)
             angle = (states[:, 4] - goals[:, 4] + np.pi) % (2 * np.pi) - np.pi
-            expected = torch.hypot(translation, torch.rad2deg(angle))
+            expected = torch.hypot(position, torch.rad2deg(angle))
             torch.testing.assert_close(
                 worlds[0].infos['distance_to_target'].reshape(-1), expected
             )
