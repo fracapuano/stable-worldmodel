@@ -150,22 +150,41 @@ class World:
         self._closed = False
         self._infer_device = device is None
         from .envx import ENVIRONMENTS, EnvXPool
-        from .jax_two_rooms import TwoRoomTaskPool
 
-        accelerated = env_name in ENVIRONMENTS or env_name == 'swm/TwoRoom-v1'
-        if accelerated:
-            if (
-                pre_wrappers
-                or extra_wrappers
-                or (env_name in ENVIRONMENTS and (kwargs or image_resample))
-                or not goal_conditioned
-            ):
-                raise ValueError(
-                    'envX execution uses envx_options and task reset options; '
-                    'Gym wrappers, kwargs, image_resample and unconditioned '
-                    'goals are unsupported'
-                )
+        accelerated = env_name in ENVIRONMENTS
+        if accelerated and (
+            pre_wrappers
+            or extra_wrappers
+            or (env_name != 'swm/TwoRoom-v1' and (kwargs or image_resample))
+            or not goal_conditioned
+        ):
+            raise ValueError(
+                'envX execution uses envx_options and task reset options; '
+                'Gym wrappers, kwargs, image_resample and unconditioned '
+                'goals are unsupported'
+            )
         if env_name in ENVIRONMENTS:
+            if env_name == 'swm/TwoRoom-v1':
+                unsupported = set(kwargs) - {
+                    'success_radius',
+                    'render_target',
+                    'init_value',
+                    'render_mode',
+                }
+                if unsupported:
+                    raise ValueError(
+                        f'unsupported TwoRoom options: {sorted(unsupported)}'
+                    )
+                envx_options = {
+                    **dict(envx_options or {}),
+                    **{
+                        key: value
+                        for key, value in kwargs.items()
+                        if key != 'render_mode'
+                    },
+                }
+                if image_resample is not None:
+                    envx_options['image_resample'] = image_resample
             self.envs = EnvXPool(
                 env_name,
                 num_envs,
@@ -175,14 +194,6 @@ class World:
                 image_transform=image_transform,
                 goal_transform=goal_transform,
                 envx_options=envx_options,
-            )
-        elif env_name == 'swm/TwoRoom-v1':
-            if envx_options:
-                raise ValueError(
-                    'TwoRoom uses the existing task reset options'
-                )
-            self.envs = TwoRoomTaskPool(
-                [env_fn] * num_envs, max_episode_steps=max_episode_steps
             )
         else:
             self.envs = EnvPool([env_fn] * num_envs)

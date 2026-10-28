@@ -10,11 +10,9 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 import torch
-from gymnasium.wrappers import OrderEnforcing, PassiveEnvChecker, TimeLimit
 from torch import nn
 from typing_extensions import Self
 
-from stable_worldmodel.envs.two_room.env import TwoRoomEnv
 from stable_worldmodel.evaluation import (
     EvaluationProtocol,
     EvaluationResults,
@@ -23,27 +21,9 @@ from stable_worldmodel.evaluation.records import episodes_from_rollout
 from stable_worldmodel.planning import FastCEMSolver
 from stable_worldmodel.policy import WorldModelPolicy
 from stable_worldmodel.protocols import PopulationModel
-from stable_worldmodel.wrapper import (
-    AddPixelsWrapper,
-    EnsureInfoKeysWrapper,
-    EverythingToInfoWrapper,
-    MegaWrapper,
-    ResizeGoalWrapper,
-)
 
 from .envx import EnvXPool
 from .world import World
-
-_ENVX_WRAPPERS = (
-    MegaWrapper,
-    ResizeGoalWrapper,
-    EnsureInfoKeysWrapper,
-    EverythingToInfoWrapper,
-    AddPixelsWrapper,
-    TimeLimit,
-    OrderEnforcing,
-    PassiveEnvChecker,
-)
 
 
 def _same_device(actual: torch.device, expected: torch.device) -> bool:
@@ -293,75 +273,26 @@ class ManyWorlds:
             raise ValueError('ManyWorlds requires envX World execution')
         if len({world.env_name for world in self.worlds}) != 1:
             raise ValueError('ManyWorlds cannot mix environments')
-        if isinstance(self.worlds[0].envs, EnvXPool):
-            first = self.worlds[0]
+        first = self.worlds[0]
 
-            for world in self.worlds:
-                if (
-                    world.env_name != first.env_name
-                    or world.envs.device != first.envs.device
-                    or world.envs.image_shape != first.envs.image_shape
-                    or not _equivalent(
-                        world.envs.envx_options, first.envs.envx_options
-                    )
-                    or not _equivalent(
-                        world.envs.image_transform, first.envs.image_transform
-                    )
-                    or not _equivalent(
-                        world.envs.goal_transform, first.envs.goal_transform
-                    )
-                ):
-                    raise ValueError(
-                        'envX Worlds must share environment, device, rendering and simulator options'
-                    )
-            return
-        for world_index, world in enumerate(self.worlds):
-            for task_index, wrapped in enumerate(world.envs.envs):
-                env_id = getattr(getattr(wrapped, 'spec', None), 'id', None)
-                if env_id != 'swm/TwoRoom-v1':
-                    raise ValueError(
-                        'ManyWorlds currently supports only '
-                        f'swm/TwoRoom-v1, got {env_id!r}'
-                    )
-                current = wrapped
-                wrapper_types = []
-                while isinstance(current, gym.Wrapper):
-                    wrapper_types.append(type(current))
-                    if type(current) not in _ENVX_WRAPPERS:
-                        wrapper = (
-                            f'{type(current).__module__}.'
-                            f'{type(current).__qualname__}'
-                        )
-                        raise ValueError(
-                            'ManyWorlds supports only the standard TwoRoom '
-                            'wrapper stack; custom wrapper '
-                            f'{wrapper} was found in World {world_index}, '
-                            f'task {task_index}'
-                        )
-                    current = current.env
-                if tuple(wrapper_types) != _ENVX_WRAPPERS:
-                    actual = ' -> '.join(
-                        wrapper.__qualname__ for wrapper in wrapper_types
-                    )
-                    raise ValueError(
-                        'ManyWorlds requires the exact standard TwoRoom '
-                        f'wrapper stack, got {actual}'
-                    )
-                if type(current) is not TwoRoomEnv:
-                    env_type = (
-                        f'{type(current).__module__}.'
-                        f'{type(current).__qualname__}'
-                    )
-                    raise ValueError(
-                        'ManyWorlds currently supports only '
-                        f'swm/TwoRoom-v1, got {env_type}'
-                    )
-
-        action_space = self.worlds[0].envs.single_action_space
-        if action_space.shape != (2,):
-            raise ValueError(
-                'envX TwoRoom requires an unmodified action shape of (2,)'
-            )
+        for world in self.worlds:
+            if (
+                world.env_name != first.env_name
+                or world.envs.device != first.envs.device
+                or world.envs.image_shape != first.envs.image_shape
+                or not _equivalent(
+                    world.envs.envx_options, first.envs.envx_options
+                )
+                or not _equivalent(
+                    world.envs.image_transform, first.envs.image_transform
+                )
+                or not _equivalent(
+                    world.envs.goal_transform, first.envs.goal_transform
+                )
+            ):
+                raise ValueError(
+                    'envX Worlds must share environment, device, rendering and simulator options'
+                )
 
     @property
     def population_size(self) -> int:
@@ -679,7 +610,9 @@ class ManyWorlds:
 
     def _rollout_member_plans(self, initial_state, actions):
         """Execute plans with the state returned by _reset_member_protocols."""
-        return self._member_envs.rollout(actions)
+        if initial_state is None:
+            return self._member_envs.rollout(actions)
+        return self._member_envs.rollout(actions, initial_state=initial_state)
 
     @torch.inference_mode()
     def _evaluate_envx(
@@ -690,6 +623,8 @@ class ManyWorlds:
         population: PopulationModel | None,
         eval_budget: int,
         record: bool,
+        prepared_info=None,
+        initial_state=None,
     ) -> ManyWorldsEvaluationResults:
         """Plan once and score every full plan in one compiled envX rollout."""
         if record:
@@ -708,7 +643,16 @@ class ManyWorlds:
             if member_tasks
             else (protocol,) * self.population_size
         )
-        if member_tasks:
+        if prepared_info is not None:
+            info = prepared_info
+            if self._member_envs is None:
+                self._member_envs = self.envs._with_num_envs(
+                    self.simulator_count
+                )
+            self._bootstrap_simulator_count = 0
+            for policy in self.policies:
+                policy.reset_state()
+        elif member_tasks:
             info, initial_state = self._reset_member_protocols(protocols)
         else:
             info = self._reset_envx(
@@ -773,7 +717,7 @@ class ManyWorlds:
         else:
             outcome = self.worlds[0].envs.rollout(actions)
         first_protocol = protocols[0]
-        if isinstance(self.worlds[0].envs, EnvXPool):
+        if self.worlds[0].env_name != 'swm/TwoRoom-v1':
             score_name = str(
                 dict(first_protocol.metadata).get('score', 'distance')
             )
@@ -840,18 +784,39 @@ class ManyWorlds:
         population: PopulationModel | None = None,
         eval_budget: int | None = None,
         record: bool = False,
+        prepared_info=None,
+        initial_state=None,
     ) -> ManyWorldsEvaluationResults:
         """Evaluate all Worlds with population-batched FastCEM.
 
         There is no per-World solver call or model loop: CEM, model ranking,
-        action postprocessing, and TwoRoom execution stay tensorized across
+        action postprocessing, and environment execution stay tensorized across
         the population on the accelerator. Pass one protocol to share its
         tasks, or P protocols to assign one fixed-size task minibatch per
         member. Results retain the input member/task ordering. Call ``close``
         to release the additional task pool used by per-member protocols.
+        Supply prepared_info with (population, task, ...) observations and a
+        matching EnvXPool.snapshot() to skip task reset and rendering. The
+        snapshot rows must follow member-major/task-minor protocol ordering.
         """
         if self._closed or any(world._closed for world in self.worlds):
             raise RuntimeError('ManyWorlds or its input World is closed')
+        if (prepared_info is None) != (initial_state is None):
+            raise ValueError(
+                'prepared_info and initial_state must be supplied together'
+            )
+        if prepared_info is not None:
+            if isinstance(protocol, EvaluationProtocol):
+                raise ValueError(
+                    'prepared inputs require one protocol per population member'
+                )
+            for value in prepared_info.values():
+                if not isinstance(value, (torch.Tensor, np.ndarray)) or tuple(
+                    value.shape[:2]
+                ) != (self.population_size, self.num_tasks):
+                    raise ValueError(
+                        'prepared observations must have population and task axes'
+                    )
         if not isinstance(protocol, EvaluationProtocol):
             if not isinstance(protocol, Sequence) or not all(
                 isinstance(item, EvaluationProtocol) for item in protocol
@@ -898,6 +863,8 @@ class ManyWorlds:
             population=population,
             eval_budget=eval_budget,
             record=record,
+            prepared_info=prepared_info,
+            initial_state=initial_state,
         )
 
 
