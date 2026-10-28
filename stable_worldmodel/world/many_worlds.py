@@ -645,7 +645,11 @@ class ManyWorlds:
         )
 
     def _reset_member_protocols(self, protocols):
-        """Restore all P*T states without changing the input Worlds' pools."""
+        """Return observations and rollout state for all P*T tasks.
+
+        The native pool owns its reset state, so its explicit state is None.
+        Prepared-task implementations can return a state snapshot instead.
+        """
         self._bootstrap_simulator_count = self.simulator_count
         if self._member_envs is None:
             self._member_envs = self.envs._with_num_envs(
@@ -664,13 +668,18 @@ class ManyWorlds:
         for policy in self.policies:
             policy.reset_state()
         info = self.policies[0]._prepare_info(raw_info)
-        return {
+        info = {
             key: value.reshape(
                 self.population_size, self.num_tasks, *value.shape[1:]
             )
             for key, value in info.items()
             if isinstance(value, (torch.Tensor, np.ndarray))
         }
+        return info, None
+
+    def _rollout_member_plans(self, initial_state, actions):
+        """Execute plans with the state returned by _reset_member_protocols."""
+        return self._member_envs.rollout(actions)
 
     @torch.inference_mode()
     def _evaluate_envx(
@@ -699,13 +708,12 @@ class ManyWorlds:
             if member_tasks
             else (protocol,) * self.population_size
         )
-        info = (
-            self._reset_member_protocols(protocols)
-            if member_tasks
-            else self._reset_envx(
+        if member_tasks:
+            info, initial_state = self._reset_member_protocols(protocols)
+        else:
+            info = self._reset_envx(
                 protocol, eval_budget, expand_population=population is None
             )
-        )
         seeds = info.get('controller_seed')
         noise_tasks = (
             self.population_size * self.num_tasks
@@ -751,7 +759,7 @@ class ManyWorlds:
             flat = actions.reshape(
                 1, self.population_size * self.num_tasks, *actions.shape[2:]
             )
-            flat_outcome = self._member_envs.rollout(flat)
+            flat_outcome = self._rollout_member_plans(initial_state, flat)
             outcome = type(flat_outcome)(
                 **{
                     field.name: getattr(flat_outcome, field.name).reshape(

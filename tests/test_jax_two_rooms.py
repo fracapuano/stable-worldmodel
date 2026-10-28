@@ -251,6 +251,45 @@ def test_many_worlds_envx_returns_device_resident_population_scores() -> None:
         many.close()
 
 
+def test_many_worlds_passes_each_selected_state_to_its_rollout() -> None:
+    prepared_states, executed_states = [], []
+
+    class ExplicitStateWorlds(swm.ManyWorlds):
+        def _reset_member_protocols(self, protocols):
+            info, state = super()._reset_member_protocols(protocols)
+            assert state is None
+            selected = tuple(protocol.task_keys for protocol in protocols)
+            prepared_states.append(selected)
+            return info, selected
+
+        def _rollout_member_plans(self, initial_state, actions):
+            executed_states.append(initial_state)
+            return super()._rollout_member_plans(None, actions)
+
+    protocol = _protocol()
+    reversed_protocol = EvaluationProtocol(
+        split=protocol.split,
+        environment=protocol.environment,
+        metadata=protocol.metadata,
+        tasks=protocol.tasks[::-1],
+    )
+    worlds = [_world(1.0), _world(-1.0)]
+    many = ExplicitStateWorlds(worlds=worlds)
+    try:
+        for assigned in (
+            (protocol, reversed_protocol),
+            (reversed_protocol, protocol),
+        ):
+            result = many.evaluate(
+                assigned, solver=worlds[0].policy.solver, eval_budget=4
+            )
+            assert torch.isfinite(result.task_final_distances).all()
+        assert prepared_states[0] != prepared_states[1]
+        assert executed_states == prepared_states
+    finally:
+        many.close()
+
+
 def test_many_worlds_accepts_one_population_forward_world() -> None:
     world = _world(1.0, receding_horizon=2)
     solver = world.policy.solver
