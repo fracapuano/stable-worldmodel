@@ -122,3 +122,25 @@ def test_snapshot_remains_usable_after_reset_and_without_resetting_consumer():
     finally:
         consumer.close()
         pool.close()
+
+
+@pytest.mark.parametrize('radius, success', [(8.0, False), (16.0, True)])
+def test_world_preserves_goal_images_and_success_radius(radius, success):
+    from stable_worldmodel import World
+
+    world = World(
+        'swm/TwoRoom-v1',
+        1,
+        image_shape=(32, 32),
+        device='cpu',
+        success_radius=radius,
+    )
+    try:
+        world.reset(
+            seed=[3], options=[{'state': [40, 49], 'target_state': [50, 49]}]
+        )
+        assert world.infos['goal'].shape == (1, 1, 32, 32, 3)
+        _, _, terminated, _, _ = world.envs.step(torch.zeros(1, 2))
+        assert bool(terminated[0]) == success
+    finally:
+        world.close()
