@@ -1,4 +1,4 @@
-"""Compatibility boundary for envX d26c817 (not a replacement simulator).
+"""Compatibility boundary for envX 9550e39 (not a replacement simulator).
 
 Missing upstream APIs: batched restore/observe/close for MJX environments,
 and an unclipped relative PushT step. Keep all private envX access here.
@@ -60,6 +60,32 @@ class StateAdapter:
             self.template = self.raw._make_data()
 
     def restore(self, inputs):
+        if self.name == 'two-rooms':
+            from envx.tworooms import EnvState
+
+            extras = inputs['extras']
+            fields = {
+                name: extras[name]
+                for name in (
+                    'door_positions',
+                    'door_sizes',
+                    'agent_radius',
+                    'target_radius',
+                    'speed',
+                    'wall_axis',
+                    'wall_thickness',
+                    'num_doors',
+                )
+            }
+            for name in ('wall_axis', 'wall_thickness', 'num_doors'):
+                fields[name] = fields[name].astype(jnp.int32)
+            return EnvState(
+                agent_position=inputs['qpos'],
+                target_position=inputs['goal'],
+                last_action=jnp.zeros_like(inputs['qpos']),
+                time=jnp.zeros(inputs['qpos'].shape[0], jnp.int32),
+                **fields,
+            )
         if self.name == 'pusht':
             # Public dataset restore preserves body-origin coordinates. The
             # dataset state7 omits block velocity; optional full-state fields
@@ -113,6 +139,11 @@ class StateAdapter:
         )
 
     def advance(self, state, action, contract):
+        if self.name == 'two-rooms':
+            _, following, _, _, info = self.env.step(
+                jax.random.key(0), state, action, self.params
+            )
+            return following, info['collided']
         if self.name == 'pusht':
             # env.step clips absolute targets. The declared SWM relative
             # control deliberately does not. Call envX's public physics kernel.
@@ -127,13 +158,14 @@ class StateAdapter:
                     current, target, self.params
                 ).replace(last_action=target, time=current.time + 1)
 
-            return jax.vmap(one)(
+            following = jax.vmap(one)(
                 state,
                 action,
                 contract['relative'],
                 contract['action_scale'],
                 contract['clip_target'],
             )
+            return following, jnp.zeros(action.shape[0], jnp.bool_)
         # Public state-only step: no renderer and no candidate Python loop.
         n = action.shape[0]
         zeros = jnp.zeros(n, jnp.float32)
@@ -159,11 +191,16 @@ class StateAdapter:
                 zeros,
                 false,
             )
-        return self.env.step(jax.random.key(0), wrapped, action, self.params)[
-            1
-        ].data
+        following = self.env.step(
+            jax.random.key(0), wrapped, action, self.params
+        )[1].data
+        return following, false
 
     def vector(self, state):
+        if self.name == 'two-rooms':
+            from envx.tworooms import swm_observation
+
+            return jax.vmap(swm_observation)(state)
         if self.name == 'cube':
             return state.qpos[:, 14:17]
         if self.name == 'reacher':
@@ -178,7 +215,27 @@ class StateAdapter:
             axis=-1,
         )
 
-    def render(self, state):
+    def render(self, state, inputs=None):
+        if self.name == 'two-rooms':
+            from envx.tworooms.rendering import render_swm
+
+            appearance = inputs['extras']
+            return jax.vmap(
+                lambda current, values: render_swm(
+                    current,
+                    visualize_goal=values['render_target'].astype(jnp.bool_),
+                    **{
+                        name + '_color': values[name + '_color']
+                        for name in (
+                            'agent',
+                            'target',
+                            'wall',
+                            'door',
+                            'background',
+                        )
+                    },
+                )
+            )(state, appearance)
         if self.name == 'pusht':
             return self.env.render(state, self.params)
         if self.name == 'cube':

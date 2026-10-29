@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 
 import gymnasium as gym
 import numpy as np
@@ -11,10 +12,33 @@ import torch
 from gymnasium.vector.utils import batch_space
 
 ENVIRONMENTS = {
+    'swm/TwoRoom-v1': 'two-rooms',
     'swm/PushT-v1': 'pusht',
     'swm/ReacherDMControl-v0': 'reacher',
     'swm/OGBCube-v0': 'cube',
 }
+
+
+def _validate_cuda_packages() -> None:
+    torch_cuda = torch.version.cuda
+    if not torch.cuda.is_available() or torch_cuda is None:
+        return
+    installed = []
+    for major in (12, 13):
+        try:
+            version(f'jax-cuda{major}-plugin')
+        except PackageNotFoundError:
+            continue
+        installed.append(major)
+    expected = int(torch_cuda.split('.', maxsplit=1)[0])
+    if installed and installed != [expected]:
+        choices = ', '.join(map(str, installed))
+        raise RuntimeError(
+            f'PyTorch uses CUDA {expected}, but JAX CUDA plugin(s) '
+            f'{choices} are installed. Install only '
+            'the envX/JAX extra matching PyTorch to avoid cuDNN '
+            'sublibrary conflicts.'
+        )
 
 
 def action_space_for(env_name):
@@ -29,12 +53,57 @@ def _vector(value, width, name):
     return array
 
 
-def task_inputs(name, options):
+def _two_room_inputs(options, seed, config):
+    from stable_worldmodel import spaces
+    from stable_worldmodel.envs.two_room.env import (
+        DEFAULT_VARIATIONS,
+        make_variation_space,
+    )
+
+    space = make_variation_space()
+    if config.get('init_value') is not None:
+        space.set_init_value(config['init_value'])
+    spaces.reset_variation_space(space, seed, options, DEFAULT_VARIATIONS)
+    values = space.value
+    count = int(values['door']['number'])
+    extras = {
+        'door_positions': np.where(
+            np.arange(3) < count, values['door']['position'], 49
+        ).astype(np.float32),
+        'door_sizes': np.where(
+            np.arange(3) < count, values['door']['size'], 14
+        ).astype(np.float32),
+        'agent_radius': float(values['agent']['radius'].item()),
+        'target_radius': float(values['target']['radius'].item()),
+        'speed': float(values['agent']['speed'].item()),
+        'wall_axis': int(values['wall']['axis']),
+        'wall_thickness': int(values['wall']['thickness']),
+        'num_doors': count,
+        'render_target': bool(values['rendering']['render_target'])
+        or bool(config.get('render_target', False)),
+        **{
+            name + '_color': values[name]['color']
+            for name in ('agent', 'target', 'wall', 'door', 'background')
+        },
+    }
+    start = dict(
+        qpos=_vector(options['state'], 2, 'start'),
+        qvel=np.zeros(0, np.float32),
+        **extras,
+    )
+    goal = dict(start, qpos=_vector(options['target_state'], 2, 'goal'))
+    return start, goal
+
+
+def task_inputs(name, options, *, seed=None, config=None):
     """Interpret existing reset options; never mutate a frozen task."""
     state = dict(options.get('simulator_state', {}))
     start, goal = dict(state.get('start', {})), dict(state.get('goal', {}))
     contract = dict(options.get('task_contract', {}))
-    if name == 'pusht':
+    if name == 'two-rooms':
+        start, goal = _two_room_inputs(options, seed, config or {})
+        width, velocity_width = 2, 0
+    elif name == 'pusht':
         start.setdefault('qpos', options['state'])
         goal.setdefault(
             'qpos', options.get('goal_state', options['target_state'])
@@ -77,7 +146,11 @@ def task_inputs(name, options):
             raise ValueError(f'{label} Cube quaternion must be normalized')
     defaults = {
         'repeat': 2 if name == 'reacher' else 1,
-        'threshold': 0.04 if name == 'cube' else 0.05,
+        'threshold': (config or {}).get('success_radius', 16.0)
+        if name == 'two-rooms'
+        else 0.04
+        if name == 'cube'
+        else 0.05,
         'position_threshold': 20.0,
         'angle_threshold': float(np.pi / 9),
         'relative': True,
@@ -129,7 +202,15 @@ class _Engine:
         del envx  # Import failure identifies the optional dependency early.
         self.name, self.count, self.device = name, count, device
         config = dict(kwargs, num_envs=count, observation_type='state')
-        if name == 'pusht':
+        if name == 'two-rooms':
+            for key in (
+                'success_radius',
+                'render_target',
+                'init_value',
+                'image_resample',
+            ):
+                config.pop(key, None)
+        elif name == 'pusht':
             if image_shape and image_shape[0] != image_shape[1]:
                 raise ValueError(
                     'pinned envX PushT renderer requires square images'
@@ -145,7 +226,7 @@ class _Engine:
             config.update(device=device)
             config.setdefault('naconmax', max(512, 32 * count))
             config.setdefault('njmax', 1024)
-        if image_shape and name != 'pusht':
+        if image_shape and name not in {'pusht', 'two-rooms'}:
             config.update(observation_type='pixels', image_size=image_shape)
         with jax.default_device(device):
             env, params = make_env(name, **config)
@@ -158,7 +239,10 @@ class _Engine:
         import jax.numpy as jnp
 
         values = self.adapter.vector(state)
-        if self.name == 'reacher':
+        if self.name == 'two-rooms':
+            distance = jnp.linalg.norm(values[:, :2] - goals, axis=-1)
+            success = distance < contract['threshold']
+        elif self.name == 'reacher':
             delta = values - goals
             # Only the shoulder is periodic; the wrist has joint limits.
             shoulder = jnp.arctan2(jnp.sin(delta[:, 0]), jnp.cos(delta[:, 0]))
@@ -200,6 +284,7 @@ class _Engine:
             zeros,
             zeros,
             zeros,
+            jnp.zeros(actions.shape[0], jnp.int32),
         )
 
         def step(carry, item):
@@ -213,6 +298,7 @@ class _Engine:
                 path,
                 control,
                 final_rewards,
+                collisions,
             ) = carry
             index, action = item
             active = (~success) & (index < limits)
@@ -220,8 +306,10 @@ class _Engine:
             control += jnp.where(active, jnp.square(action).sum(-1), 0)
 
             def repeat_step(repeat_index, inner):
-                current, values, distance, success, path = inner
-                next_state = self.adapter.advance(current, action, contract)
+                current, values, distance, success, path, collisions = inner
+                next_state, collided = self.adapter.advance(
+                    current, action, contract
+                )
                 next_values, next_distance, hit = self._metrics(
                     next_state, inputs['goal'], contract
                 )
@@ -233,20 +321,25 @@ class _Engine:
                 )
                 values = jnp.where(live[:, None], next_values, values)
                 distance = jnp.where(live, next_distance, distance)
+                collisions += (live & collided).astype(jnp.int32)
                 success |= live & hit
                 # Retain the full terminal simulator state so rendering and
                 # subsequent masked steps agree with the reported outcome.
                 current = retain_state(current, next_state, live)
-                return current, values, distance, success, path
+                return current, values, distance, success, path, collisions
 
-            state, values, distance, success, path = jax.lax.fori_loop(
-                0,
-                jnp.max(contract['repeat']),
-                repeat_step,
-                (state, values, distance, success, path),
+            state, values, distance, success, path, collisions = (
+                jax.lax.fori_loop(
+                    0,
+                    jnp.max(contract['repeat']),
+                    repeat_step,
+                    (state, values, distance, success, path, collisions),
+                )
             )
             reward = (
-                -distance
+                jnp.zeros_like(distance)
+                if self.name == 'two-rooms'
+                else -distance
                 if self.name == 'pusht'
                 else success.astype(jnp.float32)
             )
@@ -262,6 +355,7 @@ class _Engine:
                 path,
                 control,
                 final_rewards,
+                collisions,
             ), None
 
         final, _ = jax.lax.scan(
@@ -279,6 +373,7 @@ class _Engine:
             path,
             control,
             final_rewards,
+            collisions,
         ) = final
         return (
             values,
@@ -288,7 +383,7 @@ class _Engine:
             lengths,
             path,
             control,
-            jnp.zeros_like(lengths),
+            collisions,
             final_rewards,
         ), final[0]
 
@@ -391,9 +486,7 @@ class EnvXPool:
         if self._jax_device is None:
             self.set_device(self.device)
             os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
-            from .jax_two_rooms import JaxTwoRoomsRollout
-
-            JaxTwoRoomsRollout._validate_cuda_packages()
+            _validate_cuda_packages()
             try:
                 import envx
                 import jax
@@ -457,7 +550,9 @@ class EnvXPool:
             'history',
             'plugin_state',
         }
-        if self.name == 'pusht':
+        if self.name == 'two-rooms':
+            allowed = set(rows[0]) - {'qpos', 'qvel'}
+        elif self.name == 'pusht':
             allowed = {'time', 'last_action', 'n_contacts'}
         if extras[0] - allowed:
             raise ValueError(
@@ -497,14 +592,23 @@ class EnvXPool:
         _ = self.jax_device
         import jax
 
-        if any(
+        if self.name != 'two-rooms' and any(
             row.get('variation') or row.get('variation_values')
             for row in options
         ):
             raise NotImplementedError(
                 'envX task execution does not yet support Gym variations'
             )
-        self.rows = [task_inputs(self.name, row) for row in options]
+        if seed is None:
+            seed = [None] * self.num_envs
+        elif isinstance(seed, (int, np.integer)):
+            seed = [int(seed) + i for i in range(self.num_envs)]
+        if len(seed) != self.num_envs:
+            raise ValueError('reset requires one seed per task')
+        self.rows = [
+            task_inputs(self.name, row, seed=seed[i], config=self.envx_options)
+            for i, row in enumerate(options)
+        ]
         if len({row[2]['repeat'] for row in self.rows}) != 1:
             raise ValueError(
                 'envX task batches must share one physics repeat count'
@@ -516,13 +620,17 @@ class EnvXPool:
             )
             for key in self.rows[0][2]
         }
-        self.seeds = np.asarray(seed, np.int64)
+        self.seeds = np.asarray(
+            [0 if value is None else value for value in seed], np.int64
+        )
         inputs = self._inputs()
         engine = self._engine(self.num_envs)
         state = engine.restore(inputs)
         self._state = state
         self._steps = np.zeros(self.num_envs, np.int32)
         vector = torch.from_dlpack(engine.adapter.vector(state))
+        if self.name == 'two-rooms':
+            vector = vector[:, :2]
         info = {
             'state': vector[:, None],
             'action': np.zeros(
@@ -535,6 +643,12 @@ class EnvXPool:
         if self.name == 'cube':
             target = target[:, :3]
         info['target_state'] = target[:, None]
+        if self.name == 'two-rooms':
+            info['proprio'] = vector[:, None]
+            info['goal_state'] = target[:, None]
+            info['distance_to_target'] = torch.linalg.vector_norm(
+                vector - target, dim=-1
+            )[:, None]
         if not self.image_shape:
             info['goal'] = target[:, None]
         if self.image_shape:
@@ -545,14 +659,34 @@ class EnvXPool:
             ):
                 pixels = torch.from_dlpack(
                     renderer.render(
-                        renderer.restore(self._inputs(which=which))
+                        renderer.restore(self._inputs(which=which)),
+                        self._inputs(which=which),
                     )
                 )
+                pixels = self._resize_pixels(pixels)
                 info[key] = (transform(pixels) if transform else pixels)[
                     :, None
                 ]
         self._infos = info
         return None, info
+
+    def _resize_pixels(self, pixels):
+        if tuple(pixels.shape[1:3]) == tuple(self.image_shape):
+            return pixels
+        from torchvision.transforms.functional import InterpolationMode, resize
+
+        from stable_worldmodel.wrapper.default import _resolve_resample
+
+        mode = _resolve_resample(self.envx_options.get('image_resample'))
+        # PIL's default for RGB images is bicubic. Tensor interpolation keeps
+        # the common resize modes on the simulator device.
+        mode = InterpolationMode.BICUBIC if mode is None else mode
+        return resize(
+            pixels.permute(0, 3, 1, 2),
+            list(self.image_shape),
+            interpolation=mode,
+            antialias=True,
+        ).permute(0, 2, 3, 1)
 
     def step(self, actions, mask=None):
         import jax
@@ -588,6 +722,10 @@ class EnvXPool:
         vector, success, distance, rewards, *_ = (
             torch.from_dlpack(v) for v in values
         )
+        if self.name == 'two-rooms':
+            vector = vector[:, :2]
+        if self.name == 'two-rooms':
+            self._infos['proprio'] = vector[:, None]
         self._steps += active
         self._infos.update(
             state=vector[:, None],
@@ -601,7 +739,10 @@ class EnvXPool:
         )
         if self.image_shape:
             renderer = self._engine(self.num_envs, render=True)
-            pixels = torch.from_dlpack(renderer.render(self._state))
+            pixels = torch.from_dlpack(
+                renderer.render(self._state, self._inputs())
+            )
+            pixels = self._resize_pixels(pixels)
             self._infos['pixels'] = (
                 self.image_transform(pixels)
                 if self.image_transform
@@ -616,14 +757,21 @@ class EnvXPool:
         )
         return None, rewards.cpu().numpy(), terminated, truncated, self._infos
 
-    def rollout(self, actions, *, max_steps=None, limits=None):
+    def snapshot(self):
+        """Return immutable batched reset inputs, independent of later resets."""
+        if self.rows is None or self._closed:
+            raise RuntimeError(
+                'reset the open envX task pool before taking a snapshot'
+            )
+        return {'inputs': self._inputs(), 'contract': self._contract}
+
+    def rollout(
+        self, actions, *, initial_state=None, max_steps=None, limits=None
+    ):
         import jax
         import jax.numpy as jnp
 
-        if self.rows is None:
-            raise RuntimeError(
-                'reset the envX task pool before executing plans'
-            )
+        initial = self.snapshot() if initial_state is None else initial_state
         if (
             not torch.is_tensor(actions)
             or actions.device.type != self.device.type
@@ -653,6 +801,8 @@ class EnvXPool:
         limits = jnp.minimum(jax.device_put(limits, self.jax_device), limit)
         if limits.shape != (population, tasks):
             raise ValueError('plan limits must have shape (population, tasks)')
+        if any(value.shape[0] != tasks for value in jax.tree.leaves(initial)):
+            raise ValueError('snapshot must contain one row per task')
         plans = actions.detach().float().contiguous()
         # A contiguous Torch view can still begin at an unaligned storage
         # offset. XLA assumes aligned buffers; copy only such views.
@@ -662,10 +812,16 @@ class EnvXPool:
         engine = self._engine(population * tasks)
         contract = {
             key: jnp.tile(value, population)
-            for key, value in self._contract.items()
+            for key, value in initial['contract'].items()
         }
+        inputs = jax.tree.map(
+            lambda value: jnp.tile(
+                value, (population,) + (1,) * (value.ndim - 1)
+            ),
+            initial['inputs'],
+        )
         values, _ = engine.run(
-            self._inputs(repeat=population),
+            inputs,
             contract,
             jax.dlpack.from_dlpack(plans).reshape(
                 population * tasks, horizon, -1

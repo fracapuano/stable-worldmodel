@@ -8,6 +8,8 @@ TwoRoom Navigation Environment - Clean Torch-based Implementation (Refactored).
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import gymnasium as gym
 import numpy as np
 import torch
@@ -18,8 +20,160 @@ from stable_worldmodel import spaces as swm_spaces
 DEFAULT_VARIATIONS = ('agent.position', 'target.position')
 
 
+def make_variation_space():
+    """Shared seeded TwoRoom task specification for Gym and envX."""
+
+    def constrain_agent(position):
+        axis = int(space['wall']['axis'].value)
+        radius = float(space['agent']['radius'].value.item())
+        half = int(space['wall']['thickness'].value) // 2
+        coordinate = position[0 if axis == 1 else 1]
+        return not 112 - half - radius <= coordinate <= 112 + half + radius
+
+    def door_fits(sizes):
+        count = int(space['door']['number'].value)
+        radius = float(space['agent']['radius'].value.item())
+        return any(float(size) >= 1.1 * radius for size in sizes[:count])
+
+    # Valid position bounds: inside border with some padding for agent radius
+    pos_min = float(14)
+    pos_max = float(224 - 14 - 1)
+
+    space = swm_spaces.Dict(
+        {
+            'agent': swm_spaces.Dict(
+                {
+                    'color': swm_spaces.RGBBox(
+                        init_value=np.array([255, 0, 0], dtype=np.uint8)
+                    ),
+                    'radius': swm_spaces.Box(
+                        low=np.array([7.0], dtype=np.float32),
+                        high=np.array([14.0], dtype=np.float32),
+                        init_value=np.array([7.0], dtype=np.float32),
+                        shape=(1,),
+                        dtype=np.float32,
+                    ),
+                    'position': swm_spaces.Box(
+                        low=np.array([pos_min, pos_min], dtype=np.float32),
+                        high=np.array([pos_max, pos_max], dtype=np.float32),
+                        shape=(2,),
+                        dtype=np.float32,
+                        init_value=np.array([60.0, 112.0], dtype=np.float32),
+                        constrain_fn=constrain_agent,
+                    ),
+                    'speed': swm_spaces.Box(
+                        low=np.array([1.75], dtype=np.float32),
+                        high=np.array([10.5], dtype=np.float32),
+                        init_value=np.array([5.0], dtype=np.float32),
+                        shape=(1,),
+                        dtype=np.float32,
+                    ),
+                },
+                sampling_order=['color', 'radius', 'position', 'speed'],
+            ),
+            'target': swm_spaces.Dict(
+                {
+                    'color': swm_spaces.RGBBox(
+                        init_value=np.array([0, 255, 0], dtype=np.uint8)
+                    ),
+                    'radius': swm_spaces.Box(
+                        low=np.array([7.0], dtype=np.float32),
+                        high=np.array([14.0], dtype=np.float32),
+                        init_value=np.array([7.0], dtype=np.float32),
+                        shape=(1,),
+                        dtype=np.float32,
+                    ),
+                    'position': swm_spaces.Box(
+                        low=np.array([pos_min, pos_min], dtype=np.float32),
+                        high=np.array([pos_max, pos_max], dtype=np.float32),
+                        shape=(2,),
+                        dtype=np.float32,
+                        init_value=np.array([164.0, 112.0], dtype=np.float32),
+                        # The original target sampler has no constraint.
+                    ),
+                },
+                sampling_order=['color', 'radius', 'position'],
+            ),
+            'wall': swm_spaces.Dict(
+                {
+                    'color': swm_spaces.RGBBox(
+                        init_value=np.array([0, 0, 0], dtype=np.uint8)
+                    ),
+                    'thickness': swm_spaces.Discrete(
+                        35, start=7, init_value=10
+                    ),
+                    'axis': swm_spaces.Discrete(
+                        2, init_value=1
+                    ),  # 0: horizontal, 1: vertical
+                    'border_color': swm_spaces.RGBBox(
+                        init_value=np.array([0, 0, 0], dtype=np.uint8)
+                    ),
+                },
+                sampling_order=[
+                    'color',
+                    'border_color',
+                    'thickness',
+                    'axis',
+                ],
+            ),
+            'door': swm_spaces.Dict(
+                {
+                    'color': swm_spaces.RGBBox(
+                        init_value=np.array([255, 255, 255], dtype=np.uint8)
+                    ),
+                    'number': swm_spaces.Discrete(3, start=1, init_value=1),
+                    # door size is half-extent: range [1, 21] pixels
+                    'size': swm_spaces.MultiDiscrete(
+                        nvec=[21, 21, 21],
+                        start=[1, 1, 1],
+                        init_value=[14, 14, 14],
+                        constrain_fn=door_fits,
+                    ),
+                    # door position is center coord along wall: [0, 223]
+                    'position': swm_spaces.MultiDiscrete(
+                        nvec=[224, 224, 224],
+                        init_value=[49, 49, 49],
+                    ),
+                },
+                sampling_order=['color', 'number', 'size', 'position'],
+            ),
+            'background': swm_spaces.Dict(
+                {
+                    'color': swm_spaces.RGBBox(
+                        init_value=np.array([255, 255, 255], dtype=np.uint8)
+                    )
+                }
+            ),
+            'rendering': swm_spaces.Dict(
+                {'render_target': swm_spaces.Discrete(2, init_value=0)}
+            ),
+            'task': swm_spaces.Dict(
+                {
+                    'min_steps': swm_spaces.Discrete(
+                        100, start=15, init_value=25
+                    ),
+                }
+            ),
+        },
+        sampling_order=[
+            'background',
+            'wall',
+            'agent',
+            'door',
+            'task',
+            'target',
+            'rendering',
+        ],
+    )
+
+    return space
+
+
 class TwoRoomEnv(gym.Env):
-    metadata = {'render_modes': ['rgb_array'], 'render_fps': 10}
+    metadata: ClassVar[dict] = {
+        'render_modes': ['rgb_array'],
+        'render_fps': 10,
+    }
 
     # Fixed geometry for 224x224 (scale = 224/64 = 3.5)
     IMG_SIZE = 224
@@ -89,150 +243,7 @@ class TwoRoomEnv(gym.Env):
     # ---------------- Variation Space ----------------
 
     def _build_variation_space(self):
-        # Valid position bounds: inside border with some padding for agent radius
-        pos_min = float(self.BORDER_SIZE)
-        pos_max = float(self.IMG_SIZE - self.BORDER_SIZE - 1)
-
-        return swm_spaces.Dict(
-            {
-                'agent': swm_spaces.Dict(
-                    {
-                        'color': swm_spaces.RGBBox(
-                            init_value=np.array([255, 0, 0], dtype=np.uint8)
-                        ),
-                        'radius': swm_spaces.Box(
-                            low=np.array([7.0], dtype=np.float32),
-                            high=np.array([14.0], dtype=np.float32),
-                            init_value=np.array([7.0], dtype=np.float32),
-                            shape=(1,),
-                            dtype=np.float32,
-                        ),
-                        'position': swm_spaces.Box(
-                            low=np.array([pos_min, pos_min], dtype=np.float32),
-                            high=np.array(
-                                [pos_max, pos_max], dtype=np.float32
-                            ),
-                            shape=(2,),
-                            dtype=np.float32,
-                            init_value=np.array(
-                                [60.0, 112.0], dtype=np.float32
-                            ),
-                            constrain_fn=self._constrain_agent_not_in_wall,
-                        ),
-                        'speed': swm_spaces.Box(
-                            low=np.array([1.75], dtype=np.float32),
-                            high=np.array([10.5], dtype=np.float32),
-                            init_value=np.array([5.0], dtype=np.float32),
-                            shape=(1,),
-                            dtype=np.float32,
-                        ),
-                    },
-                    sampling_order=['color', 'radius', 'position', 'speed'],
-                ),
-                'target': swm_spaces.Dict(
-                    {
-                        'color': swm_spaces.RGBBox(
-                            init_value=np.array([0, 255, 0], dtype=np.uint8)
-                        ),
-                        'radius': swm_spaces.Box(
-                            low=np.array([7.0], dtype=np.float32),
-                            high=np.array([14.0], dtype=np.float32),
-                            init_value=np.array([7.0], dtype=np.float32),
-                            shape=(1,),
-                            dtype=np.float32,
-                        ),
-                        'position': swm_spaces.Box(
-                            low=np.array([pos_min, pos_min], dtype=np.float32),
-                            high=np.array(
-                                [pos_max, pos_max], dtype=np.float32
-                            ),
-                            shape=(2,),
-                            dtype=np.float32,
-                            init_value=np.array(
-                                [164.0, 112.0], dtype=np.float32
-                            ),
-                            # constrain_fn=self._constrain_target_by_min_steps,
-                        ),
-                    },
-                    sampling_order=['color', 'radius', 'position'],
-                ),
-                'wall': swm_spaces.Dict(
-                    {
-                        'color': swm_spaces.RGBBox(
-                            init_value=np.array([0, 0, 0], dtype=np.uint8)
-                        ),
-                        'thickness': swm_spaces.Discrete(
-                            35, start=7, init_value=10
-                        ),
-                        'axis': swm_spaces.Discrete(
-                            2, init_value=1
-                        ),  # 0: horizontal, 1: vertical
-                        'border_color': swm_spaces.RGBBox(
-                            init_value=np.array([0, 0, 0], dtype=np.uint8)
-                        ),
-                    },
-                    sampling_order=[
-                        'color',
-                        'border_color',
-                        'thickness',
-                        'axis',
-                    ],
-                ),
-                'door': swm_spaces.Dict(
-                    {
-                        'color': swm_spaces.RGBBox(
-                            init_value=np.array(
-                                [255, 255, 255], dtype=np.uint8
-                            )
-                        ),
-                        'number': swm_spaces.Discrete(
-                            3, start=1, init_value=1
-                        ),
-                        # door size is half-extent: range [1, 21] pixels
-                        'size': swm_spaces.MultiDiscrete(
-                            nvec=[21, 21, 21],
-                            start=[1, 1, 1],
-                            init_value=[14, 14, 14],
-                            constrain_fn=self._check_door_fit,
-                        ),
-                        # door position is center coord along wall: [0, 223]
-                        'position': swm_spaces.MultiDiscrete(
-                            nvec=[224, 224, 224],
-                            init_value=[49, 49, 49],
-                        ),
-                    },
-                    sampling_order=['color', 'number', 'size', 'position'],
-                ),
-                'background': swm_spaces.Dict(
-                    {
-                        'color': swm_spaces.RGBBox(
-                            init_value=np.array(
-                                [255, 255, 255], dtype=np.uint8
-                            )
-                        )
-                    }
-                ),
-                'rendering': swm_spaces.Dict(
-                    {'render_target': swm_spaces.Discrete(2, init_value=0)}
-                ),
-                'task': swm_spaces.Dict(
-                    {
-                        'min_steps': swm_spaces.Discrete(
-                            100, start=15, init_value=25
-                        ),
-                    }
-                ),
-            },
-            sampling_order=[
-                'background',
-                'wall',
-                'agent',
-                'door',
-                'task',
-                'target',
-                'rendering',
-            ],
-        )
+        return make_variation_space()
 
     # ---------------- Gym API ----------------
 
@@ -549,39 +560,6 @@ class TwoRoomEnv(gym.Env):
         return result
 
     # ---------------- Constraint ----------------
-
-    def _constrain_agent_not_in_wall(self, agent_pos):
-        """
-        Ensure agent position is not inside the wall (unless in a door).
-        Agent can start in either room.
-        """
-        wall_axis = int(self.variation_space['wall']['axis'].value)
-        wall_thickness = int(self.variation_space['wall']['thickness'].value)
-        half_thickness = wall_thickness // 2
-        agent_r = float(self.variation_space['agent']['radius'].value.item())
-
-        # Effective wall zone including agent radius
-        wall_min = self.WALL_CENTER - half_thickness - agent_r
-        wall_max = self.WALL_CENTER + half_thickness + agent_r
-
-        if wall_axis == 1:  # vertical wall
-            # Check if agent x is in wall zone
-            if wall_min <= agent_pos[0] <= wall_max:
-                return False  # Agent would be in wall
-        else:  # horizontal wall
-            # Check if agent y is in wall zone
-            if wall_min <= agent_pos[1] <= wall_max:
-                return False  # Agent would be in wall
-
-        return True
-
-    def _check_door_fit(self, sizes):
-        """
-        Ensure at least one door half-extent can fit agent radius.
-        """
-        num = int(self.variation_space['door']['number'].value)
-        agent_r = float(self.variation_space['agent']['radius'].value.item())
-        return any(float(s) >= 1.1 * agent_r for s in sizes[:num])
 
     def _constrain_target_by_min_steps(self, target_pos):
         """

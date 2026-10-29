@@ -21,7 +21,6 @@ from stable_worldmodel.planning import (
     GoalMSE,
     ShootingCostEvaluator,
 )
-from stable_worldmodel.world.jax_two_rooms import JaxTwoRoomsRollout
 
 pytestmark = pytest.mark.skipif(
     find_spec('envx') is None,
@@ -178,14 +177,9 @@ def test_jax_rollout_uses_torch_dlpack_and_preserves_task_state() -> None:
     protocol = _protocol()
     try:
         world._reset_from_protocol(protocol, eval_budget=4)
-        rollout = JaxTwoRoomsRollout(
-            population_size=3,
-            num_tasks=2,
-            eval_budget=4,
-        )
-        initial_state = rollout.initial_state(world)
+        initial_state = world.envs.snapshot()
         actions = torch.zeros(3, 2, 4, 2)
-        outcome = rollout(initial_state, actions)
+        outcome = world.envs.rollout(actions, initial_state=initial_state)
 
         starts = torch.tensor([task.start for task in protocol.tasks])
         goals = torch.tensor([task.goal for task in protocol.tasks])
@@ -236,12 +230,7 @@ def test_many_worlds_envx_returns_device_resident_population_scores() -> None:
         # envX outcomes belong to the result object; they must not be published
         # as the state of Gym environments which were never stepped.
         starts = np.asarray([task.start for task in _protocol().tasks])
-        actual = np.stack(
-            [
-                np.asarray(wrapped.unwrapped.agent_position)
-                for wrapped in worlds[0].envs.envs
-            ]
-        )
+        actual = np.asarray(worlds[0].envs.snapshot()['inputs']['qpos'])
         np.testing.assert_allclose(actual, starts)
         np.testing.assert_allclose(
             np.asarray(worlds[0].infos['state'])[:, -1], starts
@@ -510,7 +499,7 @@ def test_many_worlds_rejects_numpy_action_postprocessing() -> None:
     worlds = [_world(1.0, process=process), _world(-1.0, process=process)]
     many = swm.ManyWorlds(worlds=worlds)
     try:
-        with pytest.raises(TypeError, match='must return a torch.Tensor'):
+        with pytest.raises(TypeError, match='torch.Tensor'):
             many.evaluate(
                 _protocol(), solver=worlds[0].policy.solver, eval_budget=2
             )

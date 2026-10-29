@@ -243,7 +243,10 @@ def test_first_success_inside_repeated_control_freezes_outcome():
     engine.adapter = SimpleNamespace(
         restore=lambda inputs: jnp.zeros((1, 2)),
         vector=lambda state: state,
-        advance=lambda state, action, contract: state + action,
+        advance=lambda state, action, contract: (
+            state + action,
+            jnp.zeros(state.shape[0], dtype=bool),
+        ),
     )
     result, simulator_state = engine._run(
         {'goal': jnp.asarray([[0.1, 0.0]])},
@@ -1257,4 +1260,61 @@ def test_mixed_physics_intervals_are_rejected():
         with pytest.raises(ValueError, match='share one physics repeat'):
             world._reset_from_protocol(p, 4)
     finally:
+        world.close()
+
+
+@integration
+@pytest.mark.parametrize('name', ['two-room', 'pusht', 'reacher', 'cube'])
+def test_manyworlds_accepts_prepared_inputs_without_reset_or_render(
+    name, monkeypatch
+):
+    if name in ('reacher', 'cube') and DEVICE == 'cpu':
+        pytest.skip('MJX integration requires CUDA')
+    p = protocol(name)
+    world = world_for(p, pixels=True)
+    solver = attach_policy(world)
+    many = swm.ManyWorlds.from_population(world, population_size=2)
+    population = RepeatedPopulation(solver.cost.model, 2)
+    try:
+        protocols = (p, p)
+        expected = many.evaluate(
+            protocols, solver=solver, population=population, eval_budget=4
+        )
+        info, _ = many._reset_member_protocols(protocols)
+        snapshot = many._member_envs.snapshot()
+
+        def unexpected(*args, **kwargs):
+            pytest.fail('prepared evaluation must not reset or render tasks')
+
+        monkeypatch.setattr(many._member_envs, 'reset', unexpected)
+        monkeypatch.setattr(world.envs, 'reset', unexpected)
+        actual = many.evaluate(
+            protocols,
+            solver=solver,
+            population=population,
+            eval_budget=4,
+            prepared_info=info,
+            initial_state=snapshot,
+        )
+        torch.testing.assert_close(
+            actual.planned_actions, expected.planned_actions
+        )
+        torch.testing.assert_close(
+            actual.task_final_distances,
+            expected.task_final_distances,
+            atol=1e-3,
+            rtol=0,
+        )
+        assert many.bootstrap_simulator_count == 0
+        with pytest.raises(ValueError, match='supplied together'):
+            many.evaluate(protocols, solver=solver, prepared_info=info)
+        with pytest.raises(ValueError, match='population and task axes'):
+            many.evaluate(
+                protocols,
+                solver=solver,
+                initial_state=snapshot,
+                prepared_info={'state': torch.zeros(1)},
+            )
+    finally:
+        many.close()
         world.close()

@@ -1,4 +1,5 @@
 import json
+from importlib.util import find_spec
 
 import numpy as np
 import pytest
@@ -74,27 +75,33 @@ class ZeroPolicy:
         return np.zeros(self.env.action_space.shape, dtype=np.float32)
 
 
+@pytest.mark.skipif(
+    find_spec('envx') is None, reason='optional envX dependency'
+)
 @pytest.mark.parametrize('workflow', ['records', 'video'])
-def test_two_room_rejects_unaccelerated_protocol_workflows(tmp_path, workflow):
+def test_two_room_supports_recording_and_video(tmp_path, workflow):
     protocol = make_protocol()
     world = swm.World(
         protocol.environment,
         num_envs=1,
         image_shape=(32, 32),
         max_episode_steps=10,
+        device='cpu',
     )
     world.set_policy(ZeroPolicy())
     try:
-        with pytest.raises(NotImplementedError, match='complete FastCEM'):
-            world.evaluate(
-                protocol=protocol,
-                eval_budget=2,
-                record=workflow == 'records',
-                video=tmp_path if workflow == 'video' else None,
-                backend='zero',
-            )
+        result = world.evaluate(
+            protocol=protocol,
+            eval_budget=2,
+            record=workflow == 'records',
+            video=tmp_path if workflow == 'video' else None,
+            backend='zero',
+        )
         assert world.execution_backend == 'envx'
-        assert not list(tmp_path.iterdir())
+        assert len(result.episodes) == 1
+        assert result.episodes[0].length == 2
+        if workflow == 'video':
+            assert list(tmp_path.iterdir())
     finally:
         world.close()
 
