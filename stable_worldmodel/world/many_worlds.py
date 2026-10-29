@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from importlib.util import find_spec
 from typing import Any
 
@@ -143,6 +143,7 @@ class ManyWorlds:
         *,
         model_names: Sequence[str] | None = None,
         population_size: int | None = None,
+        task_pool: EvaluationProtocol | None = None,
     ) -> None:
         worlds = tuple(worlds)
         if not worlds:
@@ -182,6 +183,22 @@ class ManyWorlds:
         self._member_envs = None
         self._closed = False
         self._bootstrap_simulator_count = self.num_tasks
+        # A fixed pool bounds the cache and keeps its ownership with evaluation.
+        # Preprocessing must remain fixed for the lifetime of this instance.
+        self._task_pool = task_pool
+        self._task_cache = None
+        self._task_indices = {}
+        if task_pool is not None:
+            if task_pool.environment != self.worlds[0].env_name:
+                raise ValueError('task pool environment differs from World')
+            self._task_indices = {
+                replace(task, _legacy_key=None).key: index
+                for index, task in enumerate(task_pool.tasks)
+            }
+            if len(self._task_indices) != len(task_pool.tasks):
+                raise ValueError(
+                    'task pool contains duplicate task identities'
+                )
 
         if model_names is None:
             model_names = (
@@ -222,11 +239,19 @@ class ManyWorlds:
         *,
         population_size: int,
         model_names: Sequence[str] | None = None,
+        task_pool: EvaluationProtocol | None = None,
     ) -> Self:
+        """Evaluate a population, optionally reusing a fixed pool's task inputs.
+
+        With task_pool, reset/render/preprocessing run once for that pool.
+        Model-dependent embeddings, plans and outcomes are always recomputed.
+        Recreate ManyWorlds if task preparation or preprocessing changes.
+        """
         return cls(
             worlds=(world,),
             model_names=model_names,
             population_size=population_size,
+            task_pool=task_pool,
         )
 
     def _common_episode_limit(self) -> int:
@@ -323,6 +348,7 @@ class ManyWorlds:
             self._member_envs = None
         for world in self.worlds:
             world.close()
+        self._task_cache = None
         self._closed = True
 
     def _validate_world_shapes(self) -> None:
@@ -578,8 +604,7 @@ class ManyWorlds:
     def _reset_member_protocols(self, protocols):
         """Return observations and rollout state for all P*T tasks.
 
-        The native pool owns its reset state, so its explicit state is None.
-        Prepared-task implementations can return a state snapshot instead.
+        The native pool retains its reset inputs for the ensuing rollout.
         """
         self._bootstrap_simulator_count = self.simulator_count
         if self._member_envs is None:
@@ -608,6 +633,101 @@ class ManyWorlds:
         }
         return info, None
 
+    def _reset_cached_protocols(self, protocols):
+        """Select matching observations and starting inputs from the fixed pool."""
+        if any(
+            protocol.environment != self._task_pool.environment
+            or len(protocol.tasks) != self.num_tasks
+            for protocol in protocols
+        ):
+            raise ValueError(
+                'protocols must match the World environment and task count'
+            )
+        tasks = tuple(
+            task for protocol in protocols for task in protocol.tasks
+        )
+        try:
+            indices = np.asarray(
+                [
+                    self._task_indices[replace(task, _legacy_key=None).key]
+                    for task in tasks
+                ],
+                dtype=np.int64,
+            ).reshape(self.population_size, self.num_tasks)
+        except KeyError as error:
+            raise ValueError(
+                'assigned task differs from the fixed task pool'
+            ) from error
+
+        self._bootstrap_simulator_count = 0
+        if self._task_cache is None:
+            pool = self.envs._with_num_envs(len(self._task_pool.tasks))
+            try:
+                _, raw = pool.reset(
+                    seed=[
+                        task.environment_seed for task in self._task_pool.tasks
+                    ],
+                    options=[
+                        World._task_reset_options(task)
+                        for task in self._task_pool.tasks
+                    ],
+                )
+                prepared = self.policies[0]._prepare_info(raw)
+                info = {}
+                for key, value in prepared.items():
+                    if key == 'controller_seed':
+                        continue
+                    if key == 'render_time':
+                        value = torch.zeros_like(value)
+                    if torch.is_tensor(value):
+                        info[key] = value.to(self.envs.device).clone()
+                    elif isinstance(value, np.ndarray):
+                        info[key] = value.copy()
+                self._task_cache = (info, pool.snapshot())
+                self._bootstrap_simulator_count = len(self._task_pool.tasks)
+            finally:
+                pool.close()
+
+        import jax
+
+        cached_info, cached_state = self._task_cache
+        shared = bool(np.all(indices == indices[:1]))
+        observation_indices = indices[0] if shared else indices.reshape(-1)
+        torch_indices = torch.as_tensor(
+            observation_indices, device=self.envs.device
+        )
+        info = {}
+        for key, value in cached_info.items():
+            selected = (
+                value.index_select(0, torch_indices)
+                if torch.is_tensor(value)
+                else value[observation_indices].copy()
+            )
+            if shared:
+                shape = (self.population_size, *selected.shape)
+                selected = (
+                    selected.unsqueeze(0).expand(shape)
+                    if torch.is_tensor(selected)
+                    else np.broadcast_to(selected, shape)
+                )
+            else:
+                selected = selected.reshape(
+                    self.population_size, self.num_tasks, *selected.shape[1:]
+                )
+            info[key] = selected
+        info['controller_seed'] = np.asarray(
+            [task.controller_seed for task in tasks], dtype=np.int64
+        ).reshape(self.population_size, self.num_tasks, 1)
+        jax_indices = jax.device_put(indices.reshape(-1), self.envs.jax_device)
+        initial_state = jax.tree.map(
+            lambda value: value[jax_indices], cached_state
+        )
+        if self._member_envs is None:
+            self._member_envs = self.envs._with_num_envs(self.simulator_count)
+        for policy in self.policies:
+            policy.reset_state()
+        return info, initial_state
+
     def _rollout_member_plans(self, initial_state, actions):
         """Execute plans with the state returned by _reset_member_protocols."""
         if initial_state is None:
@@ -623,8 +743,6 @@ class ManyWorlds:
         population: PopulationModel | None,
         eval_budget: int,
         record: bool,
-        prepared_info=None,
-        initial_state=None,
     ) -> ManyWorldsEvaluationResults:
         """Plan once and score every full plan in one compiled envX rollout."""
         if record:
@@ -637,21 +755,16 @@ class ManyWorlds:
                 f'{self.config.plan_len}'
             )
 
+        initial_state = None
         member_tasks = not isinstance(protocol, EvaluationProtocol)
         protocols = (
             tuple(protocol)
             if member_tasks
             else (protocol,) * self.population_size
         )
-        if prepared_info is not None:
-            info = prepared_info
-            if self._member_envs is None:
-                self._member_envs = self.envs._with_num_envs(
-                    self.simulator_count
-                )
-            self._bootstrap_simulator_count = 0
-            for policy in self.policies:
-                policy.reset_state()
+        if self._task_pool is not None:
+            info, initial_state = self._reset_cached_protocols(protocols)
+            member_tasks = True
         elif member_tasks:
             info, initial_state = self._reset_member_protocols(protocols)
         else:
@@ -784,8 +897,6 @@ class ManyWorlds:
         population: PopulationModel | None = None,
         eval_budget: int | None = None,
         record: bool = False,
-        prepared_info=None,
-        initial_state=None,
     ) -> ManyWorldsEvaluationResults:
         """Evaluate all Worlds with population-batched FastCEM.
 
@@ -795,28 +906,11 @@ class ManyWorlds:
         tasks, or P protocols to assign one fixed-size task minibatch per
         member. Results retain the input member/task ordering. Call ``close``
         to release the additional task pool used by per-member protocols.
-        Supply prepared_info with (population, task, ...) observations and a
-        matching EnvXPool.snapshot() to skip task reset and rendering. The
-        snapshot rows must follow member-major/task-minor protocol ordering.
+        When constructed with task_pool, task inputs are prepared once and
+        selected internally; evaluate receives only the assigned protocols.
         """
         if self._closed or any(world._closed for world in self.worlds):
             raise RuntimeError('ManyWorlds or its input World is closed')
-        if (prepared_info is None) != (initial_state is None):
-            raise ValueError(
-                'prepared_info and initial_state must be supplied together'
-            )
-        if prepared_info is not None:
-            if isinstance(protocol, EvaluationProtocol):
-                raise ValueError(
-                    'prepared inputs require one protocol per population member'
-                )
-            for value in prepared_info.values():
-                if not isinstance(value, (torch.Tensor, np.ndarray)) or tuple(
-                    value.shape[:2]
-                ) != (self.population_size, self.num_tasks):
-                    raise ValueError(
-                        'prepared observations must have population and task axes'
-                    )
         if not isinstance(protocol, EvaluationProtocol):
             if not isinstance(protocol, Sequence) or not all(
                 isinstance(item, EvaluationProtocol) for item in protocol
@@ -863,8 +957,6 @@ class ManyWorlds:
             population=population,
             eval_budget=eval_budget,
             record=record,
-            prepared_info=prepared_info,
-            initial_state=initial_state,
         )
 
 

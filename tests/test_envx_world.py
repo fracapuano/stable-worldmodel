@@ -22,7 +22,12 @@ from stable_worldmodel.planning import (
     GoalMSE,
     ShootingCostEvaluator,
 )
-from stable_worldmodel.world.envx import ENVIRONMENTS, _Engine, task_inputs
+from stable_worldmodel.world.envx import (
+    ENVIRONMENTS,
+    EnvXPool,
+    _Engine,
+    task_inputs,
+)
 
 HAS_ENVX = find_spec('envx') is not None
 DEVICE = os.environ.get('SWM_ENVX_TEST_DEVICE', 'cpu')
@@ -1265,7 +1270,7 @@ def test_mixed_physics_intervals_are_rejected():
 
 @integration
 @pytest.mark.parametrize('name', ['two-room', 'pusht', 'reacher', 'cube'])
-def test_manyworlds_accepts_prepared_inputs_without_reset_or_render(
+def test_fixed_task_pool_reuses_preparation_with_ordinary_evaluate(
     name, monkeypatch
 ):
     if name in ('reacher', 'cube') and DEVICE == 'cpu':
@@ -1273,48 +1278,167 @@ def test_manyworlds_accepts_prepared_inputs_without_reset_or_render(
     p = protocol(name)
     world = world_for(p, pixels=True)
     solver = attach_policy(world)
-    many = swm.ManyWorlds.from_population(world, population_size=2)
+    baseline = swm.ManyWorlds.from_population(world, population_size=2)
+    cached = swm.ManyWorlds.from_population(
+        world, population_size=2, task_pool=p
+    )
     population = RepeatedPopulation(solver.cost.model, 2)
+    protocols = (p, p)
     try:
-        protocols = (p, p)
-        expected = many.evaluate(
-            protocols, solver=solver, population=population, eval_budget=4
-        )
-        info, _ = many._reset_member_protocols(protocols)
-        snapshot = many._member_envs.snapshot()
-
-        def unexpected(*args, **kwargs):
-            pytest.fail('prepared evaluation must not reset or render tasks')
-
-        monkeypatch.setattr(many._member_envs, 'reset', unexpected)
-        monkeypatch.setattr(world.envs, 'reset', unexpected)
-        actual = many.evaluate(
+        expected = baseline.evaluate(
             protocols,
             solver=solver,
             population=population,
             eval_budget=4,
-            prepared_info=info,
-            initial_state=snapshot,
         )
-        torch.testing.assert_close(
-            actual.planned_actions, expected.planned_actions
+        first = cached.evaluate(
+            protocols,
+            solver=solver,
+            population=population,
+            eval_budget=4,
         )
-        torch.testing.assert_close(
-            actual.task_final_distances,
-            expected.task_final_distances,
-            atol=1e-3,
-            rtol=0,
+        assert cached.bootstrap_simulator_count == len(p.tasks)
+
+        def unexpected(*args, **kwargs):
+            pytest.fail(
+                'warm cached evaluation must not reset, render or preprocess'
+            )
+
+        monkeypatch.setattr(EnvXPool, 'reset', unexpected)
+        monkeypatch.setattr(world.policy, '_prepare_info', unexpected)
+        # Both shared and per-member protocol forms keep the ordinary interface.
+        for assigned in (protocols, p):
+            actual = cached.evaluate(
+                assigned,
+                solver=solver,
+                population=population,
+                eval_budget=4,
+            )
+            torch.testing.assert_close(
+                actual.planned_actions, expected.planned_actions
+            )
+            torch.testing.assert_close(
+                actual.task_final_distances,
+                expected.task_final_distances,
+                atol=1e-3,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                actual.task_successes, first.task_successes
+            )
+            assert cached.bootstrap_simulator_count == 0
+    finally:
+        cached.close()
+        baseline.close()
+    assert cached._task_cache is None
+
+
+@integration
+def test_task_cache_selects_matching_state_and_keeps_controller_rng_fresh():
+    p = protocol('two-room')
+    world = world_for(p, pixels=True)
+    attach_policy(world)
+    many = swm.ManyWorlds.from_population(
+        world, population_size=2, task_pool=p
+    )
+    try:
+        first_info, first_state = many._reset_cached_protocols((p, p))
+        original = many._task_cache[0]['state'].clone()
+        changed = replace(
+            p,
+            tasks=tuple(
+                replace(
+                    task,
+                    controller_seed=100 + i,
+                    _legacy_key=task._full_content_key,
+                )
+                for i, task in enumerate(p.tasks[::-1])
+            ),
+        )
+        second_info, second_state = many._reset_cached_protocols(
+            (changed, changed)
         )
         assert many.bootstrap_simulator_count == 0
-        with pytest.raises(ValueError, match='supplied together'):
-            many.evaluate(protocols, solver=solver, prepared_info=info)
-        with pytest.raises(ValueError, match='population and task axes'):
-            many.evaluate(
-                protocols,
-                solver=solver,
-                initial_state=snapshot,
-                prepared_info={'state': torch.zeros(1)},
-            )
+        assert second_info['controller_seed'][0, :, 0].tolist() == [100, 101]
+        assert not np.array_equal(
+            first_state['inputs']['qpos'], second_state['inputs']['qpos']
+        )
+        actions = torch.zeros(1, 4, 4, 2, device=DEVICE)
+        expected = many._member_envs.rollout(
+            actions, initial_state=first_state
+        )
+        other = many._member_envs.rollout(actions, initial_state=second_state)
+        actual = many._member_envs.rollout(actions, initial_state=first_state)
+        assert not torch.equal(
+            other.final_observations, expected.final_observations
+        )
+        torch.testing.assert_close(
+            actual.final_observations, expected.final_observations
+        )
+        first_info['state'][0].zero_()
+        torch.testing.assert_close(many._task_cache[0]['state'], original)
+        assert first_info['controller_seed'][0, :, 0].tolist() == list(
+            p.controller_seeds
+        )
     finally:
         many.close()
+
+
+@integration
+@pytest.mark.parametrize(
+    'field,value',
+    [
+        ('environment_seed', 90),
+        ('observation_noise_seed', 90),
+        ('start', (30.0, 30.0)),
+        ('options', (('different', 1),)),
+        ('dynamics_parameters', (('different', 1),)),
+    ],
+)
+def test_task_cache_rejects_changed_task_before_preparing(
+    field, value, monkeypatch
+):
+    p = protocol('two-room')
+    world = world_for(p)
+    attach_policy(world)
+    many = swm.ManyWorlds.from_population(
+        world, population_size=2, task_pool=p
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('unknown tasks must be rejected before preparation')
+
+    monkeypatch.setattr(EnvXPool, 'reset', unexpected)
+    changed = replace(
+        p, tasks=(replace(p.tasks[0], **{field: value}), p.tasks[1])
+    )
+    try:
+        with pytest.raises(
+            ValueError, match='differs from the fixed task pool'
+        ):
+            many._reset_cached_protocols((p, changed))
+        assert many._task_cache is None
+    finally:
+        many.close()
+
+
+@integration
+def test_task_cache_rejects_wrong_environment_and_duplicate_identities():
+    p = protocol('two-room')
+    world = world_for(p)
+    attach_policy(world)
+    try:
+        with pytest.raises(ValueError, match='environment differs'):
+            swm.ManyWorlds.from_population(
+                world, population_size=2, task_pool=protocol('pusht')
+            )
+        first = replace(p.tasks[0], _legacy_key=p.tasks[0]._full_content_key)
+        second = replace(p.tasks[0], controller_seed=999)
+        second = replace(second, _legacy_key=second._full_content_key)
+        duplicates = replace(p, tasks=(first, second))
+        with pytest.raises(ValueError, match='duplicate task identities'):
+            swm.ManyWorlds.from_population(
+                world, population_size=2, task_pool=duplicates
+            )
+    finally:
         world.close()
