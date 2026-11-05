@@ -502,9 +502,9 @@ class WorldModelPolicy(BasePolicy):
 
             solver_options = {}
             if return_tensor:
-                from stable_worldmodel.planning import FastCEMSolver
+                from stable_worldmodel.planning import PopulationSolver
 
-                if isinstance(self.solver, FastCEMSolver):
+                if isinstance(self.solver, PopulationSolver):
                     solver_options['return_tensors'] = True
             outputs = self.solver(
                 sliced, init_action=sliced_init, **solver_options

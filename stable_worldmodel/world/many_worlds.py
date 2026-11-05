@@ -1,4 +1,4 @@
-"""Population evaluation of multiple weight-bound Worlds with FastCEM."""
+"""Population evaluation of multiple weight-bound Worlds."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from stable_worldmodel.evaluation import (
     EvaluationResults,
 )
 from stable_worldmodel.evaluation.records import episodes_from_rollout
-from stable_worldmodel.planning import FastCEMSolver
+from stable_worldmodel.planning import PopulationSolver
 from stable_worldmodel.policy import WorldModelPolicy
 from stable_worldmodel.protocols import PopulationModel
 
@@ -77,7 +77,7 @@ class ManyWorldsEvaluationResults:
     model_names: tuple[str, ...]
     planned_actions: torch.Tensor
     planner_costs: torch.Tensor
-    planner_variances: torch.Tensor
+    planner_variances: torch.Tensor | None
     environment_actions: torch.Tensor
     evaluations: tuple[EvaluationResults, ...]
     compiled: bool
@@ -125,9 +125,9 @@ class ManyWorlds:
     """Evaluate weight-bound Worlds in one envX population run.
 
     Each input ``World`` must already have a ``WorldModelPolicy`` backed by a
-    compatible ``FastCEMSolver``. This preserves the invariant that one World
+    compatible ``PopulationSolver``. This preserves the invariant that one World
     owns one concrete model instance and weight set. ``evaluate`` replaces the
-    individual solver calls with one population FastCEM graph and executes the
+    individual solver calls with one population solver call and executes the
     complete plans in one open-loop envX rollout. All population members and
     tasks execute together; device allocation failures propagate to the caller.
 
@@ -276,9 +276,9 @@ class ManyWorlds:
                 'each World must have an attached WorldModelPolicy before it '
                 'is passed to ManyWorlds'
             )
-        if not isinstance(policy.solver, FastCEMSolver):
+        if not isinstance(policy.solver, PopulationSolver):
             raise TypeError(
-                'each World policy must use FastCEMSolver so its model and '
+                'each World policy must use PopulationSolver so its model and '
                 'planning configuration are explicit'
             )
         return policy
@@ -288,7 +288,7 @@ class ManyWorlds:
         model = getattr(policy.solver.cost, 'model', None)
         if not isinstance(model, nn.Module):
             raise TypeError(
-                'each FastCEM cost must expose its world model as cost.model'
+                'each solver cost must expose its world model as cost.model'
             )
         return model
 
@@ -359,7 +359,7 @@ class ManyWorlds:
         first_space = first_world.envs.single_action_space
         if not isinstance(first_space, gym.spaces.Box):
             raise TypeError(
-                'population FastCEM requires a continuous Box action space'
+                'population planning requires a continuous Box action space'
             )
 
         for index, (world, policy, model) in enumerate(
@@ -396,31 +396,24 @@ class ManyWorlds:
                 raise TypeError(
                     'all world models must have the same concrete type'
                 )
-            for attribute in (
-                'batch_size',
-                'num_samples',
-                'var_scale',
-                'n_steps',
-                'topk',
-                'device',
-                'dtype',
+            if (
+                type(policy.solver) is not type(first_solver)
+                or policy.solver.population_config
+                != first_solver.population_config
             ):
-                if getattr(policy.solver, attribute) != getattr(
-                    first_solver, attribute
-                ):
-                    raise ValueError(
-                        f'all Worlds must use the same FastCEM {attribute}'
-                    )
+                raise ValueError(
+                    'all Worlds must use the same population solver configuration'
+                )
 
     def _validate_population(
         self,
-        solver: FastCEMSolver,
+        solver: PopulationSolver,
         population: PopulationModel | None,
     ) -> None:
-        if not isinstance(solver, FastCEMSolver):
-            raise TypeError('solver must be a FastCEMSolver')
-        if getattr(solver._tensor_cost, 'model', None) is not self.models[0]:
-            raise ValueError("solver must use the first World's FastCEM model")
+        if not isinstance(solver, PopulationSolver):
+            raise TypeError('solver must implement PopulationSolver')
+        if getattr(solver.cost, 'model', None) is not self.models[0]:
+            raise ValueError("solver must use the first World's model")
         if population is not None:
             if population.population_size != self.population_size:
                 raise ValueError(
@@ -523,15 +516,15 @@ class ManyWorlds:
             }
             actions = output['actions'][world_index]
             solver_output = {
+                **output,
                 'actions': actions,
                 'costs': output['costs'][world_index],
-                'mean': [output['mean'][0][world_index]],
-                'var': [output['var'][0][world_index]],
-                'compiled': output['compiled'],
-                'compile_error': output['compile_error'],
-                'population_backend': output['population_backend'],
-                'solve_time_seconds': output['solve_time_seconds'],
             }
+            for key in ('mean', 'var'):
+                if key in output:
+                    solver_output[key] = [
+                        value[world_index] for value in output[key]
+                    ]
             event = {
                 'env_indices': tuple(range(self.num_tasks)),
                 'controller_input': controller_input,
@@ -739,7 +732,7 @@ class ManyWorlds:
         self,
         protocol: EvaluationProtocol | Sequence[EvaluationProtocol],
         *,
-        solver: FastCEMSolver,
+        solver: PopulationSolver,
         population: PopulationModel | None,
         eval_budget: int,
         record: bool,
@@ -771,36 +764,12 @@ class ManyWorlds:
             info = self._reset_envx(
                 protocol, eval_budget, expand_population=population is None
             )
-        seeds = info.get('controller_seed')
-        noise_tasks = (
-            self.population_size * self.num_tasks
-            if member_tasks
-            else self.num_tasks
-        )
-        if seeds is not None:
-            if member_tasks:
-                seeds = seeds.reshape(noise_tasks, 1)
-            elif population is None:
-                seeds = seeds[0]
-        noise = solver._batch_noise(
-            noise_tasks,
-            0,
-            seeds,
-            np.zeros((noise_tasks, 1), dtype=np.int64),
-        )
         solver_options = {}
         if member_tasks:
-            noise = noise.reshape(
-                solver.n_steps,
-                self.population_size,
-                self.num_tasks,
-                *noise.shape[2:],
-            ).movedim(1, 0)
             solver_options['population_in_dims'] = 0
         output = solver.solve_population(
             info,
             self.models if population is None else population,
-            noise=noise,
             **solver_options,
         )
         planned = output['actions']
@@ -876,12 +845,14 @@ class ManyWorlds:
             model_names=self.model_names,
             planned_actions=planned.unsqueeze(0),
             planner_costs=output['costs'].unsqueeze(0),
-            planner_variances=output['var'][0].unsqueeze(0),
+            planner_variances=output['var'][0].unsqueeze(0)
+            if 'var' in output
+            else None,
             environment_actions=actions,
             evaluations=evaluations,
-            compiled=bool(output['compiled']),
-            compile_error=output['compile_error'],
-            population_backend=output['population_backend'] or 'unknown',
+            compiled=bool(output.get('compiled', False)),
+            compile_error=output.get('compile_error'),
+            population_backend=output.get('population_backend') or 'unknown',
             task_successes=outcome.successes,
             task_final_distances=outcome.final_distances,
             scores=scores,
@@ -893,12 +864,12 @@ class ManyWorlds:
         self,
         protocol: EvaluationProtocol | Sequence[EvaluationProtocol],
         *,
-        solver: FastCEMSolver,
+        solver: PopulationSolver,
         population: PopulationModel | None = None,
         eval_budget: int | None = None,
         record: bool = False,
     ) -> ManyWorldsEvaluationResults:
-        """Evaluate all Worlds with population-batched FastCEM.
+        """Evaluate all Worlds with a population solver.
 
         There is no per-World solver call or model loop: CEM, model ranking,
         action postprocessing, and environment execution stay tensorized across

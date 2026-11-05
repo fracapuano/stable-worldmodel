@@ -96,7 +96,10 @@ class RepeatedPopulation:
 
 
 @pytest.mark.parametrize('opaque', [False, True])
-def test_population_specific_tasks_and_noise_match_serial_solves(opaque):
+@pytest.mark.parametrize('seeded', [False, True])
+def test_population_specific_tasks_and_noise_match_serial_solves(
+    opaque, seeded
+):
     torch.manual_seed(71)
     model = _model()
     solver = FastCEMSolver(
@@ -112,13 +115,21 @@ def test_population_specific_tasks_and_noise_match_serial_solves(opaque):
         'goal_emb': torch.randn(3, 2, 1, 4),
     }
     noise = torch.stack([solver.sample_noise(2) for _ in range(3)])
+    if seeded:
+        info['controller_seed'] = torch.arange(6).reshape(3, 2, 1)
+        noise = torch.stack(
+            [
+                solver._batch_noise(2, 0, seeds, None)
+                for seeds in info['controller_seed']
+            ]
+        )
     models = (
         RepeatedPopulation(model, 3)
         if opaque
         else (model, deepcopy(model), deepcopy(model))
     )
     actual = solver.solve_population(
-        info, models, noise=noise, population_in_dims=0
+        info, models, noise=None if seeded else noise, population_in_dims=0
     )
     for index in range(3):
         expected = solver.solve_tensors(

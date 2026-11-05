@@ -7,7 +7,7 @@ import torch
 
 from stable_worldmodel.evaluation import EvaluationResults
 from stable_worldmodel.evaluation.records import episodes_from_rollout
-from stable_worldmodel.planning import FastCEMSolver
+from stable_worldmodel.planning import PopulationSolver
 from stable_worldmodel.policy import WorldModelPolicy
 
 
@@ -17,7 +17,7 @@ def evaluate_world(world, protocol, budget, video, record, backend):
     two_room = world.env_name == 'swm/TwoRoom-v1'
     if (
         not isinstance(policy, WorldModelPolicy)
-        or not isinstance(policy.solver, FastCEMSolver)
+        or not isinstance(policy.solver, PopulationSolver)
         or video
         or record
     ):

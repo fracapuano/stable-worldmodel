@@ -219,6 +219,21 @@ class FastCEMSolver(CEMSolver):
         )
 
     @property
+    def population_config(self) -> dict:
+        return {
+            key: getattr(self, key)
+            for key in (
+                'batch_size',
+                'num_samples',
+                'var_scale',
+                'n_steps',
+                'topk',
+                'device',
+                'dtype',
+            )
+        }
+
+    @property
     def compilation_enabled(self) -> bool:
         return (
             self.compile_kernel
@@ -561,6 +576,27 @@ class FastCEMSolver(CEMSolver):
         if population_in_dims not in (None, 0):
             raise ValueError('population_in_dims must be None or 0')
         started = time.perf_counter()
+        if noise is None and info.get('controller_seed') is not None:
+            opaque = isinstance(models, PopulationModel)
+            seeds = info['controller_seed']
+            decisions = info.get('step_idx')
+            if population_in_dims == 0:
+                population, tasks = next(iter(info.values())).shape[:2]
+                noise = self._batch_noise(
+                    population * tasks,
+                    0,
+                    seeds.reshape(-1, 1),
+                    None if decisions is None else decisions.reshape(-1, 1),
+                )
+                noise = noise.unflatten(1, (population, tasks)).movedim(1, 0)
+            else:
+                tasks = next(iter(info.values())).size(0 if opaque else 1)
+                noise = self._batch_noise(
+                    tasks,
+                    0,
+                    seeds if opaque else seeds[0],
+                    decisions if opaque or decisions is None else decisions[0],
+                )
         if isinstance(models, PopulationModel):
             population = models
             if not isinstance(self._tensor_cost, _LeWMTerminalCost):

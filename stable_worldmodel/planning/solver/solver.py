@@ -50,3 +50,34 @@ class Solver(Protocol):
             Dictionary containing optimized actions and other solver-specific info.
         """
         ...
+
+
+@runtime_checkable
+class PopulationSolver(Solver, Protocol):
+    """A solver that can plan for a population of world models."""
+
+    cost: Costable
+    device: str | torch.device
+
+    @property
+    def population_config(self) -> dict:
+        """Solver settings that must agree across the input Worlds."""
+        ...
+
+    def solve(
+        self,
+        info_dict: dict,
+        init_action: torch.Tensor | None = None,
+        *,
+        return_tensors: bool = False,
+    ) -> dict: ...
+
+    def solve_population(
+        self,
+        info: dict,
+        models,
+        *,
+        population_in_dims: int | None = None,
+    ) -> dict:
+        """Plan with solver-owned initialization and return tensor actions."""
+        ...

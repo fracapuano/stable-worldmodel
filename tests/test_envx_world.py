@@ -20,6 +20,7 @@ from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationTask
 from stable_worldmodel.planning import (
     FastCEMSolver,
     GoalMSE,
+    GradientSolver,
     ShootingCostEvaluator,
 )
 from stable_worldmodel.world.envx import (
@@ -632,6 +633,78 @@ class RepeatedPopulation:
         return vmap(
             call, in_dims=(0, 0, *((population_in_dims,) * len(args)))
         )(parameters, buffers, *args)
+
+
+class FixedPopulationSolver(GradientSolver):
+    @property
+    def population_config(self):
+        return {'n_steps': self.n_steps}
+
+    def solve(self, info, init_action=None, *, return_tensors=False):
+        count = len(next(iter(info.values())))
+        return {
+            'actions': torch.zeros(
+                count, self.horizon, self.action_dim, device=self.device
+            ),
+            'costs': torch.zeros(count, device=self.device),
+        }
+
+    def solve_population(self, info, models, *, population_in_dims=None):
+        opaque = hasattr(models, 'population_size')
+        population = models.population_size if opaque else len(models)
+        tasks = next(iter(info.values())).size(
+            1 if population_in_dims == 0 or not opaque else 0
+        )
+        return {
+            'actions': torch.zeros(
+                population,
+                tasks,
+                self.horizon,
+                self.action_dim,
+                device=self.device,
+            ),
+            'costs': torch.zeros(population, tasks, device=self.device),
+        }
+
+
+@integration
+@pytest.mark.parametrize('opaque', [False, True])
+def test_population_evaluation_accepts_non_cem_solver(opaque):
+    p = protocol('two-room')
+    worlds = [world_for(p, pixels=True) for _ in range(1 if opaque else 2)]
+    for world in worlds:
+        world.set_policy(
+            swm.policy.WorldModelPolicy(
+                solver=FixedPopulationSolver(
+                    ShootingCostEvaluator(TinyModel().to(DEVICE), GoalMSE()),
+                    n_steps=2,
+                    device=DEVICE,
+                ),
+                config=swm.PlanConfig(horizon=4, receding_horizon=4),
+            )
+        )
+    solver = worlds[0].policy.solver
+    events = []
+    worlds[0].policy.on_plan = events.append
+    many = swm.ManyWorlds(
+        worlds,
+        population_size=2 if opaque else None,
+        task_pool=p,
+    )
+    population = RepeatedPopulation(solver.cost.model, 2) if opaque else None
+    try:
+        expected = worlds[0].evaluate(protocol=p, eval_budget=4)
+        result = many.evaluate(
+            p, solver=solver, population=population, eval_budget=4
+        )
+        assert result.planned_actions.shape == (1, 2, 2, 4, 2)
+        assert torch.count_nonzero(result.planned_actions) == 0
+        assert result.planner_variances is None
+        assert 'var' not in events[-1]['solver_output']
+        assert result.evaluations[0].success_rate == expected.success_rate
+        assert torch.isfinite(result.task_final_distances).all()
+    finally:
+        many.close()
 
 
 @integration

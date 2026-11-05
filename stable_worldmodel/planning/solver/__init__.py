@@ -7,7 +7,7 @@ from .lagrangian import LagrangianSolver
 from .mppi import MPPISolver
 from .pgd import PGDSolver
 from .predictive_sampling import PredictiveSamplingSolver
-from .solver import Solver
+from .solver import PopulationSolver, Solver
 
 __all__ = [
     'CEMSolver',
@@ -18,6 +18,7 @@ __all__ = [
     'LagrangianSolver',
     'MPPISolver',
     'PGDSolver',
+    'PopulationSolver',
     'PredictiveSamplingSolver',
     'Solver',
 ]
