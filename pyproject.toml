@@ -38,6 +38,7 @@ swm = "stable_worldmodel.cli:app"
 benchmark = ["huggingface-hub", "imageio[ffmpeg]"]
 envx = [
     "envx @ git+https://github.com/fracapuano/envX.git@e4844329d936b73e605ec02cfcd8fd59620a8d70 ; python_version >= '3.11' and python_version < '3.13'",
+    "six>=1.16; python_version >= '3.11' and python_version < '3.13'",
     "mujoco>=3.11,<3.12; python_version >= '3.11' and python_version < '3.13'",
     "mujoco-mjx[warp]>=3.11,<3.12; python_version >= '3.11' and python_version < '3.13'",
     "jax>=0.7,<0.11; python_version >= '3.11' and python_version < '3.13'",
@@ -85,6 +86,7 @@ all = [
 [dependency-groups]
 dev = [
   "envx @ git+https://github.com/fracapuano/envX.git@e4844329d936b73e605ec02cfcd8fd59620a8d70 ; python_version >= '3.11' and python_version < '3.13'",
+  "six>=1.16; python_version >= '3.11' and python_version < '3.13'",
   "ipdb",
   "mujoco<3.12; python_version >= '3.11' and python_version < '3.13'",
   "mujoco-mjx<3.12; python_version >= '3.11' and python_version < '3.13'",
