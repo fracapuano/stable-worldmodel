@@ -35,6 +35,7 @@ dependencies = [
 swm = "stable_worldmodel.cli:app"
 
 [project.optional-dependencies]
+benchmark = ["huggingface-hub", "imageio[ffmpeg]"]
 envx = [
     "envx @ git+https://github.com/fracapuano/envX.git@9550e39f1d3173aad28f104e5f2cbb90fd77f685 ; python_version >= '3.11' and python_version < '3.13'",
     "mujoco>=3.11,<3.12; python_version >= '3.11' and python_version < '3.13'",

@@ -170,3 +170,34 @@ Print the installed version.
 ```bash
 swm --version
 ```
+
+## Run a frozen benchmark
+
+Install the `benchmark` and `envx` extras for Hugging Face downloads, MP4
+recording, and the envX control environments. The dataset repository should
+contain a serialized `EvaluationProtocol` at `validation.json` (or
+`<split>.json`). Existing manifests can be uploaded verbatim. Their metadata
+sets the action budget through `eval_budget` or `steps` and can specify an
+`image_shape`; the default is 224 × 224. Record the dataset commit SHA for
+reproducibility.
+
+```sh
+swm benchmark your-org/tworoom --revision <commit-sha> --policy random
+swm benchmark your-org/tworoom --revision <commit-sha> \
+  --policy my_project.policy:make_policy --output results.json --video-task 0
+```
+
+A local manifest path also works. A policy factory returns a fresh
+stable-worldmodel policy, such as a `WorldModelPolicy` wrapping your planner.
+The JSON contains the suite digest, success rate as a percentage, and per-task
+results. It also includes final distances and their mean when the environment
+provides them (pixels for TwoRoom). Repeat `--video-task` to record multiple zero-based task indices in a
+separate diagnostic run. Reacher pixel rendering requires CUDA.
+
+```python
+from stable_worldmodel.benchmarks import load_benchmark
+
+benchmark = load_benchmark("your-org/tworoom", revision="<commit-sha>")
+result = benchmark.evaluate(policy=my_policy)
+result.write("results.json")
+```

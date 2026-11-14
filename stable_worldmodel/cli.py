@@ -1002,6 +1002,47 @@ def checkpoints(
         print(table)
 
 
+@app.command()
+def benchmark(
+    source: str,
+    policy: str = 'random',
+    output: str = 'results.json',
+    revision: str | None = None,
+    split: str = 'validation',
+    device: str | None = None,
+    video_task: Annotated[list[int] | None, typer.Option()] = None,
+    video_dir: str = 'rollouts',
+):
+    """Evaluate random actions or a policy from a zero-argument module:factory."""
+    from importlib import import_module
+
+    from stable_worldmodel.benchmarks import load_benchmark
+    from stable_worldmodel.policy import RandomPolicy
+
+    suite = load_benchmark(source, revision=revision, split=split)
+    if policy == 'random':
+
+        def make_policy():
+            return RandomPolicy(seed=42)
+    else:
+        module, separator, factory = policy.partition(':')
+        if not separator or not module or not factory:
+            raise typer.BadParameter(
+                'expected random or module:factory', param_hint='--policy'
+            )
+        make_policy = getattr(import_module(module), factory)
+
+    result = suite.evaluate(make_policy(), device=device)
+    result.write(output)
+    typer.echo(
+        f'{result.success_rate:.2f}% success over {len(result.episodes)} tasks'
+    )
+    if video_task:
+        suite.record_rollouts(
+            make_policy(), video_dir, video_task, device=device
+        )
+
+
 @app.callback(invoke_without_command=True)
 def main(
     version: Annotated[
