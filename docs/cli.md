@@ -178,12 +178,11 @@ recording, and the envX control environments. The dataset repository should
 contain a serialized `EvaluationProtocol` at
 `<environment>/validation.json`. Existing manifests can be uploaded verbatim. Their metadata
 sets the action budget through `eval_budget` or `steps` and can specify an
-`image_shape`; the default is 224 × 224. Record the dataset commit SHA for
-reproducibility.
+`image_shape`; the default is 224 × 224.
 
 ```sh
-swm benchmark fracapuano/evolving-wm-benchmarks tworoom --revision <commit-sha> --policy random
-swm benchmark fracapuano/evolving-wm-benchmarks tworoom --revision <commit-sha> \
+swm benchmark fracapuano/evolving-wm-benchmarks tworoom --policy random --device cuda
+swm benchmark fracapuano/evolving-wm-benchmarks tworoom \
   --policy my_project.policy:make_policy --policy-environment tworoom --output results.json --video-task 0
 ```
 
