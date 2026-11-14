@@ -196,16 +196,13 @@ results. It also includes final distances and their mean when the environment
 provides them (pixels for TwoRoom). Repeat `--video-task` to record multiple zero-based task indices in a
 separate diagnostic run. Reacher pixel rendering requires CUDA.
 
-The Python example uses a policy factory from your project. For LeWM, the
-factory loads `quentinll/lewm-tworooms` and supplies its preprocessing and
-planner settings.
+### Evaluate the released TwoRoom checkpoint
 
-```python
-from my_project.policy import make_tworoom_policy
-from stable_worldmodel.benchmarks import load_benchmark
+Install the `train` extra for the checkpoint's model dependencies. The
+[standalone example](evaluate.py) loads `quentinll/lewm-tworooms` with its
+released preprocessing and FastCEM 300×30 settings. Run it with access to the
+private benchmark dataset.
 
-suite = load_benchmark("fracapuano/evolving-wm-benchmarks", environment="tworoom")
-suite.evaluate(
-    make_tworoom_policy("cuda"), policy_environment="tworoom", device="cuda"
-).write("results.json")
+```sh
+python docs/evaluate.py tworoom
 ```
