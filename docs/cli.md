@@ -170,3 +170,38 @@ Print the installed version.
 ```bash
 swm --version
 ```
+
+## Run a frozen benchmark
+
+Install the `benchmark` and `envx` extras for Hugging Face downloads, MP4
+recording, and the envX control environments. The dataset repository should
+contain a serialized `EvaluationProtocol` at
+`<environment>/validation.json`. Existing manifests can be uploaded verbatim. Their metadata
+sets the action budget through `eval_budget` or `steps` and can specify an
+`image_shape`; the default is 224 × 224.
+
+```sh
+swm benchmark fracapuano/evolving-wm-benchmarks tworoom --policy random --device cuda
+swm benchmark fracapuano/evolving-wm-benchmarks tworoom \
+  --policy my_project.policy:make_policy --policy-environment tworoom --output results.json --video-task 0
+```
+
+Supported environments are `tworoom`, `pusht`, `reacher`, and `cube`.
+A local manifest path also works. The runner checks the manifest environment
+and the policy’s declared training environment against the selected benchmark. A policy factory returns a fresh
+stable-worldmodel policy, such as a `WorldModelPolicy` wrapping your planner.
+The JSON contains the suite digest, success rate as a percentage, and per-task
+results. It also includes final distances and their mean when the environment
+provides them (pixels for TwoRoom). Repeat `--video-task` to record multiple zero-based task indices in a
+separate diagnostic run. Reacher pixel rendering requires CUDA.
+
+### Evaluate the released TwoRoom checkpoint
+
+Install the `train` extra for the checkpoint's model dependencies. The
+[standalone example](evaluate.py) loads `quentinll/lewm-tworooms` with its
+released preprocessing and FastCEM 300×30 settings. Run it with access to the
+private benchmark dataset.
+
+```sh
+python docs/evaluate.py tworoom
+```
