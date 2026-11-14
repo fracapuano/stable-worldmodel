@@ -7,6 +7,13 @@ from pathlib import Path
 from stable_worldmodel.evaluation import EvaluationProtocol, EvaluationResults
 from stable_worldmodel.policy import Policy
 
+_ENVIRONMENTS = {
+    'tworoom': 'swm/TwoRoom-v1',
+    'pusht': 'swm/PushT-v1',
+    'reacher': 'swm/ReacherDMControl-v0',
+    'cube': 'swm/OGBCube-v0',
+}
+
 
 @dataclass(frozen=True)
 class Benchmark:
@@ -15,9 +22,14 @@ class Benchmark:
     image_shape: tuple[int, int] = (224, 224)
 
     def evaluate(
-        self, policy: Policy, *, device: str | None = None
+        self,
+        policy: Policy,
+        *,
+        policy_environment: str,
+        device: str | None = None,
     ) -> EvaluationResults:
         """Score the full suite and return the evaluator's structured results."""
+        self._check_policy_environment(policy_environment)
         return self._run(self.protocol, policy, device=device)
 
     def record_rollouts(
@@ -26,9 +38,11 @@ class Benchmark:
         directory: str | Path,
         task_indices: Iterable[int],
         *,
+        policy_environment: str,
         device: str | None = None,
     ) -> EvaluationResults:
         """Run a diagnostic evaluation and save MP4s for selected tasks."""
+        self._check_policy_environment(policy_environment)
         indices = tuple(task_indices)
         if not indices or len(set(indices)) != len(indices):
             raise ValueError(
@@ -47,6 +61,13 @@ class Benchmark:
             raise ValueError('rollout task names must be unique filenames')
         protocol = replace(self.protocol, tasks=tasks)
         return self._run(protocol, policy, device=device, video=directory)
+
+    def _check_policy_environment(self, environment: str) -> None:
+        if _ENVIRONMENTS.get(environment) != self.protocol.environment:
+            raise ValueError(
+                f'policy environment {environment!r} does not match '
+                f'benchmark environment {self.protocol.environment!r}'
+            )
 
     def _run(
         self, protocol, policy, *, device, video=None
@@ -92,14 +113,16 @@ def load_benchmark(
     source: str | Path,
     *,
     revision: str | None = None,
-    split: str = 'validation',
+    environment: str,
 ) -> Benchmark:
-    """Load a local JSON manifest or an HF dataset's `<split>.json` file.
+    """Load a local JSON manifest or an HF dataset's `<environment>/validation.json` file.
 
     Pass a Hugging Face commit SHA as `revision` for reproducible downloads.
     The manifest supplies the evaluation budget via `eval_budget` or `steps`
     and can specify an `image_shape` in its metadata.
     """
+    if environment not in _ENVIRONMENTS:
+        raise ValueError(f'unknown benchmark environment: {environment!r}')
     path = Path(source)
     if isinstance(source, Path) or path.is_file():
         if revision is not None:
@@ -110,11 +133,16 @@ def load_benchmark(
         path = hf_hub_download(
             repo_id=source,
             repo_type='dataset',
-            filename=f'{split}.json',
+            filename=f'{environment}/validation.json',
             revision=revision,
         )
 
     protocol = EvaluationProtocol.read(path)
+    expected = _ENVIRONMENTS[environment]
+    if protocol.environment != expected:
+        raise ValueError(
+            f'expected environment {expected!r}, got {protocol.environment!r}'
+        )
     metadata = dict(protocol.metadata)
     budget = metadata.get('eval_budget', metadata.get('steps'))
     if type(budget) is not int or budget < 1:

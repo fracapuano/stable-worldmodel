@@ -1005,10 +1005,11 @@ def checkpoints(
 @app.command()
 def benchmark(
     source: str,
+    environment: str,
     policy: str = 'random',
     output: str = 'results.json',
     revision: str | None = None,
-    split: str = 'validation',
+    policy_environment: str | None = None,
     device: str | None = None,
     video_task: Annotated[list[int] | None, typer.Option()] = None,
     video_dir: str = 'rollouts',
@@ -1019,12 +1020,18 @@ def benchmark(
     from stable_worldmodel.benchmarks import load_benchmark
     from stable_worldmodel.policy import RandomPolicy
 
-    suite = load_benchmark(source, revision=revision, split=split)
+    suite = load_benchmark(source, revision=revision, environment=environment)
     if policy == 'random':
+        policy_environment = policy_environment or environment
 
         def make_policy():
             return RandomPolicy(seed=42)
     else:
+        if policy_environment != environment:
+            raise typer.BadParameter(
+                'must declare the training environment and match the benchmark',
+                param_hint='--policy-environment',
+            )
         module, separator, factory = policy.partition(':')
         if not separator or not module or not factory:
             raise typer.BadParameter(
@@ -1032,14 +1039,20 @@ def benchmark(
             )
         make_policy = getattr(import_module(module), factory)
 
-    result = suite.evaluate(make_policy(), device=device)
+    result = suite.evaluate(
+        make_policy(), policy_environment=policy_environment, device=device
+    )
     result.write(output)
     typer.echo(
         f'{result.success_rate:.2f}% success over {len(result.episodes)} tasks'
     )
     if video_task:
         suite.record_rollouts(
-            make_policy(), video_dir, video_task, device=device
+            make_policy(),
+            video_dir,
+            video_task,
+            policy_environment=policy_environment,
+            device=device,
         )
 
 
