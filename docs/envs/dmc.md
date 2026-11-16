@@ -201,8 +201,8 @@ A planar two-link arm that must reach a small target. The task uses feature-base
 | `qpos_match` | Match a target joint configuration |
 
 Frozen-task Reacher evaluation and `qpos_match` compare joint configurations.
-The frozen-task distance is the L2 joint-angle error in radians, wrapping only
-the shoulder. The wrist is limited to ±160° and is
+The frozen-task distance is `d / (d + tolerance)`, with `d` the L2 joint-angle
+error in radians wrapping only the shoulder. The wrist is limited to ±160° and is
 not wrapped. Success requires both errors to be strictly below the configured
 tolerance (0.05 radians by default).
 

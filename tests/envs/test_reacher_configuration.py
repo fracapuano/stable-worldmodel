@@ -80,8 +80,9 @@ def test_envx_reacher_configuration_distance(state, goal, expected, success):
     states = jnp.asarray([state, [0, 0]], dtype=jnp.float32)
     goals = jnp.asarray([goal, [0, 0]], dtype=jnp.float32)
     contract = {'threshold': 0.05}
+    expected = expected / (expected + contract['threshold'])
     _, distance, hits = jax.jit(engine._metrics)(states, goals, contract)
-    np.testing.assert_allclose(distance, [expected, 0], rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(distance, [expected, 0], rtol=1e-5, atol=2e-5)
     # Float32 atan2 can round a nominal shoulder threshold across the boundary.
     _, _, original_hits = jax.jit(original_metrics)(states, goals, contract)
     np.testing.assert_array_equal(hits, original_hits)
@@ -90,7 +91,7 @@ def test_envx_reacher_configuration_distance(state, goal, expected, success):
         np.testing.assert_array_equal(hits, [success, True])
 
 
-def test_reacher_distance_uses_both_joints_independently_of_tolerance():
+def test_reacher_distance_uses_both_joints_and_configured_tolerance():
     jax = pytest.importorskip('jax')
     jnp = pytest.importorskip('jax.numpy')
     from stable_worldmodel.world.envx import _Engine
@@ -106,8 +107,8 @@ def test_reacher_distance_uses_both_joints_independently_of_tolerance():
         {'threshold': jnp.asarray([0.05, 0.05, 0.1, 0.05, 0.1])},
     )
     assert distances[0] > distances[1] > 0
-    np.testing.assert_array_equal(distances[1:2], distances[2:3])
-    np.testing.assert_array_equal(distances[3:4], distances[4:5])
+    assert distances[1] > distances[2] > 0
+    assert distances[3] > distances[4] > 0
     np.testing.assert_array_equal(success, [False, False, False, False, True])
 
 

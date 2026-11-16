@@ -249,6 +249,7 @@ class _Engine:
             distance = jnp.maximum(jnp.abs(shoulder), jnp.abs(delta[:, 1]))
             success = distance < contract['threshold']
             distance = jnp.hypot(shoulder, delta[:, 1])
+            distance = distance / (distance + contract['threshold'])
         elif self.name == 'cube':
             distance = jnp.linalg.norm(values - goals[:, :3], axis=-1)
             success = distance <= contract['threshold']
