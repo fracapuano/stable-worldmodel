@@ -111,6 +111,15 @@ def test_missing_full_state_is_an_error_instead_of_random_reset():
         task_inputs('cube', {'state': [0, 0, 0], 'target_state': [1, 1, 1]})
 
 
+def _metric_engine(name):
+    if name == 'pusht':
+        pytest.importorskip('envx')
+    engine = _Engine.__new__(_Engine)
+    engine.name = name
+    engine.adapter = SimpleNamespace(vector=lambda value: value)
+    return engine
+
+
 @integration
 def test_contract_metrics_and_wrapped_angle():
     import jax.numpy as jnp
@@ -130,9 +139,7 @@ def test_contract_metrics_and_wrapped_angle():
             [True, False],
         ),
     ):
-        engine = _Engine.__new__(_Engine)
-        engine.name = name
-        engine.adapter = SimpleNamespace(vector=lambda value: value)
+        engine = _metric_engine(name)
         _, distances, success = engine._metrics(
             jnp.asarray(states),
             jnp.asarray(goals),
@@ -144,10 +151,9 @@ def test_contract_metrics_and_wrapped_angle():
         )
         np.testing.assert_array_equal(success, expected)
         if name == 'pusht':
-            # Distance includes pusher position, ignores velocity, and wraps T rotation.
-            # Float32 radian roundoff is amplified by conversion to degrees.
+            # Goal distance stays positive inside success; the boundary stays strict.
             np.testing.assert_allclose(
-                distances, [np.rad2deg(0.02), 20], rtol=1e-5, atol=5e-5
+                distances, [2 * np.sin(0.01) * np.sqrt(5962.5), 20], atol=1e-4
             )
 
 
@@ -156,22 +162,31 @@ def test_contract_metrics_and_wrapped_angle():
     [
         ([0, 0], 0, 0, 0, True),
         ([3, 4], 0, 0, 5, True),
-        ([0, 0], np.pi / 2, 0, 90, False),
-        ([0, 0], np.deg2rad(359), np.deg2rad(1), 2, True),
-        ([0, 0], np.deg2rad(1), np.deg2rad(359), 2, True),
-        ([0, 0], np.pi, 0, 180, False),
-        ([3, 4], np.pi / 6, 0, np.sqrt(5**2 + 30**2), False),
+        ([0, 0], np.pi / 2, 0, np.sqrt(11925), False),
+        (
+            [0, 0],
+            np.deg2rad(359),
+            np.deg2rad(1),
+            2 * np.sin(np.pi / 180) * np.sqrt(5962.5),
+            True,
+        ),
+        (
+            [0, 0],
+            np.deg2rad(1),
+            np.deg2rad(359),
+            2 * np.sin(np.pi / 180) * np.sqrt(5962.5),
+            True,
+        ),
+        ([0, 0], np.pi, 0, 2 * np.sqrt(5962.5), False),
+        ([3, 4], np.pi / 6, 0, 37.939639, False),
     ],
 )
-def test_pusht_pose_distance_includes_pusher_and_ignores_velocity(
+def test_pusht_vertex_distance_and_pusher_bottleneck_ignore_velocity(
     position, angle, goal_angle, expected, expected_success
 ):
     jax = pytest.importorskip('jax')
     jnp = pytest.importorskip('jax.numpy')
-    engine = _Engine.__new__(_Engine)
-    engine.name = 'pusht'
-    engine.adapter = SimpleNamespace(vector=lambda value: value)
-    # Pusher position contributes to distance; its velocity does not.
+    engine = _metric_engine('pusht')
     states = jnp.asarray(
         [
             [100, 200, *position, angle, 300, -400],
@@ -183,20 +198,20 @@ def test_pusht_pose_distance_includes_pusher_and_ignores_velocity(
     options = swm.World._task_reset_options(protocol().tasks[0])
     _, _, contract = task_inputs('pusht', options)
     _, distance, success = jax.jit(engine._metrics)(states, goals, contract)
-    with_pusher = np.hypot(np.hypot(100, 200), expected)
     np.testing.assert_allclose(
-        distance, [with_pusher, with_pusher, expected], rtol=1e-5, atol=1e-5
+        distance,
+        [np.sqrt(50000), np.sqrt(50000), expected],
+        rtol=1e-5,
+        atol=1e-4,
     )
     np.testing.assert_array_equal(success, [False, False, expected_success])
 
 
-def test_pusht_pose_distance_matches_native_evaluation():
+def test_pusht_fitness_distance_preserves_native_success():
     jax = pytest.importorskip('jax')
     jnp = pytest.importorskip('jax.numpy')
     native = pytest.importorskip('stable_worldmodel.envs.pusht.env').PushT()
-    engine = _Engine.__new__(_Engine)
-    engine.name = 'pusht'
-    engine.adapter = SimpleNamespace(vector=lambda value: value)
+    engine = _metric_engine('pusht')
     states = np.asarray(
         [
             [100, 200, 3, 4, np.pi / 6, 300, -400],
@@ -214,7 +229,7 @@ def test_pusht_pose_distance_matches_native_evaluation():
         native.variation_space.set_value(
             {'block.shape': native.shapes.index('T')}
         )
-        expected_success, expected_distance = zip(
+        expected_success, native_distance = zip(
             *(
                 native.eval_state(goal, state)
                 for goal, state in zip(goals, states, strict=True)
@@ -225,11 +240,61 @@ def test_pusht_pose_distance_matches_native_evaluation():
             jnp.asarray(states), jnp.asarray(goals), contract
         )
         np.testing.assert_allclose(
-            distances, expected_distance, rtol=1e-5, atol=1e-5
+            distances,
+            [np.sqrt(50000), 2 * np.sin(np.pi / 180) * np.sqrt(5962.5)],
+            rtol=1e-5,
+            atol=1e-4,
+        )
+        # Native environment rewards retain their original distance definition.
+        np.testing.assert_allclose(
+            native_distance, [np.sqrt(50925), 2], rtol=1e-5
         )
         np.testing.assert_array_equal(success, expected_success)
     finally:
         native.close()
+
+
+def test_pusht_distance_is_the_larger_of_object_and_pusher_errors():
+    jax = pytest.importorskip('jax')
+    jnp = pytest.importorskip('jax.numpy')
+    states = jnp.asarray(
+        [
+            [10, 0, 5, 0, 0, 0, 0],
+            [2, 0, 5, 0, 0, 0, 0],
+            [100, 0, 50, 0, 0, 0, 0],
+            [25, 0, 50, 0, 0, 0, 0],
+        ],
+        dtype=jnp.float32,
+    )
+    contract = {'position_threshold': 20, 'angle_threshold': np.pi / 9}
+    _, distances, success = jax.jit(_metric_engine('pusht')._metrics)(
+        states, jnp.zeros_like(states), contract
+    )
+    np.testing.assert_allclose(distances, [10, 5, 100, 50], atol=1e-5)
+    np.testing.assert_array_equal(success, [True, True, False, False])
+
+
+@pytest.mark.parametrize(
+    'key,tolerances,state',
+    [
+        ('position_threshold', [10, 20], [10, 0, 5, 0, 0, 0, 0]),
+        ('angle_threshold', [0.1, np.pi / 9], [0, 0, 0, 0, 0.25, 0, 0]),
+    ],
+)
+def test_pusht_distance_in_pixels_is_independent_of_success_tolerances(
+    key, tolerances, state
+):
+    jax = pytest.importorskip('jax')
+    jnp = pytest.importorskip('jax.numpy')
+    states = jnp.asarray([state] * 2, dtype=jnp.float32)
+    contract = {'position_threshold': 20, 'angle_threshold': np.pi / 9}
+    contract[key] = jnp.asarray(tolerances)
+    _, distances, success = jax.jit(_metric_engine('pusht')._metrics)(
+        states, jnp.zeros_like(states), contract
+    )
+    np.testing.assert_array_equal(distances[:1], distances[1:])
+    assert distances[0] > 0
+    np.testing.assert_array_equal(success, [False, True])
 
 
 def test_pusht_distance_cannot_be_overridden():
@@ -1014,13 +1079,18 @@ def test_public_world_and_manyworlds_evaluation(name, monkeypatch):
         assert result.metadata['planning_calls'] == len(events) == 1
         assert all(1 <= row.length <= 4 for row in result.episodes)
         if name == 'pusht':
+            import jax.numpy as jnp
+
             states = torch.as_tensor(worlds[0].infos['state'])[:, -1]
             goals = states.new_tensor([task.goal for task in p.tasks])
-            position = (states[:, :4] - goals[:, :4]).norm(dim=-1)
-            angle = (states[:, 4] - goals[:, 4] + np.pi) % (2 * np.pi) - np.pi
-            expected = torch.hypot(position, torch.rad2deg(angle))
+            _, expected, _ = _metric_engine(name)._metrics(
+                jnp.asarray(states.cpu().numpy()),
+                jnp.asarray(goals.cpu().numpy()),
+                {'position_threshold': 20, 'angle_threshold': np.pi / 9},
+            )
             torch.testing.assert_close(
-                worlds[0].infos['distance_to_target'].reshape(-1), expected
+                worlds[0].infos['distance_to_target'].reshape(-1).cpu(),
+                torch.tensor(np.asarray(expected)),
             )
         population = many.evaluate(p, solver=solvers[0], eval_budget=4)
         assert population.task_final_distances.shape == (2, 2)

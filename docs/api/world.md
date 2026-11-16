@@ -247,9 +247,17 @@ from the initial frame, matching the existing history warm-up behavior.
 Closed-loop replanning, filled histories, warm starts, early termination, and
 transition records are outside the supported path.
 
-Set protocol metadata `score="success"` for mean success or
-`score="distance"` for `1 - mean_final_distance / hypot(224, 224)`; distance
-is the default.
+Set protocol metadata `score="success"` for mean success or `score="distance"`
+for distance scoring (the default). TwoRoom uses
+`1 - mean_final_distance / hypot(224, 224)`; other environments use
+`-mean_final_distance`.
+
+Frozen Reacher distance is the L2 joint-angle error in radians, wrapping only
+the shoulder. Frozen PushT distance is the maximum of the RMS error of matching
+world-space T vertices and the pusher position error, both in pixels. T translation
+and rotation are measured together using the existing envX geometry. Distance
+can remain positive on success. Native Gym distances and rewards, and the
+existing success criteria, are unchanged.
 
 Every LeWM parameter and persistent buffer may differ across Worlds, including
 the observation encoder, action encoder, projector, predictor, and prediction

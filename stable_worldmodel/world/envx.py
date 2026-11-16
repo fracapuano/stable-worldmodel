@@ -248,17 +248,30 @@ class _Engine:
             shoulder = jnp.arctan2(jnp.sin(delta[:, 0]), jnp.cos(delta[:, 0]))
             distance = jnp.maximum(jnp.abs(shoulder), jnp.abs(delta[:, 1]))
             success = distance < contract['threshold']
+            distance = jnp.hypot(shoulder, delta[:, 1])
         elif self.name == 'cube':
             distance = jnp.linalg.norm(values - goals[:, :3], axis=-1)
             success = distance <= contract['threshold']
         else:
+            import jax
+            from envx.pusht.geometry import tee_vertices
+
             position = jnp.linalg.norm(values[:, :4] - goals[:, :4], axis=-1)
             angle = jnp.mod(jnp.abs(values[:, 4] - goals[:, 4]), 2 * jnp.pi)
             angle = jnp.minimum(angle, 2 * jnp.pi - angle)
-            distance = jnp.hypot(position, jnp.rad2deg(angle))
             success = (position < contract['position_threshold']) & (
                 angle < contract['angle_threshold']
             )
+            vertices = jax.vmap(tee_vertices)(values[:, 2:4], values[:, 4])
+            goal_vertices = jax.vmap(tee_vertices)(goals[:, 2:4], goals[:, 4])
+            vertex_error = vertices - goal_vertices
+            tee_distance = jnp.sqrt(
+                jnp.mean(jnp.sum(vertex_error**2, axis=-1), axis=-1)
+            )
+            pusher_distance = jnp.linalg.norm(
+                values[:, :2] - goals[:, :2], axis=-1
+            )
+            distance = jnp.maximum(tee_distance, pusher_distance)
         return values, distance, success
 
     def _run(self, inputs, contract, actions, limits, initial_state=None):
