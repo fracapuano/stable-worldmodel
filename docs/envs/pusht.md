@@ -28,6 +28,7 @@ world = swm.World('swm/PushT-v1', num_envs=4, image_shape=(128, 128))
 | Action Space | `Box(-1, 1, shape=(2,))` — 2D relative velocity control |
 | Observation Space | `Dict(proprio=(4,), state=(7,))` |
 | Reward | Negative distance to goal state (higher is better) |
+| EnvX task distance | Unitless: `1 + gT / (1 + gT)` until the T is within its native tolerances, then `gF / (1 + gF)` for the full pusher/T error; errors are maxima normalized by native tolerances. |
 | Episode Length | 200 steps (default) |
 | Render Size | 224×224 (configurable) |
 | Physics | Pymunk, 10 Hz control, PD controller |

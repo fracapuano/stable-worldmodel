@@ -153,7 +153,7 @@ def test_contract_metrics_and_wrapped_angle():
         if name == 'pusht':
             # Goal distance stays positive inside success; the boundary stays strict.
             np.testing.assert_allclose(
-                distances, [2 * np.sin(0.01) * np.sqrt(5962.5), 20], atol=1e-4
+                distances, [0.02 / (np.pi / 9 + 0.02), 0.5], atol=1e-4
             )
 
 
@@ -161,27 +161,28 @@ def test_contract_metrics_and_wrapped_angle():
     'position,angle,goal_angle,expected,expected_success',
     [
         ([0, 0], 0, 0, 0, True),
-        ([3, 4], 0, 0, 5, True),
-        ([0, 0], np.pi / 2, 0, np.sqrt(11925), False),
+        ([3, 4], 0, 0, 0.2, True),
+        ([20, 0], 0, 0, 1.5, False),
+        ([0, 0], np.pi / 2, 0, 20 / 11, False),
         (
             [0, 0],
             np.deg2rad(359),
             np.deg2rad(1),
-            2 * np.sin(np.pi / 180) * np.sqrt(5962.5),
+            1 / 11,
             True,
         ),
         (
             [0, 0],
             np.deg2rad(1),
             np.deg2rad(359),
-            2 * np.sin(np.pi / 180) * np.sqrt(5962.5),
+            1 / 11,
             True,
         ),
-        ([0, 0], np.pi, 0, 2 * np.sqrt(5962.5), False),
-        ([3, 4], np.pi / 6, 0, 37.939639, False),
+        ([0, 0], np.pi, 0, 1.9, False),
+        ([3, 4], np.pi / 6, 0, 1.6, False),
     ],
 )
-def test_pusht_vertex_distance_and_pusher_bottleneck_ignore_velocity(
+def test_pusht_two_stage_pose_distance_ignores_velocity(
     position, angle, goal_angle, expected, expected_success
 ):
     jax = pytest.importorskip('jax')
@@ -189,22 +190,20 @@ def test_pusht_vertex_distance_and_pusher_bottleneck_ignore_velocity(
     engine = _metric_engine('pusht')
     states = jnp.asarray(
         [
-            [100, 200, *position, angle, 300, -400],
-            [100, 200, *position, angle, 0, 0],
+            [0, 0, *position, angle, 300, -400],
             [0, 0, *position, angle, 0, 0],
         ]
     )
-    goals = jnp.asarray([[0, 0, 0, 0, goal_angle, 0, 0]] * 3)
+    goals = jnp.asarray([[0, 0, 0, 0, goal_angle, 0, 0]] * 2)
     options = swm.World._task_reset_options(protocol().tasks[0])
     _, _, contract = task_inputs('pusht', options)
     _, distance, success = jax.jit(engine._metrics)(states, goals, contract)
     np.testing.assert_allclose(
-        distance,
-        [np.sqrt(50000), np.sqrt(50000), expected],
-        rtol=1e-5,
-        atol=1e-4,
+        distance, [expected, expected], rtol=1e-5, atol=1e-4
     )
-    np.testing.assert_array_equal(success, [False, False, expected_success])
+    np.testing.assert_array_equal(
+        success, [expected_success, expected_success]
+    )
 
 
 def test_pusht_fitness_distance_preserves_native_success():
@@ -241,7 +240,7 @@ def test_pusht_fitness_distance_preserves_native_success():
         )
         np.testing.assert_allclose(
             distances,
-            [np.sqrt(50000), 2 * np.sin(np.pi / 180) * np.sqrt(5962.5)],
+            [1.6, 1 / 11],
             rtol=1e-5,
             atol=1e-4,
         )
@@ -254,7 +253,7 @@ def test_pusht_fitness_distance_preserves_native_success():
         native.close()
 
 
-def test_pusht_distance_is_the_larger_of_object_and_pusher_errors():
+def test_pusht_distance_uses_full_position_error_after_T_is_ready():
     jax = pytest.importorskip('jax')
     jnp = pytest.importorskip('jax.numpy')
     states = jnp.asarray(
@@ -263,6 +262,8 @@ def test_pusht_distance_is_the_larger_of_object_and_pusher_errors():
             [2, 0, 5, 0, 0, 0, 0],
             [100, 0, 50, 0, 0, 0, 0],
             [25, 0, 50, 0, 0, 0, 0],
+            [19, 0, 0, 0, 0, 0, 0],
+            [10, 0, 19, 0, 0, 0, 0],
         ],
         dtype=jnp.float32,
     )
@@ -270,8 +271,21 @@ def test_pusht_distance_is_the_larger_of_object_and_pusher_errors():
     _, distances, success = jax.jit(_metric_engine('pusht')._metrics)(
         states, jnp.zeros_like(states), contract
     )
-    np.testing.assert_allclose(distances, [10, 5, 100, 50], atol=1e-5)
-    np.testing.assert_array_equal(success, [True, True, False, False])
+    np.testing.assert_allclose(
+        distances,
+        [
+            np.sqrt(125) / (20 + np.sqrt(125)),
+            np.sqrt(29) / (20 + np.sqrt(29)),
+            12 / 7,
+            12 / 7,
+            19 / 39,
+            np.sqrt(461) / (20 + np.sqrt(461)),
+        ],
+        atol=1e-5,
+    )
+    np.testing.assert_array_equal(
+        success, [True, True, False, False, True, False]
+    )
 
 
 @pytest.mark.parametrize(
@@ -281,9 +295,7 @@ def test_pusht_distance_is_the_larger_of_object_and_pusher_errors():
         ('angle_threshold', [0.1, np.pi / 9], [0, 0, 0, 0, 0.25, 0, 0]),
     ],
 )
-def test_pusht_distance_in_pixels_is_independent_of_success_tolerances(
-    key, tolerances, state
-):
+def test_pusht_distance_uses_native_success_tolerances(key, tolerances, state):
     jax = pytest.importorskip('jax')
     jnp = pytest.importorskip('jax.numpy')
     states = jnp.asarray([state] * 2, dtype=jnp.float32)
@@ -292,8 +304,7 @@ def test_pusht_distance_in_pixels_is_independent_of_success_tolerances(
     _, distances, success = jax.jit(_metric_engine('pusht')._metrics)(
         states, jnp.zeros_like(states), contract
     )
-    np.testing.assert_array_equal(distances[:1], distances[1:])
-    assert distances[0] > 0
+    assert distances[0] > distances[1] > 0
     np.testing.assert_array_equal(success, [False, True])
 
 

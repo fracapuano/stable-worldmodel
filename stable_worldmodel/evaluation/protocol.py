@@ -31,10 +31,13 @@ class EvaluationTask:
     ``angle_threshold`` and its ``relative``/``action_scale``/``clip_target``
     controls. These options apply to the frozen task evaluation only.
 
-    Reacher bounds shoulder-wrapped L2 joint error ``d`` as
-    ``d / (d + threshold)`` (unitless). PushT distance is the maximum of the
-    RMS error of corresponding world-space T vertices and pusher position
-    error, both in pixels. Distances remain positive inside success;
+    Reacher clips each absolute joint error minus tolerance at zero, wrapping
+    only the shoulder, and bounds their L2 norm ``r`` as
+    ``r / (r + threshold)`` (unitless). PushT takes the maximum of
+    tolerance-normalized position and wrapped-angle errors: ``g_T`` uses
+    the T origin, while ``g_F`` uses the full pusher/T position. Its unitless
+    distance is ``1 + g_T / (1 + g_T)`` for ``g_T >= 1``, otherwise
+    ``g_F / (1 + g_F)``. PushT distance remains positive inside success;
     success checks and full-state restoration are unchanged.
     """
 
