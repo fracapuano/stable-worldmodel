@@ -266,22 +266,19 @@ class _Engine:
             success = (position < contract['position_threshold']) & (
                 angle < contract['angle_threshold']
             )
-            object_position = jnp.linalg.norm(
-                values[:, 2:4] - goals[:, 2:4], axis=-1
+            import jax
+            from envx.pusht.geometry import tee_vertices
+
+            vertices = jax.vmap(tee_vertices)(values[:, 2:4], values[:, 4])
+            goal_vertices = jax.vmap(tee_vertices)(goals[:, 2:4], goals[:, 4])
+            vertex_error = vertices - goal_vertices
+            tee_rms = jnp.sqrt(
+                jnp.mean(jnp.sum(vertex_error**2, axis=-1), axis=-1)
             )
-            object_error = jnp.maximum(
-                object_position / contract['position_threshold'],
-                angle / contract['angle_threshold'],
+            pusher_distance = jnp.linalg.norm(
+                values[:, :2] - goals[:, :2], axis=-1
             )
-            full_error = jnp.maximum(
-                position / contract['position_threshold'],
-                angle / contract['angle_threshold'],
-            )
-            distance = jnp.where(
-                object_error >= 1.0,
-                1.0 + object_error / (1.0 + object_error),
-                full_error / (1.0 + full_error),
-            )
+            distance = jnp.maximum(tee_rms, pusher_distance)
         return values, distance, success
 
     def _run(self, inputs, contract, actions, limits, initial_state=None):

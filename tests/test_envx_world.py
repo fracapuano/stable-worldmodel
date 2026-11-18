@@ -120,6 +120,10 @@ def _metric_engine(name):
     return engine
 
 
+# RMS radius of the eight T vertices about the body origin, in pixels.
+_T_VERTEX_RMS_RADIUS = np.sqrt(5962.5)
+
+
 @integration
 def test_contract_metrics_and_wrapped_angle():
     import jax.numpy as jnp
@@ -153,7 +157,9 @@ def test_contract_metrics_and_wrapped_angle():
         if name == 'pusht':
             # Goal distance stays positive inside success; the boundary stays strict.
             np.testing.assert_allclose(
-                distances, [0.02 / (np.pi / 9 + 0.02), 0.5], atol=1e-4
+                distances,
+                [2 * _T_VERTEX_RMS_RADIUS * np.sin(0.01), 20],
+                atol=1e-4,
             )
 
 
@@ -161,28 +167,27 @@ def test_contract_metrics_and_wrapped_angle():
     'position,angle,goal_angle,expected,expected_success',
     [
         ([0, 0], 0, 0, 0, True),
-        ([3, 4], 0, 0, 0.2, True),
-        ([20, 0], 0, 0, 1.5, False),
-        ([0, 0], np.pi / 2, 0, 20 / 11, False),
+        ([3, 4], 0, 0, 5, True),
+        ([20, 0], 0, 0, 20, False),
+        ([0, 0], np.pi / 2, 0, np.sqrt(2) * _T_VERTEX_RMS_RADIUS, False),
         (
             [0, 0],
             np.deg2rad(359),
             np.deg2rad(1),
-            1 / 11,
+            2 * _T_VERTEX_RMS_RADIUS * np.sin(np.deg2rad(1)),
             True,
         ),
         (
             [0, 0],
             np.deg2rad(1),
             np.deg2rad(359),
-            1 / 11,
+            2 * _T_VERTEX_RMS_RADIUS * np.sin(np.deg2rad(1)),
             True,
         ),
-        ([0, 0], np.pi, 0, 1.9, False),
-        ([3, 4], np.pi / 6, 0, 1.6, False),
+        ([0, 0], np.pi, 0, 2 * _T_VERTEX_RMS_RADIUS, False),
     ],
 )
-def test_pusht_two_stage_pose_distance_ignores_velocity(
+def test_pusht_vertex_rms_distance_ignores_velocity(
     position, angle, goal_angle, expected, expected_success
 ):
     jax = pytest.importorskip('jax')
@@ -240,7 +245,10 @@ def test_pusht_fitness_distance_preserves_native_success():
         )
         np.testing.assert_allclose(
             distances,
-            [1.6, 1 / 11],
+            [
+                np.hypot(100, 200),
+                2 * _T_VERTEX_RMS_RADIUS * np.sin(np.deg2rad(1)),
+            ],
             rtol=1e-5,
             atol=1e-4,
         )
@@ -253,7 +261,7 @@ def test_pusht_fitness_distance_preserves_native_success():
         native.close()
 
 
-def test_pusht_distance_uses_full_position_error_after_T_is_ready():
+def test_pusht_distance_uses_larger_t_or_pusher_displacement():
     jax = pytest.importorskip('jax')
     jnp = pytest.importorskip('jax.numpy')
     states = jnp.asarray(
@@ -264,6 +272,7 @@ def test_pusht_distance_uses_full_position_error_after_T_is_ready():
             [25, 0, 50, 0, 0, 0, 0],
             [19, 0, 0, 0, 0, 0, 0],
             [10, 0, 19, 0, 0, 0, 0],
+            [15, 0, 15, 0, 0, 0, 0],
         ],
         dtype=jnp.float32,
     )
@@ -272,19 +281,10 @@ def test_pusht_distance_uses_full_position_error_after_T_is_ready():
         states, jnp.zeros_like(states), contract
     )
     np.testing.assert_allclose(
-        distances,
-        [
-            np.sqrt(125) / (20 + np.sqrt(125)),
-            np.sqrt(29) / (20 + np.sqrt(29)),
-            12 / 7,
-            12 / 7,
-            19 / 39,
-            np.sqrt(461) / (20 + np.sqrt(461)),
-        ],
-        atol=1e-5,
+        distances, [10, 5, 100, 50, 19, 19, 15], atol=1e-5
     )
     np.testing.assert_array_equal(
-        success, [True, True, False, False, True, False]
+        success, [True, True, False, False, True, False, False]
     )
 
 
@@ -295,7 +295,9 @@ def test_pusht_distance_uses_full_position_error_after_T_is_ready():
         ('angle_threshold', [0.1, np.pi / 9], [0, 0, 0, 0, 0.25, 0, 0]),
     ],
 )
-def test_pusht_distance_uses_native_success_tolerances(key, tolerances, state):
+def test_pusht_success_tolerances_do_not_scale_distance(
+    key, tolerances, state
+):
     jax = pytest.importorskip('jax')
     jnp = pytest.importorskip('jax.numpy')
     states = jnp.asarray([state] * 2, dtype=jnp.float32)
@@ -304,7 +306,7 @@ def test_pusht_distance_uses_native_success_tolerances(key, tolerances, state):
     _, distances, success = jax.jit(_metric_engine('pusht')._metrics)(
         states, jnp.zeros_like(states), contract
     )
-    assert distances[0] > distances[1] > 0
+    assert distances[0] == distances[1] > 0
     np.testing.assert_array_equal(success, [False, True])
 
 
