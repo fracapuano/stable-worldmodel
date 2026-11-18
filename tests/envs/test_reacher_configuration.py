@@ -5,39 +5,62 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+# Expected unbounded distance outside the joint-tolerance box (tolerance 0.05).
 CASES = [
     pytest.param([0, 0], [0, 0], 0, True, id='same-configuration'),
     pytest.param(
         [np.pi - 0.01, 0],
         [-np.pi + 0.01, 0],
-        0.02,
+        0,
         True,
         id='positive-shoulder-seam',
     ),
     pytest.param(
         [-np.pi + 0.01, 0],
         [np.pi - 0.01, 0],
-        0.02,
+        0,
         True,
         id='negative-shoulder-seam',
     ),
     pytest.param([4 * np.pi, 0], [0, 0], 0, True, id='full-shoulder-turns'),
     pytest.param([0, 0], [-2 * np.pi, 0], 0, True, id='goal-full-turn'),
-    pytest.param([np.pi, 0], [0, 0], np.pi, False, id='half-shoulder-turn'),
+    pytest.param(
+        [np.pi, 0],
+        [0, 0],
+        np.pi - 0.05,
+        False,
+        id='half-shoulder-turn',
+    ),
     pytest.param(
         [0, np.deg2rad(160)],
         [0, np.deg2rad(-160)],
-        np.deg2rad(320),
+        np.deg2rad(320) - 0.05,
         False,
         id='wrist-limits-do-not-wrap',
     ),
-    pytest.param([0.02, -0.04], [0, 0], 0.04, True, id='worst-joint-error'),
-    pytest.param([0.049, 0], [0, 0], 0.049, True, id='shoulder-inside'),
-    pytest.param([0, 0.049], [0, 0], 0.049, True, id='wrist-inside'),
-    pytest.param([0.05, 0], [0, 0], 0.05, False, id='shoulder-threshold'),
-    pytest.param([0, 0.05], [0, 0], 0.05, False, id='wrist-threshold'),
-    pytest.param([0.051, 0], [0, 0], 0.051, False, id='shoulder-outside'),
-    pytest.param([0, 0.051], [0, 0], 0.051, False, id='wrist-outside'),
+    pytest.param(
+        [0.02, -0.04],
+        [0, 0],
+        0,
+        True,
+        id='both-joints-inside',
+    ),
+    pytest.param(
+        [0.049, -0.049], [0, 0], 0, True, id='inside-tolerance-corner'
+    ),
+    pytest.param([0.049, 0], [0, 0], 0, True, id='shoulder-inside'),
+    pytest.param([0, 0.049], [0, 0], 0, True, id='wrist-inside'),
+    pytest.param([0.05, 0], [0, 0], 0, False, id='shoulder-threshold'),
+    pytest.param([0, 0.05], [0, 0], 0, False, id='wrist-threshold'),
+    pytest.param([0.051, 0], [0, 0], 0.001, False, id='shoulder-outside'),
+    pytest.param([0, 0.051], [0, 0], 0.001, False, id='wrist-outside'),
+    pytest.param(
+        [0.15, 0.20],
+        [0, 0],
+        np.hypot(0.1, 0.15),
+        False,
+        id='both-joints-outside',
+    ),
 ]
 
 
@@ -47,17 +70,62 @@ def test_envx_reacher_configuration_distance(state, goal, expected, success):
     jnp = pytest.importorskip('jax.numpy')
     from stable_worldmodel.world.envx import _Engine
 
+    def original_metrics(values, goals, contract):
+        delta = values - goals
+        shoulder = jnp.arctan2(jnp.sin(delta[:, 0]), jnp.cos(delta[:, 0]))
+        distance = jnp.maximum(jnp.abs(shoulder), jnp.abs(delta[:, 1]))
+        success = distance < contract['threshold']
+        return values, distance, success
+
     engine = _Engine.__new__(_Engine)
     engine.name = 'reacher'
     engine.adapter = SimpleNamespace(vector=lambda value: value)
     # Include a second, matching task to check reduction stays per task.
     states = jnp.asarray([state, [0, 0]], dtype=jnp.float32)
     goals = jnp.asarray([goal, [0, 0]], dtype=jnp.float32)
-    _, distance, hits = jax.jit(engine._metrics)(
-        states, goals, {'threshold': 0.05}
+    contract = {'threshold': 0.05}
+    expected = expected / (expected + contract['threshold'])
+    _, distance, hits = jax.jit(engine._metrics)(states, goals, contract)
+    np.testing.assert_allclose(distance, [expected, 0], rtol=1e-5, atol=2e-5)
+    # Float32 atan2 can round a nominal shoulder threshold across the boundary.
+    _, _, original_hits = jax.jit(original_metrics)(states, goals, contract)
+    np.testing.assert_array_equal(hits, original_hits)
+    np.testing.assert_array_equal(np.asarray(distance)[np.asarray(hits)], 0)
+    if state[0] == goal[0]:
+        # No shoulder wrapping: retain exact strict wrist-boundary expectations.
+        np.testing.assert_array_equal(hits, [success, True])
+
+
+def test_reacher_distance_uses_both_joints_and_configured_tolerance():
+    jax = pytest.importorskip('jax')
+    jnp = pytest.importorskip('jax.numpy')
+    from stable_worldmodel.world.envx import _Engine
+
+    engine = _Engine.__new__(_Engine)
+    engine.name = 'reacher'
+    engine.adapter = SimpleNamespace(vector=lambda value: value)
+    _, distances, success = jax.jit(engine._metrics)(
+        jnp.asarray(
+            [
+                [1.0, 0.8],
+                [1.0, 0.1],
+                [1.0, 0.1],
+                [0.08, 0],
+                [0.08, 0],
+                [0.08, 0.049],
+                [0.09, 0],
+            ]
+        ),
+        jnp.zeros((7, 2)),
+        {'threshold': jnp.asarray([0.05, 0.05, 0.1, 0.05, 0.1, 0.05, 0.05])},
     )
-    np.testing.assert_allclose(distance, [expected, 0], atol=1e-6)
-    np.testing.assert_array_equal(hits, [success, True])
+    assert distances[0] > distances[1] > 0
+    assert distances[1] > distances[2] > 0
+    assert distances[3] > distances[4] == 0
+    assert distances[3] == distances[5] < distances[6]
+    np.testing.assert_array_equal(
+        success, [False, False, False, False, True, False, False]
+    )
 
 
 @pytest.mark.parametrize('state,goal,expected,success', CASES)

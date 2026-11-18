@@ -201,10 +201,11 @@ A planar two-link arm that must reach a small target. The task uses feature-base
 | `qpos_match` | Match a target joint configuration |
 
 Frozen-task Reacher evaluation and `qpos_match` compare joint configurations.
-The distance is the maximum of the shortest shoulder-angle error modulo a full
-turn and the absolute wrist-angle error. The wrist is limited to ±160° and is
-not wrapped. Success requires both errors to be strictly below the configured
-tolerance (0.05 radians by default).
+The frozen-task distance is `r / (r + tolerance)`, with `r` the L2 norm of
+`max(abs(joint_error) - tolerance, 0)` across joints. Only the shoulder wraps;
+the wrist is limited to ±160° and is not wrapped. Distance is zero inside and on
+the tolerance box boundary. Success still requires both errors to be strictly
+below the configured tolerance (0.05 radians by default).
 
 ```python
 world = swm.World('swm/ReacherDMControl-v0', num_envs=4)

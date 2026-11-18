@@ -31,11 +31,14 @@ class EvaluationTask:
     ``angle_threshold`` and its ``relative``/``action_scale``/``clip_target``
     controls. These options apply to the frozen task evaluation only.
 
-    PushT distance always measures T pose:
-    sqrt(dx**2 + dy**2 + wrapped_angle_degrees**2). Position is in native
-    pixels and angle uses the shortest difference in degrees, giving one
-    pixel and one degree equal weight. Pusher state is excluded from
-    distance; success and full-state restoration are unchanged.
+    Reacher clips each absolute joint error minus tolerance at zero, wrapping
+    only the shoulder, and bounds their L2 norm ``r`` as
+    ``r / (r + threshold)`` (unitless). PushT takes the maximum of
+    tolerance-normalized position and wrapped-angle errors: ``g_T`` uses
+    the T origin, while ``g_F`` uses the full pusher/T position. Its unitless
+    distance is ``1 + g_T / (1 + g_T)`` for ``g_T >= 1``, otherwise
+    ``g_F / (1 + g_F)``. PushT distance remains positive inside success;
+    success checks and full-state restoration are unchanged.
     """
 
     environment_seed: int
